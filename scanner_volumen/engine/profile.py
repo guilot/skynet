@@ -47,7 +47,19 @@ class VolumeProfile:
         return slot.median
 
     def cumulative_baseline(self, minute: int) -> float | None:
-        """Suma de las medianas desde el minuto 0 hasta `minute` inclusive."""
+        """Suma de las medianas desde el minuto 0 hasta `minute` inclusive.
+
+        A diferencia de `baseline()`, que se niega (devuelve None) ante
+        cualquier slot ausente o con mediana <= 0, aquí los slots ausentes se
+        saltan y la suma continúa: solo se devuelve None si no se encontró
+        ningún dato en todo el rango o si el total es <= 0. Se prefiere esta
+        tolerancia porque `cumulative_baseline` es el denominador del RVOL de
+        sesión, que cubre cientos de minutos; exigir que todos estén presentes
+        haría que el RVOL de sesión desapareciera por la ausencia de un solo
+        minuto. El coste de esta tolerancia es que un rango con huecos
+        subestima ligeramente la referencia acumulada y, por tanto, sobrestima
+        ligeramente el RVOL de sesión resultante.
+        """
         total = 0.0
         vistos = 0
         for m in range(min(minute, MINUTOS_POR_DIA - 1) + 1):
@@ -119,7 +131,10 @@ def build_profile(
 def rolling_baseline(candles: list[Candle], n: int) -> float | None:
     """Referencia de emergencia para símbolos sin histórico suficiente:
     mediana de las últimas n velas cerradas."""
-    if not candles:
+    if not candles or n <= 0:
+        # candles[-n:] con n=0 devolvería la lista entera (candles[-0:] == candles[:]),
+        # no un slice vacío: hay que cortar aquí para no calcular la mediana de
+        # todo el histórico cuando se pretendía desactivar el fallback.
         return None
     ultimas = [c.quote_vol for c in candles[-n:]]
     if not ultimas:

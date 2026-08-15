@@ -72,7 +72,13 @@ def test_calcula_percentiles():
     perfil = build_profile("AAAUSDT", velas, cfg(smoothing_window_minutes=0))
     s = perfil.slots[100]
     assert s.median <= s.p75 <= s.p90 <= s.p95
-    assert s.p95 >= 130
+    # Valores exactos de la interpolación lineal (pos = q * (len-1)) sobre
+    # las 14 muestras [10, 20, ..., 140]:
+    tolerancia = 1e-9
+    assert abs(s.median - 75.0) < tolerancia
+    assert abs(s.p75 - 107.5) < tolerancia
+    assert abs(s.p90 - 127.0) < tolerancia
+    assert abs(s.p95 - 133.5) < tolerancia
 
 
 def test_confianza_baja_con_poco_historico():
@@ -107,6 +113,22 @@ def test_cumulative_baseline_suma_desde_medianoche():
     assert perfil.cumulative_baseline(9) == 1000.0  # minutos 0..9
 
 
+def test_cumulative_baseline_salta_huecos_y_suma_solo_los_slots_con_datos():
+    """A diferencia de baseline(), que se niega ante un slot ausente,
+    cumulative_baseline salta los huecos y sigue sumando: pin del
+    comportamiento tolerante documentado en el docstring."""
+    velas = [vela(0 * MINUTO, 100.0), vela(5 * MINUTO, 100.0)]
+    perfil = build_profile("AAAUSDT", velas, cfg(smoothing_window_minutes=0))
+    assert perfil.baseline(2) is None  # minuto 2 no tiene muestras
+    assert perfil.cumulative_baseline(9) == 200.0  # solo minutos 0 y 5 aportan
+
+
+def test_cumulative_baseline_none_si_no_hay_datos_en_el_rango():
+    velas = [vela(500 * MINUTO, 100.0)]
+    perfil = build_profile("AAAUSDT", velas, cfg(smoothing_window_minutes=0))
+    assert perfil.cumulative_baseline(9) is None  # minutos 0..9 sin datos
+
+
 def test_rolling_baseline_es_la_mediana_de_las_ultimas_n():
     velas = [vela(m * MINUTO, float(m)) for m in range(1, 11)]
     assert rolling_baseline(velas, 10) == 5.5
@@ -115,3 +137,16 @@ def test_rolling_baseline_es_la_mediana_de_las_ultimas_n():
 
 def test_rolling_baseline_sin_velas_devuelve_none():
     assert rolling_baseline([], 10) is None
+
+
+def test_rolling_baseline_n_cero_devuelve_none():
+    """candles[-0:] en Python es la lista entera, no un slice vacío: n=0
+    debe desactivar el fallback devolviendo None, no la mediana de todo
+    el histórico."""
+    velas = [vela(m * MINUTO, float(m)) for m in range(1, 11)]
+    assert rolling_baseline(velas, 0) is None
+
+
+def test_rolling_baseline_n_negativo_devuelve_none():
+    velas = [vela(m * MINUTO, float(m)) for m in range(1, 11)]
+    assert rolling_baseline(velas, -3) is None
