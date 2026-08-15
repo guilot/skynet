@@ -66,6 +66,18 @@ async def test_limit_por_encima_de_200_se_recorta():
     assert pedidas[-1].params["limit"] == "200"
 
 
+async def test_get_candles_devuelve_modelos():
+    transporte, pedidas = transporte_de_fixtures()
+    async with httpx.AsyncClient(transport=transporte, base_url="https://api.bitget.com") as cli:
+        rest = BitgetRest(venue="USDT-FUTURES", rate_limit=1000, client=cli)
+        velas = await rest.get_candles("BTCUSDT")
+    assert len(velas) == 200
+    url = pedidas[-1]
+    assert url.params["granularity"] == "1m"
+    assert url.params["productType"] == "USDT-FUTURES"
+    assert "endTime" not in url.params
+
+
 async def test_error_de_negocio_de_bitget_lanza_excepcion():
     def handler(request):
         return httpx.Response(200, json={"code": "40020", "msg": "Parameter limit error", "data": []})
