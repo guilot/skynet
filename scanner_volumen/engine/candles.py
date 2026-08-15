@@ -71,12 +71,17 @@ class CandleBuffer:
         return vela.close if vela is not None else None
 
     def session_volume(self, day_start_ms: int) -> float:
-        """Volumen (en moneda base) acumulado desde el inicio de la sesión.
+        """Volumen en quote (USDT) acumulado desde el inicio de la sesión.
+
+        Todo el motor trabaja en volumen quote (USDT), no en moneda base:
+        el perfil de volumen y rvol_window también se calculan sobre
+        quote_vol, así que session_volume debe usar la misma unidad para
+        que rvol_session = session_volume / baseline sea comparable.
 
         Incluye la vela en curso: su volumen parcial sigue siendo volumen
         real ya operado, aunque no sea comparable a una vela cerrada.
         """
-        total = sum(c.base_vol for c in self._closed if c.ts >= day_start_ms)
+        total = sum(c.quote_vol for c in self._closed if c.ts >= day_start_ms)
         if self._current is not None and self._current.ts >= day_start_ms:
-            total += self._current.base_vol
+            total += self._current.quote_vol
         return total

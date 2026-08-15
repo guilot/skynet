@@ -81,8 +81,11 @@ def test_session_volume_suma_desde_el_inicio_del_dia():
     for m in range(1, 6):
         buf.upsert(vela(m, vol=10))
     # incluye la vela en curso
-    assert buf.session_volume(day_start_ms=0) == 50
-    assert buf.session_volume(day_start_ms=3 * MINUTO) == 30
+    # session_volume trabaja en quote_vol (USDT), no en base_vol: con
+    # close=100.0 (default de vela()) y vol=10, cada vela aporta
+    # quote_vol = 10 * 100 = 1000.
+    assert buf.session_volume(day_start_ms=0) == 5000
+    assert buf.session_volume(day_start_ms=3 * MINUTO) == 3000
 
 
 def test_el_buffer_respeta_su_capacidad():
