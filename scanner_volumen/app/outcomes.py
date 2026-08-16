@@ -41,11 +41,11 @@ def compute_outcome(
 class OutcomeTracker:
     """Rellena `signal_outcomes` para los horizontes ya vencidos.
 
-    Solo escribe un horizonte cuando su ventana de velas está completa
-    (llegó la vela justo en el límite del horizonte); si aún falta, se
-    salta en silencio y se reintenta en la siguiente pasada. Grabar con una
-    ventana parcial corrompería el propio dataset que este componente existe
-    para producir.
+    Solo escribe un horizonte cuando el stream de velas progresó más allá
+    del límite de la ventana; si aún no llegó tan lejos, se salta en
+    silencio y se reintenta en la siguiente pasada. Grabar con una ventana
+    parcial corrompería el propio dataset que este componente existe para
+    producir.
     """
 
     def __init__(
@@ -63,16 +63,25 @@ class OutcomeTracker:
         for signal_id, symbol, precio, horizonte, ts in self._signals.pending_outcomes(
             now_ms, self._horizons
         ):
-            fin = ts + horizonte * MINUTO_MS
-            # Ventana [ts, fin] inclusive en ambos extremos: incluye la vela
-            # de la propia señal y la vela justo en el límite del horizonte.
+            # `ts` es el instante exacto de evaluación (el orquestador corre
+            # cada segundo), no el arranque de una vela. Se redondea hacia
+            # abajo al minuto para incluir la vela que estaba abierta en el
+            # momento de la señal (la de entrada) y para que `fin` quede
+            # alineado a un límite de vela alcanzable.
+            inicio = ts - (ts % MINUTO_MS)
+            fin = inicio + horizonte * MINUTO_MS
+            # Ventana [inicio, fin] inclusive en ambos extremos.
             velas = [
-                c for c in self._candles.load(symbol, since_ms=ts) if c.ts <= fin
+                c for c in self._candles.load(symbol, since_ms=inicio) if c.ts <= fin
             ]
-            if not velas or velas[-1].ts < fin:
-                # Aún no llegó la vela que cierra la ventana: horizonte
-                # vencido según el reloj, pero datos incompletos. Se salta
-                # en silencio, nunca se graba con lo que haya.
+            ultimo_ts = self._candles.latest_ts(symbol)
+            if not velas or ultimo_ts is None or ultimo_ts < fin:
+                # El stream de velas todavía no progresó más allá del límite
+                # de la ventana: horizonte vencido según el reloj, pero datos
+                # incompletos. Se salta en silencio, nunca se graba con lo
+                # que haya. Exigir progreso (en vez de la vela exacta en
+                # `fin`) evita quedarse pendiente para siempre si un símbolo
+                # poco líquido nunca publica esa vela concreta.
                 continue
             resultado = compute_outcome(precio, velas)
             if resultado is None:

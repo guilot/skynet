@@ -106,6 +106,80 @@ def test_no_escribe_horizonte_con_ventana_incompleta(repos):
     assert fila["n"] == 0
 
 
+def test_ts_no_alineado_al_minuto_se_redondea_y_registra_resultado(repos):
+    """El orquestador evalúa cada segundo (`int(time.time() * 1000)`), así que
+    el `ts` de una señal real casi nunca cae justo en el arranque de un
+    minuto. Con ts=90_123 (minuto 1, segundo 30.123) la ventana debe
+    alinearse al minuto de la vela vigente en ese instante para que el
+    horizonte pueda completarse alguna vez: sin redondeo, `fin` nunca
+    coincide con el ts de ninguna vela y el horizonte no se registra jamás."""
+    signal_repo, candle_repo = repos
+    ts_señal = 90_123
+    signal_repo.insert(metricas(ts=ts_señal, price=100.0), desglose(), State.SIGNAL)
+    candle_repo.save_many("AAAUSDT", [
+        vela(1 * MINUTO, 100.0, high=103.0, low=99.0),
+        vela(2 * MINUTO, 104.0, high=108.0, low=101.0),
+        vela(3 * MINUTO, 102.0, high=105.0, low=97.0),
+    ])
+
+    tracker = OutcomeTracker(signal_repo, candle_repo, horizons=(1,))
+    escritos = tracker.run_once(now_ms=ts_señal + 5 * MINUTO)
+
+    assert escritos == 1
+    fila = signal_repo._conn.execute(
+        "SELECT * FROM signal_outcomes WHERE horizon_min = 1"
+    ).fetchone()
+    assert fila is not None
+    assert fila["price"] == 104.0  # cierre de la vela del minuto 2 (límite alineado)
+
+
+def test_no_escribe_si_las_velas_no_llegan_al_limite_con_ts_no_alineado(repos):
+    """Aunque `ts` no esté alineado al minuto, si el stream de velas todavía
+    no progresó más allá del límite del horizonte (aquí se detiene justo un
+    minuto antes) el horizonte sigue sin registrarse: la protección contra
+    ventanas truncadas debe seguir vigente tras redondear `ts`."""
+    signal_repo, candle_repo = repos
+    ts_señal = 90_123
+    signal_repo.insert(metricas(ts=ts_señal, price=100.0), desglose(), State.SIGNAL)
+    candle_repo.save_many("AAAUSDT", [
+        vela(1 * MINUTO, 100.0),  # solo llega la vela de entrada (minuto 1)
+    ])
+
+    tracker = OutcomeTracker(signal_repo, candle_repo, horizons=(1,))
+    assert tracker.run_once(now_ms=ts_señal + 5 * MINUTO) == 0
+
+    fila = signal_repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM signal_outcomes"
+    ).fetchone()
+    assert fila["n"] == 0
+
+
+def test_registra_con_hueco_interno_si_los_datos_llegan_mas_alla_del_limite(repos):
+    """Un hueco real en mitad de la ventana (por ejemplo el exchange no
+    publicó esas velas, ni siquiera la del límite exacto del horizonte) no
+    debe bloquear el registro para siempre: en cuanto el stream de velas
+    progresa más allá del límite, la ventana se da por completa con las
+    velas que sí llegaron, en vez de esperar indefinidamente a una vela
+    concreta que quizá nunca llegue."""
+    signal_repo, candle_repo = repos
+    signal_repo.insert(metricas(ts=0, price=100.0), desglose(), State.SIGNAL)
+    candle_repo.save_many("AAAUSDT", [
+        vela(0 * MINUTO, 100.0, high=103.0, low=99.0),
+        vela(1 * MINUTO, 104.0, high=108.0, low=101.0),
+        # faltan los minutos 2 y 3 (hueco real, incluida la vela límite)
+        vela(4 * MINUTO, 102.0),  # progresa más allá del límite del horizonte de 3 min
+    ])
+
+    tracker = OutcomeTracker(signal_repo, candle_repo, horizons=(3,))
+    escritos = tracker.run_once(now_ms=6 * MINUTO)
+
+    assert escritos == 1
+    fila = signal_repo._conn.execute(
+        "SELECT * FROM signal_outcomes WHERE horizon_min = 3"
+    ).fetchone()
+    assert fila["price"] == 104.0  # cierre de la última vela disponible dentro de la ventana (minuto 1)
+
+
 def test_guarda_el_resultado_correcto_para_el_horizonte(repos):
     """La ventana del horizonte de 1 minuto debe ser [ts_señal, ts_señal +
     1min] inclusive en ambos extremos: incluye la vela de la propia señal
