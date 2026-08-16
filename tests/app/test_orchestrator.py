@@ -444,6 +444,60 @@ async def test_poll_tickers_no_propaga_fallo_de_rest(orq):
     assert orq.dirty == set()
 
 
+class BootstrapperFallaLaPrimeraVez:
+    """Falla en la primera llamada para un símbolo y tiene éxito en la
+    segunda, para reproducir la Finding 1: un bootstrap fallido no debe
+    dejar al símbolo congelado en su placeholder para siempre."""
+
+    def __init__(self, cfg):
+        self._cfg = cfg
+        self.intentos: list[str] = []
+
+    async def bootstrap_symbol(self, symbol, now_ms):
+        self.intentos.append(symbol)
+        if self.intentos.count(symbol) == 1:
+            raise RuntimeError("Bitget no responde")
+        velas = [vela(d * DIA + m * MINUTO, vol=100.0)
+                 for d in range(14) for m in range(1440)]
+        return build_profile(symbol, velas, self._cfg)
+
+    def expect(self, symbols):
+        pass
+
+    def progress(self):
+        return (len(self.intentos), len(self.intentos))
+
+    def mark_loaded(self, symbol):
+        pass
+
+
+async def test_un_bootstrap_fallido_se_reintenta_en_el_siguiente_apply_universe(orq):
+    """Regresión Finding 1: si el bootstrap de fondo lanza una excepción, el
+    símbolo debe seguir siendo candidato a reintento en el siguiente
+    apply_universe (misma lista `ordered`, símbolo aún presente), en vez de
+    quedarse congelado en su placeholder para siempre porque el guard de
+    dedup no distingue placeholder de perfil real."""
+    orq.ws = WsFalso()
+    orq.bootstrapper = BootstrapperFallaLaPrimeraVez(orq.cfg.profile)
+    update = UniverseUpdate(
+        symbols=frozenset({"AAAUSDT"}), added=frozenset({"AAAUSDT"}),
+        removed=frozenset(), ordered=["AAAUSDT"],
+    )
+
+    await orq.apply_universe(update, now_ms=14 * DIA)
+    await asyncio.sleep(0)  # deja correr el bootstrap de fondo (falla)
+    assert orq.bootstrapper.intentos == ["AAAUSDT"]
+    assert orq.profiles["AAAUSDT"].confidence == "low"  # sigue en el placeholder
+
+    # segundo refresco de universo: mismo símbolo, sigue en `ordered`, como
+    # hace UniverseSelector.select en cada ciclo con el universo activo.
+    await orq.apply_universe(update, now_ms=14 * DIA + MINUTO)
+    await asyncio.sleep(0)  # deja correr el segundo intento (éxito)
+
+    assert orq.bootstrapper.intentos == ["AAAUSDT", "AAAUSDT"]
+    assert orq.profiles["AAAUSDT"].confidence == "high"
+
+
 async def test_apply_universe_no_espera_a_que_terminen_los_bootstraps(orq):
     """Regresión C1: en frío, apply_universe no debe bloquear ~25 minutos
     esperando ensure_profile de cada símbolo antes de suscribir el WS."""
@@ -465,3 +519,72 @@ async def test_apply_universe_no_espera_a_que_terminen_los_bootstraps(orq):
     orq.bootstrapper.evento.set()
     await asyncio.sleep(0)  # deja correr la tarea de fondo ya lanzada
     assert orq.bootstrapper.terminados == ["AAAUSDT"]
+
+
+class BootstrapperExplota:
+    """Bootstrapper cuyo bootstrap_symbol nunca debe invocarse: usado para
+    demostrar que un arranque en caliente no pasa por el camino de fondo."""
+
+    def __init__(self, cfg):
+        self._cfg = cfg
+        self.llamadas: list[str] = []
+        self.cargados: list[str] = []
+
+    async def bootstrap_symbol(self, symbol, now_ms):
+        self.llamadas.append(symbol)
+        raise AssertionError("no debería lanzarse un bootstrap real en caliente")
+
+    def expect(self, symbols):
+        pass
+
+    def progress(self):
+        return (len(self.cargados), len(self.cargados))
+
+    def mark_loaded(self, symbol):
+        self.cargados.append(symbol)
+
+
+async def test_apply_universe_en_caliente_usa_el_perfil_de_disco_sin_placeholder(orq):
+    """Regresión Finding 2: si el perfil ya existe en disco (arranque en
+    caliente), apply_universe debe cargarlo síncronamente y usarlo
+    directamente -sin placeholder ni tarea de fondo-, en vez de enrutar una
+    lectura barata de SQLite por la maquinaria pensada para el bootstrap
+    lento por REST."""
+    orq.ws = WsFalso()
+    orq.bootstrapper = BootstrapperExplota(orq.cfg.profile)
+
+    velas = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(14) for m in range(1440)]
+    perfil_real = build_profile("AAAUSDT", velas, orq.cfg.profile)
+    orq.profile_repo.save(perfil_real)
+
+    update = UniverseUpdate(
+        symbols=frozenset({"AAAUSDT"}), added=frozenset({"AAAUSDT"}),
+        removed=frozenset(), ordered=["AAAUSDT"],
+    )
+    await orq.apply_universe(update, now_ms=14 * DIA)
+
+    # el perfil real quedó puesto de inmediato, sin pasar por el placeholder
+    assert orq.profiles["AAAUSDT"].confidence == "high"
+    assert orq.profiles["AAAUSDT"] == perfil_real
+    # nunca se lanzó bootstrap real ni tarea de fondo para este símbolo
+    assert orq.bootstrapper.llamadas == []
+    assert orq.bootstrapper.cargados == ["AAAUSDT"]
+    assert "AAAUSDT" not in orq._bootstrap_tasks
+
+
+async def test_mark_loaded_se_refleja_en_progress(orq):
+    """`Bootstrapper.mark_loaded` no tenía test directo: comprueba que un
+    símbolo cargado de disco (sin pasar por bootstrap_symbol) cuenta como
+    completado en `progress()`."""
+    from scanner_volumen.app.bootstrap import Bootstrapper
+
+    boot = Bootstrapper(
+        rest=None, candle_repo=orq.candle_repo, profile_repo=orq.profile_repo,
+        profile_cfg=orq.cfg.profile,
+    )
+    boot.expect(["AAAUSDT", "BBBUSDT"])
+    assert boot.progress() == (0, 2)
+
+    boot.mark_loaded("AAAUSDT")
+
+    assert boot.progress() == (1, 2)

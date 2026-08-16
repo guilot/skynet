@@ -58,6 +58,13 @@ class Orchestrator:
         # símbolo y mantiene una referencia viva para que la tarea no se
         # recolecte a mitad de vuelo.
         self._bootstrap_tasks: dict[str, asyncio.Task] = {}
+        # símbolos cuyo `self.profiles[simbolo]` es hoy un `placeholder_profile`
+        # y no un perfil real; el dict `profiles` no distingue por sí solo
+        # entre ambos, así que sin este registro un bootstrap fallido dejaría
+        # al símbolo congelado en su placeholder para siempre (Finding 1: el
+        # guard de dedup de `apply_universe` lo confundiría con un símbolo ya
+        # resuelto).
+        self._placeholder_symbols: set[str] = set()
 
         self._metrics = MetricsBuilder(cfg.engine, cfg.profile)
         self._states = StateMachine(cfg.states)
@@ -272,10 +279,22 @@ class Orchestrator:
         sembrando antes un perfil provisional de baja confianza para que el
         símbolo puntúe desde el primer minuto vía el fallback de mediana
         rolling en vez de quedarse sin puntuar hasta que termine su descarga.
+
+        Dos matices sobre ese placeholder:
+        - Un símbolo cuyo bootstrap de fondo falló se reintenta en el
+          siguiente `apply_universe` que aún lo traiga en `ordered`, en vez
+          de quedarse congelado en el placeholder para siempre: el guard de
+          dedup no mira solo `self.profiles` (que mezcla placeholders y
+          perfiles reales) sino `self._placeholder_symbols`.
+        - Si el perfil ya existe en disco (arranque en caliente), se carga
+          de forma síncrona aquí mismo y se usa directamente: ni placeholder
+          ni tarea de fondo, porque esa maquinaria existe para el bootstrap
+          lento por REST, no para una lectura local de SQLite.
         """
         for simbolo in update.removed:
             self.buffers.pop(simbolo, None)
             self.profiles.pop(simbolo, None)
+            self._placeholder_symbols.discard(simbolo)
             self.state.drop(simbolo)
             tarea = self._bootstrap_tasks.pop(simbolo, None)
             if tarea is not None:
@@ -288,9 +307,25 @@ class Orchestrator:
                 await self.ws.unsubscribe(sorted(update.removed))
 
         for simbolo in update.ordered:
-            if simbolo in self.profiles or simbolo in self._bootstrap_tasks:
+            if simbolo in self._bootstrap_tasks:
+                continue  # ya hay un bootstrap en vuelo para este símbolo
+            if simbolo in self.profiles and simbolo not in self._placeholder_symbols:
+                continue  # ya tiene un perfil real: nada que hacer (Finding 1)
+
+            # lectura síncrona barata en disco primero (Finding 2): un
+            # arranque en caliente no debe pasar por placeholder + tarea de
+            # fondo, esa maquinaria existe solo para el bootstrap lento por
+            # REST, no para un SELECT local.
+            perfil_de_disco = self.profile_repo.load(simbolo)
+            if perfil_de_disco is not None:
+                self.bootstrapper.mark_loaded(simbolo)
+                self.profiles[simbolo] = perfil_de_disco
+                self._placeholder_symbols.discard(simbolo)
+                await self.seed_buffer(simbolo, now_ms)
                 continue
+
             self.profiles[simbolo] = placeholder_profile(simbolo)
+            self._placeholder_symbols.add(simbolo)
             await self.seed_buffer(simbolo, now_ms)
             tarea = asyncio.create_task(self._bootstrap_en_fondo(simbolo, now_ms))
             self._bootstrap_tasks[simbolo] = tarea
@@ -305,9 +340,14 @@ class Orchestrator:
         try:
             perfil = await self._load_or_bootstrap(symbol, now_ms)
             self.profiles[symbol] = perfil
+            self._placeholder_symbols.discard(symbol)
             await self.seed_buffer(symbol, now_ms)
             self.dirty.add(symbol)
         except Exception as exc:  # noqa: BLE001 - un bootstrap de fondo fallido no tumba el bucle
+            # el símbolo queda marcado en self._placeholder_symbols (nunca se
+            # tocó aquí), así que el siguiente apply_universe con este símbolo
+            # todavía en `ordered` reintentará el bootstrap en vez de dejarlo
+            # congelado en el placeholder para siempre (Finding 1).
             log.warning("bootstrap en segundo plano fallido para %s: %s", symbol, exc)
         finally:
             self._bootstrap_tasks.pop(symbol, None)
