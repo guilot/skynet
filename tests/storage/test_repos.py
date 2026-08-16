@@ -155,12 +155,46 @@ def test_recent_filtra_por_timestamp(conn):
 
 
 def test_metricas_nulas_se_guardan_como_null(conn):
+    # Una métrica almacenada como 0 en lugar de NULL es indistinguible de un
+    # verdadero cero, lo que corrupta la calibración de puntuación en V3.
+    # Este test verifica que TODA métrica nullable persiste como NULL.
     repo = SignalRepo(conn)
-    repo.insert(metricas_de_prueba(rvol_session=None, z_return=None),
-                desglose(), State.HOT)
+    repo.insert(
+        metricas_de_prueba(
+            price=None,
+            rvol_1m_closed=None, rvol_1m_live=None, rvol_5m=None,
+            rvol_session=None, demand_burst=None,
+            ret_1m=None, ret_3m=None, ret_5m=None, ret_15m=None,
+            ret_30m=None, ret_1h=None, ret_24h=None,
+            vwap=None, vwap_distance=None, z_return=None,
+            market_cap=None, volume_24h=None, open_interest=None,
+            funding_rate=None,
+        ),
+        desglose(),
+        State.HOT
+    )
     fila = repo.recent(since_ms=0)[0]
+    # Se verifica por nombre para detectar si cambia el orden de _CAMPOS
+    assert fila["price"] is None
+    assert fila["rvol_1m_closed"] is None
+    assert fila["rvol_1m_live"] is None
+    assert fila["rvol_5m"] is None
     assert fila["rvol_session"] is None
+    assert fila["demand_burst"] is None
+    assert fila["ret_1m"] is None
+    assert fila["ret_3m"] is None
+    assert fila["ret_5m"] is None
+    assert fila["ret_15m"] is None
+    assert fila["ret_30m"] is None
+    assert fila["ret_1h"] is None
+    assert fila["ret_24h"] is None
+    assert fila["vwap"] is None
+    assert fila["vwap_distance"] is None
     assert fila["z_return"] is None
+    assert fila["market_cap"] is None
+    assert fila["volume_24h"] is None
+    assert fila["open_interest"] is None
+    assert fila["funding_rate"] is None
 
 
 def test_pending_outcomes_lista_los_horizontes_vencidos(conn):
