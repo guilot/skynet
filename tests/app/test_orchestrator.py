@@ -215,6 +215,41 @@ async def test_rvol_session_y_vwap_reflejan_la_sesion_completa_no_solo_lo_llegad
     assert snap.metrics.vwap == pytest.approx(104.2, rel=1e-6)
 
 
+async def test_demand_burst_es_alcanzable_a_la_cadencia_de_produccion(orq):
+    """Regresión C2 (Task 2): alimenta el orquestador exactamente como en
+    producción -- un tick de evaluate() por segundo y una actualización de WS
+    en (casi) cada tick, como hacen el WS real (~cada 2.5s) y poll_tickers
+    (~cada 3s) -- durante más de 5 minutos simulados, y comprueba que
+    demand_burst deja de ser None.
+
+    Antes del fix, record_rvol se llamaba desde evaluate() estampando con
+    now_ms (el reloj del tick) en un deque(maxlen=120): a un tick por segundo
+    y sucio en casi todos los ticks, el deque solo cubre ~120s de pared, muy
+    por debajo de los ~300s que pide _rvol_hace(BURST_LOOKBACK_MIN=5), así
+    que la muestra de referencia nunca estaba en el historial y demand_burst
+    quedaba en None para siempre.
+    """
+    base = 14 * DIA
+    await orq.ensure_profile("AAAUSDT", now_ms=base)
+    orq.set_ticker(Ticker("AAAUSDT", 100.0, 6.4, 5e6, 100.0, 0.0001, 0))
+
+    for segundo in range(0, 6 * 60 + 1):  # > 5 minutos simulados, tick de 1s
+        ahora = base + segundo * 1000
+        minuto = segundo // 60
+        # el WS actualiza la vela en curso del minuto actual en cada tick,
+        # como en producción (símbolo sucio casi siempre); el volumen sube
+        # para que rvol_1m_closed nunca sea None ni constante.
+        await orq.handle_ws_event(
+            WsEvent(kind="update", symbol="AAAUSDT",
+                    candles=[vela(base + minuto * MINUTO, vol=100.0 + minuto)])
+        )
+        orq.evaluate(now_ms=ahora)
+
+    snap = orq.state.snapshot("AAAUSDT")
+    assert snap is not None
+    assert snap.metrics.demand_burst is not None
+
+
 async def test_ranked_ordena_por_score_descendente(orq):
     base = 14 * DIA
     datos = {

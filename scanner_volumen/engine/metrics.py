@@ -3,7 +3,10 @@
 
 Es el punto donde convergen buffer, perfil y ticker. Mantiene un pequeno
 historial de RVOL por simbolo, necesario para el demand burst, que compara con
-el valor de hace cinco minutos.
+el valor de hace cinco minutos. El historial guarda como mucho una muestra
+por vela cerrada (estampada por su ts, no por el reloj de pared en que se
+evaluo): compute() puede llamarse varias veces por minuto, pero una vela
+cerrada solo produce un rvol_1m_closed una vez.
 """
 from __future__ import annotations
 
@@ -25,6 +28,8 @@ from scanner_volumen.models import Ticker
 MINUTO_MS = 60_000
 DIA_MS = 1440 * MINUTO_MS
 BURST_LOOKBACK_MIN = 5
+# Dos horas de historial, una muestra por vela cerrada (una por minuto).
+RVOL_HISTORY_MINUTES = 120
 
 
 @dataclass(frozen=True)
@@ -61,16 +66,35 @@ class MetricsBuilder:
         # simbolo -> deque de (ts_ms, rvol_1m_closed)
         self._rvol_history: dict[str, deque[tuple[int, float]]] = {}
 
-    def record_rvol(self, symbol: str, rvol: float, now_ms: int) -> None:
-        hist = self._rvol_history.setdefault(symbol, deque(maxlen=120))
-        hist.append((now_ms, rvol))
+    def record_rvol(self, symbol: str, rvol: float, ts: int) -> None:
+        """Registra una muestra de RVOL cerrado, estampada por el ts (ms) de
+        la vela que la produjo -- nunca por el reloj de pared -- y
+        deduplicada: `compute()` puede llamarse mas de una vez sobre la misma
+        vela cerrada (p.ej. un ticker que llega sin vela nueva la deja
+        "sucia" otra vez), y sin este chequeo cada llamada añadiria una copia
+        identica del mismo minuto en vez de como mucho una.
+        """
+        hist = self._rvol_history.setdefault(symbol, deque(maxlen=RVOL_HISTORY_MINUTES))
+        if hist and hist[-1][0] == ts:
+            return
+        hist.append((ts, rvol))
 
-    def _rvol_hace(self, symbol: str, now_ms: int, minutos: int) -> float | None:
-        """Valor de RVOL mas cercano a `minutos` atras, con tolerancia de +-1 min."""
+    def _rvol_hace(self, symbol: str, ts_referencia: int, minutos: int) -> float | None:
+        """Valor de RVOL mas cercano a `minutos` atras de `ts_referencia` (ts
+        de vela cerrada, no reloj de pared), con tolerancia de +-1 min.
+
+        Con ambos lados alineados al minuto -- ts de vela contra ts de vela --
+        la tolerancia ya no absorbe jitter de reloj (eso ya no existe: las
+        muestras solo caen en multiplos exactos de un minuto). Sigue teniendo
+        sentido igualmente: tolera como mucho una vela perdida justo en el
+        objetivo (p.ej. un hueco de reconexion que aun no paso por
+        refill_gap), usando la vela adyacente en vez de devolver None por la
+        falta de una unica muestra.
+        """
         hist = self._rvol_history.get(symbol)
         if not hist:
             return None
-        objetivo = now_ms - minutos * MINUTO_MS
+        objetivo = ts_referencia - minutos * MINUTO_MS
         mejor: tuple[int, float] | None = None
         for ts, valor in hist:
             if abs(ts - objetivo) <= MINUTO_MS:
@@ -163,9 +187,16 @@ class MetricsBuilder:
         ]
         z = z_return(retornos_recientes, rets[1]) if rets[1] is not None else None
 
-        burst = demand_burst(
-            rvol_cerrado, self._rvol_hace(symbol, now_ms, BURST_LOOKBACK_MIN)
-        )
+        burst = None
+        if ultima_cerrada is not None:
+            burst = demand_burst(
+                rvol_cerrado,
+                self._rvol_hace(symbol, ultima_cerrada.ts, BURST_LOOKBACK_MIN),
+            )
+            # se registra despues de consultar el historial, para que la
+            # propia muestra de esta vela no pueda emparejarse consigo misma.
+            if rvol_cerrado is not None:
+                self.record_rvol(symbol, rvol_cerrado, ultima_cerrada.ts)
 
         return SymbolMetrics(
             symbol=symbol,

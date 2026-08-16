@@ -169,8 +169,6 @@ class Orchestrator:
                 simbolo, buffer, perfil, self.tickers.get(simbolo),
                 self.supply.market_cap(simbolo), now_ms,
             )
-            if metricas.rvol_1m_closed is not None:
-                self._metrics.record_rvol(simbolo, metricas.rvol_1m_closed, now_ms)
 
             desglose = score_symbol(metricas, self.cfg.score)
             transicion = self._states.update(simbolo, desglose.total, now_ms)

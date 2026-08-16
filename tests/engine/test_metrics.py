@@ -83,7 +83,10 @@ def test_demand_burst_necesita_historial_de_rvol():
     primera = b.compute("AAAUSDT", buf, perfil_plano(), ticker(), 5e7, now_ms=ahora)
     assert primera.demand_burst is None  # aun no hay referencia de hace 5 min
 
-    b.record_rvol("AAAUSDT", 3.1, now_ms=ahora - 5 * MINUTO)
+    # compute() usa el ts de la ultima vela cerrada (no `ahora`, que es la
+    # vela en curso) como referencia para "hace 5 minutos".
+    ultima_cerrada_ts = buf.closed(1)[0].ts
+    b.record_rvol("AAAUSDT", 3.1, ts=ultima_cerrada_ts - 5 * MINUTO)
     segunda = b.compute("AAAUSDT", buf, perfil_plano(), ticker(), 5e7, now_ms=ahora)
     # rvol_1m_closed en este instante es 8.0 (ver test del pump); demand_burst
     # debe ser exactamente 8.0 / 3.1, no solo "> 2" (una cota tan floja la
@@ -135,11 +138,14 @@ def test_rvol_hace_elige_el_mas_cercano_no_el_primero_ni_el_ultimo():
     b = constructor()
     buf = buffer_con_pump()
     ahora = buf.current().ts  # rvol_1m_closed en este instante es 8.0 (ver pump)
-    objetivo = ahora - 5 * MINUTO
+    # compute() usa el ts de la ultima vela cerrada (no `ahora`, que es la
+    # vela en curso) como referencia para "hace 5 minutos".
+    ultima_cerrada_ts = buf.closed(1)[0].ts
+    objetivo = ultima_cerrada_ts - 5 * MINUTO
 
-    b.record_rvol("AAAUSDT", 2.0, now_ms=objetivo - 30_000)  # antes: primero registrado
-    b.record_rvol("AAAUSDT", 5.0, now_ms=objetivo)  # exacto: el mas cercano (distancia 0)
-    b.record_rvol("AAAUSDT", 9.0, now_ms=objetivo + 30_000)  # despues: ultimo registrado
+    b.record_rvol("AAAUSDT", 2.0, ts=objetivo - 30_000)  # antes: primero registrado
+    b.record_rvol("AAAUSDT", 5.0, ts=objetivo)  # exacto: el mas cercano (distancia 0)
+    b.record_rvol("AAAUSDT", 9.0, ts=objetivo + 30_000)  # despues: ultimo registrado
 
     m = b.compute("AAAUSDT", buf, perfil_plano(), ticker(), 5e7, now_ms=ahora)
     esperado = 8.0 / 5.0  # rvol_cerrado(8.0) / rvol_hace_mas_cercano(5.0) = 1.6
