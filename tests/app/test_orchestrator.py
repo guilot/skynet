@@ -1,4 +1,6 @@
 # tests/app/test_orchestrator.py
+import logging
+
 import pytest
 
 from scanner_volumen.app.orchestrator import Orchestrator
@@ -180,27 +182,57 @@ async def test_un_evento_de_error_no_rompe_el_orquestador(orq):
 
 
 class RestFalsoParaHuecos:
+    """Simula get_history_candles: `limit` velas terminando en `end_time_ms`,
+    exactamente como el REST real (que solo pagina hacia atrás con endTime)."""
+
     def __init__(self):
         self.llamadas = []
 
-    async def get_candles(self, symbol, limit=200):
-        self.llamadas.append((symbol, limit))
-        base = 14 * DIA
-        return [vela(base + m * MINUTO, close=100.0, vol=100.0) for m in range(limit)]
+    async def get_history_candles(self, symbol, end_time_ms, limit=200):
+        self.llamadas.append((symbol, end_time_ms, limit))
+        return [vela(end_time_ms - m * MINUTO, close=100.0, vol=100.0) for m in range(limit)]
 
 
-async def test_refill_gap_pide_velas_por_rest_y_las_mete_en_el_buffer(orq):
+async def test_refill_gap_pagina_hacia_atras_hasta_cubrir_todo_el_hueco(orq):
+    # Hueco de 500 minutos: con páginas de 200 velas hacen falta 3 llamadas
+    # (200 + 200 + 100) para cubrirlo entero, no una sola.
     orq.rest = RestFalsoParaHuecos()
     await orq.ensure_profile("AAAUSDT", now_ms=14 * DIA)
     await orq.handle_ws_event(
         WsEvent(kind="update", symbol="AAAUSDT", candles=[vela(14 * DIA)])
     )
 
-    await orq.refill_gap("AAAUSDT", now_ms=14 * DIA + 300 * MINUTO)
+    ahora = 14 * DIA + 500 * MINUTO
+    await orq.refill_gap("AAAUSDT", now_ms=ahora)
 
-    assert orq.rest.llamadas == [("AAAUSDT", 200)]
-    assert len(orq.buffers["AAAUSDT"].all_closed()) > 100
+    assert len(orq.rest.llamadas) == 3
+    fin_pedidos = [end for (_sym, end, _lim) in orq.rest.llamadas]
+    assert fin_pedidos == [ahora, ahora - 200 * MINUTO, ahora - 400 * MINUTO]
+
+    # el minuto justo tras la última vela original ya está cubierto: no queda
+    # hueco a mitad de camino.
+    ts_cubiertos = {c.ts for c in orq.buffers["AAAUSDT"].all_closed()}
+    assert (14 * DIA + MINUTO) in ts_cubiertos
     assert "AAAUSDT" in orq.dirty
+
+
+async def test_refill_gap_respeta_el_tope_de_paginas_y_avisa(orq, caplog):
+    # Hueco deliberadamente mayor de lo que MAX_PAGINAS_DE_RELLENO cubre: debe
+    # pedir como máximo el tope de páginas y avisar del tramo sin cubrir, en
+    # vez de encadenar peticiones sin fin.
+    orq.rest = RestFalsoParaHuecos()
+    await orq.ensure_profile("AAAUSDT", now_ms=14 * DIA)
+    await orq.handle_ws_event(
+        WsEvent(kind="update", symbol="AAAUSDT", candles=[vela(14 * DIA)])
+    )
+
+    ahora = 14 * DIA + (Orchestrator.MAX_PAGINAS_DE_RELLENO + 5) * 200 * MINUTO
+    with caplog.at_level(logging.WARNING):
+        await orq.refill_gap("AAAUSDT", now_ms=ahora)
+
+    assert len(orq.rest.llamadas) == Orchestrator.MAX_PAGINAS_DE_RELLENO
+    avisos = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("AAAUSDT" in aviso for aviso in avisos)
 
 
 async def test_refill_gap_no_pide_nada_si_el_buffer_esta_al_dia(orq):
@@ -217,7 +249,7 @@ async def test_refill_gap_no_pide_nada_si_el_buffer_esta_al_dia(orq):
 
 async def test_un_fallo_de_rest_al_rellenar_no_propaga(orq):
     class RestRoto:
-        async def get_candles(self, symbol, limit=200):
+        async def get_history_candles(self, symbol, end_time_ms, limit=200):
             raise RuntimeError("Bitget no responde")
 
     orq.rest = RestRoto()
@@ -239,3 +271,49 @@ async def test_snapshot_marca_el_simbolo_como_reconectado(orq):
         WsEvent(kind="snapshot", symbol="AAAUSDT", candles=[vela(14 * DIA + MINUTO)])
     )
     assert orq.reconnected == {"AAAUSDT"}
+
+
+class RestFalsoParaTickers:
+    def __init__(self, tickers):
+        self._tickers = tickers
+        self.llamadas = 0
+
+    async def get_tickers(self):
+        self.llamadas += 1
+        return self._tickers
+
+
+async def test_poll_tickers_guarda_y_marca_sucios_los_simbolos_con_buffer(orq):
+    await orq.handle_ws_event(
+        WsEvent(kind="update", symbol="AAAUSDT", candles=[vela(14 * DIA)])
+    )
+    orq.dirty.clear()  # aislar el efecto de poll_tickers del que deja handle_ws_event
+
+    ticker_nuevo = Ticker("AAAUSDT", 105.0, 6.4, 5e6, 100.0, 0.0001, 0)
+    ticker_sin_buffer = Ticker("ZZZUSDT", 1.0, 1.0, 1e6, 1.0, 0.0001, 0)
+    orq.rest = RestFalsoParaTickers([ticker_nuevo, ticker_sin_buffer])
+
+    await orq.poll_tickers(now_ms=14 * DIA + MINUTO)
+
+    # queda disponible para que evaluate() lo use al puntuar
+    assert orq.tickers["AAAUSDT"] is ticker_nuevo
+    assert "AAAUSDT" in orq.dirty
+    # símbolo fuera del universo activo (sin buffer): se ignora
+    assert "ZZZUSDT" not in orq.tickers
+
+
+async def test_poll_tickers_no_propaga_fallo_de_rest(orq):
+    class RestRoto:
+        async def get_tickers(self):
+            raise RuntimeError("Bitget no responde")
+
+    orq.rest = RestRoto()
+    await orq.handle_ws_event(
+        WsEvent(kind="update", symbol="AAAUSDT", candles=[vela(14 * DIA)])
+    )
+    orq.dirty.clear()
+
+    await orq.poll_tickers(now_ms=14 * DIA)  # no lanza
+
+    assert orq.tickers == {}
+    assert orq.dirty == set()

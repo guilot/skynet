@@ -13,6 +13,7 @@ import logging
 import time
 
 from scanner_volumen.app.state import ScannerState, SymbolSnapshot
+from scanner_volumen.bitget.rest import MAX_HISTORY_LIMIT
 from scanner_volumen.bitget.ws import WsEvent
 from scanner_volumen.config import Config
 from scanner_volumen.engine.candles import CandleBuffer
@@ -24,6 +25,7 @@ from scanner_volumen.scoring.states import StateMachine, Transition
 from scanner_volumen.storage.repos import CandleRepo, ProfileRepo, SignalRepo
 
 ESTADO_MINIMO_PERSISTIDO = State.HOT
+MINUTO_MS = 60_000
 
 log = logging.getLogger(__name__)
 
@@ -148,13 +150,20 @@ class Orchestrator:
     # --- relleno de huecos tras reconexión ---
 
     MINUTOS_TOLERADOS_DE_HUECO = 3
+    # Tope de páginas de 200 velas que un solo relleno pedirá por REST. 20
+    # páginas x 200 min = 4000 min (~66 h) de hueco cubierto: una caída de
+    # WS de casi 3 días es ya un escenario extremo, y sin este tope un reloj
+    # atascado o un `now_ms` corrupto encadenaría peticiones sin fin.
+    MAX_PAGINAS_DE_RELLENO = 20
 
     async def refill_gap(self, symbol: str, now_ms: int) -> None:
         """Rellena por REST las velas perdidas durante una desconexión.
 
         El snapshot que envía el WebSocket al reconectar cubre solo las últimas
         velas; una caída larga deja un hueco que falsearía el VWAP de sesión y
-        el RVOL acumulado.
+        el RVOL acumulado. `get_candles` no acepta `endTime`, así que para
+        cubrir huecos largos hay que paginar hacia atrás con
+        `get_history_candles`, igual que hace el bootstrap inicial.
         """
         buffer = self.buffers.get(symbol)
         if buffer is None or self.rest is None:
@@ -166,15 +175,40 @@ class Orchestrator:
         if hueco_min <= self.MINUTOS_TOLERADOS_DE_HUECO:
             return
 
-        try:
-            velas = await self.rest.get_candles(symbol, limit=200)
-        except Exception as exc:  # noqa: BLE001 - un relleno fallido no tumba nada
-            log.warning("relleno REST fallido para %s: %s", symbol, exc)
+        # Misma convención que plan_history_requests: la última vela guardada
+        # ya cubre su propio minuto, así que el hueco empieza en el siguiente.
+        desde = actual.ts + MINUTO_MS
+        minutos = max(0, (now_ms - desde) // MINUTO_MS)
+        paginas_necesarias = -(-minutos // MAX_HISTORY_LIMIT)  # división hacia arriba
+        paginas_a_pedir = min(paginas_necesarias, self.MAX_PAGINAS_DE_RELLENO)
+
+        if paginas_necesarias > self.MAX_PAGINAS_DE_RELLENO:
+            cubierto_desde_ms = (
+                now_ms - self.MAX_PAGINAS_DE_RELLENO * MAX_HISTORY_LIMIT * MINUTO_MS
+            )
+            log.warning(
+                "relleno parcial para %s: el hueco de %d min necesita %d páginas "
+                "y el tope es %d; queda sin cubrir el tramo %d-%d",
+                symbol, hueco_min, paginas_necesarias, self.MAX_PAGINAS_DE_RELLENO,
+                desde, cubierto_desde_ms,
+            )
+
+        recibidas = []
+        for i in range(paginas_a_pedir):
+            end_time = now_ms - i * MAX_HISTORY_LIMIT * MINUTO_MS
+            try:
+                velas = await self.rest.get_history_candles(symbol, end_time_ms=end_time)
+            except Exception as exc:  # noqa: BLE001 - una página perdida no aborta el relleno
+                log.warning("página de relleno fallida para %s en %d: %s", symbol, end_time, exc)
+                continue
+            recibidas.extend(velas)
+
+        if not recibidas:
             return
 
-        for vela in sorted(velas, key=lambda c: c.ts):
+        for vela in sorted(recibidas, key=lambda c: c.ts):
             buffer.upsert(vela)
-        self.candle_repo.save_many(symbol, velas)
+        self.candle_repo.save_many(symbol, recibidas)
         self.dirty.add(symbol)
 
     # --- ciclo de vida ---
