@@ -127,6 +127,17 @@ class MetricsBuilder:
 
         inicio_dia = (now_ms // DIA_MS) * DIA_MS
         minuto_actual = minute_of_day(now_ms)
+        # A diferencia de rvol_1m/rvol_5m, aqui NO hay fallback a rolling_baseline
+        # cuando la confianza es baja, y es deliberado: rvol_session compara el
+        # volumen acumulado desde las 00:00 UTC contra una sesion historica
+        # "normal". Un simbolo con poco historial (listing nuevo) no tiene
+        # ninguna sesion pasada con la que compararse; sintetizar una
+        # multiplicando una mediana rolling por los minutos transcurridos
+        # fabricaria un baseline para una sesion que el simbolo nunca vivio,
+        # produciendo un numero con apariencia fiable pero sin fundamento real.
+        # None es la respuesta honesta aqui: el simbolo pierde solo los 5 puntos
+        # del componente rvol_session en el score, pero se sigue escaneando y
+        # puntuando por rvol_1m/5m, momentum, VWAP y burst.
         rvol_ses = rvol_session(
             buffer.session_volume(inicio_dia),
             profile.cumulative_baseline(minuto_actual)
@@ -168,7 +179,7 @@ class MetricsBuilder:
             rvol_session=rvol_ses,
             demand_burst=burst,
             vwap=valor_vwap,
-            vwap_distance=vwap_distance(precio, valor_vwap) if precio else None,
+            vwap_distance=vwap_distance(precio, valor_vwap) if precio is not None else None,
             z_return=z,
             market_cap=market_cap,
             volume_24h=ticker.volume_24h_usdt if ticker else None,

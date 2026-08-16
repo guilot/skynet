@@ -124,6 +124,55 @@ def test_usa_baseline_rolling_cuando_la_confianza_es_baja():
     assert m.rvol_1m_closed is not None and abs(m.rvol_1m_closed - 1.0) < 1e-9
 
 
+def test_rvol_hace_elige_el_mas_cercano_no_el_primero_ni_el_ultimo():
+    """Registra tres valores de RVOL dentro de la tolerancia de +-1 minuto
+    alrededor del objetivo (hace 5 minutos): uno antes, uno exacto y uno
+    despues. El exacto tiene distancia 0 y debe ser el que use demand_burst,
+    no el primero registrado (antes) ni el ultimo (despues) -- eso descarta
+    una regresion de "mas cercano" a "primer match" o "ultimo match" en el
+    bucle de _rvol_hace.
+    """
+    b = constructor()
+    buf = buffer_con_pump()
+    ahora = buf.current().ts  # rvol_1m_closed en este instante es 8.0 (ver pump)
+    objetivo = ahora - 5 * MINUTO
+
+    b.record_rvol("AAAUSDT", 2.0, now_ms=objetivo - 30_000)  # antes: primero registrado
+    b.record_rvol("AAAUSDT", 5.0, now_ms=objetivo)  # exacto: el mas cercano (distancia 0)
+    b.record_rvol("AAAUSDT", 9.0, now_ms=objetivo + 30_000)  # despues: ultimo registrado
+
+    m = b.compute("AAAUSDT", buf, perfil_plano(), ticker(), 5e7, now_ms=ahora)
+    esperado = 8.0 / 5.0  # rvol_cerrado(8.0) / rvol_hace_mas_cercano(5.0) = 1.6
+    assert m.demand_burst is not None and abs(m.demand_burst - esperado) < 1e-9
+
+
+def test_rvol_session_es_none_con_confianza_baja_sin_fallback_rolling():
+    """A diferencia de rvol_1m/rvol_5m, rvol_session NO recurre al baseline
+    rolling cuando la confianza del perfil es baja: no existe sesion
+    historica con la que comparar el volumen acumulado de un simbolo nuevo.
+    Es una decision deliberada (ver comentario en compute()), no un bug
+    pendiente de arreglar, y este test fija ese comportamiento.
+    """
+    b = constructor()
+    velas_pocas = [vela(m * MINUTO, vol=50.0) for m in range(200)]
+    perfil_corto = build_profile(
+        "AAAUSDT", velas_pocas,
+        ProfileConfig(history_days=14, smoothing_window_minutes=0,
+                      min_days_for_confidence=3, rolling_fallback_candles=120),
+    )
+    assert perfil_corto.confidence == "low"
+
+    buf = CandleBuffer("AAAUSDT")
+    for m in range(0, 130):
+        buf.upsert(vela(m * MINUTO, vol=100.0))
+    buf.upsert(vela(130 * MINUTO, vol=900.0))
+
+    m = b.compute("AAAUSDT", buf, perfil_corto, ticker(), 5e7, now_ms=131 * MINUTO)
+    assert m.profile_confidence == "low"
+    assert m.rvol_1m_closed is not None
+    assert m.rvol_session is None
+
+
 def test_el_vwap_se_calcula_solo_sobre_el_dia_utc_en_curso():
     b = constructor()
     buf = CandleBuffer("AAAUSDT")
