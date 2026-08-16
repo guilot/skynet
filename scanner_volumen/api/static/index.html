@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Bitget Real-Time Scanner</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>BITGET REAL-TIME SCANNER</h1>
+    <div class="estado-barra">
+      <span id="conexion" class="pastilla">conectando…</span>
+      <span id="bootstrap" class="pastilla">perfil: —</span>
+      <label>dirección
+        <select id="filtro-direccion">
+          <option value="">todas</option>
+          <option value="LONG">LONG</option>
+          <option value="SHORT">SHORT</option>
+        </select>
+      </label>
+      <label>estado mínimo
+        <select id="filtro-estado">
+          <option value="0">todos</option>
+          <option value="1">WATCH</option>
+          <option value="2">HOT</option>
+          <option value="3">SIGNAL</option>
+          <option value="4">EXTREME</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="sonido" checked> sonido</label>
+    </div>
+  </header>
+
+  <table id="tabla">
+    <thead>
+      <tr>
+        <th>#</th><th>SÍMBOLO</th><th>DIR</th><th>PRECIO</th><th>24H</th>
+        <th>5M</th><th>RVOL 1m</th><th>RVOL 5m</th><th>BURST</th>
+        <th>VWAP %</th><th>SCORE</th><th>ESTADO</th>
+      </tr>
+    </thead>
+    <tbody id="filas"></tbody>
+  </table>
+
+  <aside id="detalle" hidden></aside>
+  <script src="/static/app.js"></script>
+</body>
+</html>

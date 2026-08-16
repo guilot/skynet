@@ -1,0 +1,35 @@
+:root {
+  --fondo: #0d1117; --texto: #c9d1d9; --borde: #30363d;
+  --watch: #1f3a5f; --hot: #5f4a1f; --signal: #1f5f2e; --extreme: #5f1f2e;
+  --verde: #3fb950; --rojo: #f85149;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 1rem; background: var(--fondo); color: var(--texto);
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 13px;
+}
+h1 { font-size: 1.1rem; letter-spacing: .12em; margin: 0 0 .6rem; }
+.estado-barra { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap;
+  margin-bottom: 1rem; }
+.pastilla { padding: .2rem .6rem; border: 1px solid var(--borde); border-radius: 999px; }
+.pastilla.ok { border-color: var(--verde); color: var(--verde); }
+.pastilla.mal { border-color: var(--rojo); color: var(--rojo); }
+select, input { background: #161b22; color: var(--texto);
+  border: 1px solid var(--borde); border-radius: 4px; padding: .15rem .3rem; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: .35rem .5rem; text-align: right; border-bottom: 1px solid var(--borde); }
+th:nth-child(2), td:nth-child(2), th:nth-child(3), td:nth-child(3),
+th:last-child, td:last-child { text-align: left; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: #161b22; }
+tr.WATCH { background: var(--watch); }
+tr.HOT { background: var(--hot); }
+tr.SIGNAL { background: var(--signal); }
+tr.EXTREME { background: var(--extreme); }
+.pos { color: var(--verde); } .neg { color: var(--rojo); }
+.baja-confianza::after { content: " ⚠"; color: #d29922; }
+#detalle { position: fixed; right: 1rem; top: 1rem; width: 320px; padding: 1rem;
+  background: #161b22; border: 1px solid var(--borde); border-radius: 8px; }
+#detalle dl { display: grid; grid-template-columns: 1fr auto; gap: .2rem .8rem;
+  margin: .5rem 0 0; }
+#detalle dt { color: #8b949e; } #detalle dd { margin: 0; text-align: right; }
