@@ -128,6 +128,24 @@ def build_profile(
     )
 
 
+def placeholder_profile(symbol: str) -> VolumeProfile:
+    """Perfil provisional de baja confianza para un símbolo sin bootstrap
+    todavía disponible (arranque en frío no bloqueante).
+
+    Sin slots, así que `baseline`/`cumulative_baseline` siempre devuelven
+    None; el símbolo se sigue puntuando desde el primer minuto vía el
+    fallback de mediana rolling que `MetricsBuilder` ya aplica a cualquier
+    perfil con `confidence != "high"`, en vez de quedarse sin puntuar hasta
+    que termine la descarga real de histórico.
+    """
+    return VolumeProfile(
+        symbol=symbol,
+        slots=tuple(None for _ in range(MINUTOS_POR_DIA)),
+        confidence="low",
+        days_covered=0.0,
+    )
+
+
 def rolling_baseline(candles: list[Candle], n: int) -> float | None:
     """Referencia de emergencia para símbolos sin histórico suficiente:
     mediana de las últimas n velas cerradas."""

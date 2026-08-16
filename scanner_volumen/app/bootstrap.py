@@ -67,6 +67,18 @@ class Bootstrapper:
     def progress(self) -> tuple[int, int]:
         return len(self._completados), len(self._esperados or self._completados)
 
+    def mark_loaded(self, symbol: str) -> None:
+        """Cuenta como completado un símbolo cuyo perfil ya existía en disco.
+
+        En un arranque en caliente, `ensure_profile` carga el perfil
+        directamente de `ProfileRepo` sin pasar por `bootstrap_symbol`, que es
+        el único sitio que hasta ahora engordaba `_completados`. Sin esto,
+        `progress()` se quedaría en 0/N para siempre aunque no falte nada por
+        descargar.
+        """
+        self._esperados.add(symbol)
+        self._completados.add(symbol)
+
     async def bootstrap_symbol(self, symbol: str, now_ms: int) -> VolumeProfile:
         self._esperados.add(symbol)
         paginas = plan_history_requests(

@@ -93,3 +93,49 @@ def test_el_buffer_respeta_su_capacidad():
     for m in range(1, 21):
         buf.upsert(vela(m))
     assert len(buf.all_closed()) <= 5
+
+
+def test_backfill_sobre_buffer_vacio():
+    buf = CandleBuffer("AAAUSDT")
+    velas = [vela(3), vela(1), vela(2)]  # desordenadas, como puede venir SQLite
+    insertadas = buf.backfill(velas)
+    assert insertadas == 3
+    assert [c.ts for c in buf.all_closed()] == [1 * MINUTO, 2 * MINUTO, 3 * MINUTO]
+    assert buf.current() is None
+
+
+def test_backfill_no_altera_current_y_las_historicas_quedan_por_debajo():
+    buf = CandleBuffer("AAAUSDT")
+    buf.upsert(vela(10, close=999.0))  # vela en curso
+    insertadas = buf.backfill([vela(2), vela(1), vela(3)])
+    assert insertadas == 3
+    assert [c.ts for c in buf.all_closed()] == [1 * MINUTO, 2 * MINUTO, 3 * MINUTO]
+    assert buf.current().ts == 10 * MINUTO
+    assert buf.current().close == 999.0
+
+
+def test_backfill_no_duplica_velas_ya_presentes():
+    buf = CandleBuffer("AAAUSDT")
+    buf.backfill([vela(1), vela(2)])
+    insertadas = buf.backfill([vela(2), vela(3)])  # la vela(2) ya está
+    assert insertadas == 1
+    assert [c.ts for c in buf.all_closed()] == [1 * MINUTO, 2 * MINUTO, 3 * MINUTO]
+
+
+def test_backfill_ignora_velas_al_nivel_o_por_encima_de_current():
+    """El histórico solo puede rellenar por debajo de la vela en curso: una
+    vela con el mismo ts (o posterior) que current no es "histórica"."""
+    buf = CandleBuffer("AAAUSDT")
+    buf.upsert(vela(5, close=999.0))
+    insertadas = buf.backfill([vela(4), vela(5, close=1.0), vela(6, close=1.0)])
+    assert insertadas == 1
+    assert [c.ts for c in buf.all_closed()] == [4 * MINUTO]
+    assert buf.current().ts == 5 * MINUTO
+    assert buf.current().close == 999.0
+
+
+def test_backfill_respeta_la_capacidad():
+    buf = CandleBuffer("AAAUSDT", capacity=3)
+    insertadas = buf.backfill([vela(m) for m in range(1, 6)])
+    assert insertadas == 3
+    assert [c.ts for c in buf.all_closed()] == [3 * MINUTO, 4 * MINUTO, 5 * MINUTO]

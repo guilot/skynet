@@ -1,4 +1,5 @@
 # tests/app/test_orchestrator.py
+import asyncio
 import logging
 
 import pytest
@@ -12,6 +13,7 @@ from scanner_volumen.storage.db import open_db
 from scanner_volumen.storage.repos import (
     CandleRepo, ProfileRepo, SignalRepo, SupplyRepo,
 )
+from scanner_volumen.universe.selector import UniverseUpdate
 from pathlib import Path
 
 MINUTO = 60_000
@@ -47,6 +49,50 @@ class BootstrapperFalso:
 
     def progress(self):
         return (len(self.pedidos), len(self.pedidos))
+
+    def mark_loaded(self, symbol):
+        pass
+
+
+class WsFalso:
+    """Registra suscripciones sin abrir ningún socket real."""
+
+    def __init__(self):
+        self.subscribed: list[list[str]] = []
+        self.unsubscribed: list[list[str]] = []
+
+    async def subscribe(self, symbols):
+        self.subscribed.append(list(symbols))
+
+    async def unsubscribe(self, symbols):
+        self.unsubscribed.append(list(symbols))
+
+
+class BootstrapperLento:
+    """Bootstrapper cuyo bootstrap_symbol no termina hasta que el test lo
+    libera explícitamente, para poder comprobar que apply_universe no
+    espera a que termine."""
+
+    def __init__(self, cfg):
+        self._cfg = cfg
+        self.terminados: list[str] = []
+        self.evento = asyncio.Event()
+
+    async def bootstrap_symbol(self, symbol, now_ms):
+        await self.evento.wait()
+        self.terminados.append(symbol)
+        velas = [vela(d * DIA + m * MINUTO, vol=100.0)
+                 for d in range(14) for m in range(1440)]
+        return build_profile(symbol, velas, self._cfg)
+
+    def expect(self, symbols):
+        pass
+
+    def progress(self):
+        return (len(self.terminados), len(self.terminados))
+
+    def mark_loaded(self, symbol):
+        pass
 
 
 @pytest.fixture
@@ -135,6 +181,38 @@ async def test_un_pump_genera_transicion_y_se_persiste(orq):
     assert snap.state.rank >= State.WATCH.rank
     assert escaladas_a_hot_o_mas >= 1
     assert len(orq.signal_repo.recent(since_ms=0)) == escaladas_a_hot_o_mas
+
+
+async def test_rvol_session_y_vwap_reflejan_la_sesion_completa_no_solo_lo_llegado_por_ws(orq):
+    """Regresión C3: sin sembrar el buffer desde SQLite en el arranque,
+    rvol_session y vwap solo ven lo que llega por WebSocket desde que
+    arrancó el proceso, no la sesión completa desde las 00:00 UTC."""
+    base = 14 * DIA
+    minutos_del_dia = 14 * 60  # el proceso "arranca" a las 14:00 UTC
+    velas_dia = [
+        vela(base + m * MINUTO, close=100.0 + m * 0.01, vol=100.0)
+        for m in range(minutos_del_dia)
+    ]
+    orq.candle_repo.save_many("AAAUSDT", velas_dia)
+
+    await orq.ensure_profile("AAAUSDT", now_ms=base + minutos_del_dia * MINUTO)
+    orq.set_ticker(Ticker("AAAUSDT", 108.4, 1.0, 5e6, 100.0, 0.0001, 0))
+    # el WS solo entrega la vela del minuto en curso, como en un arranque real:
+    # el histórico ya guardado en SQLite nunca llega por WS.
+    await orq.handle_ws_event(
+        WsEvent(kind="update", symbol="AAAUSDT",
+                candles=[vela(base + minutos_del_dia * MINUTO, close=108.4, vol=100.0)])
+    )
+    orq.evaluate(now_ms=base + minutos_del_dia * MINUTO + 30_000)
+
+    snap = orq.state.snapshot("AAAUSDT")
+    # sesión completa (841 velas a 100 quote-vol constante) contra un
+    # baseline acumulado idéntico: rvol_session debe rondar 1.0, no
+    # 100/84100 (~0.0012), que es lo que da una sola vela de WS.
+    assert snap.metrics.rvol_session == pytest.approx(1.0, rel=1e-6)
+    # vwap de la sesión completa (closes de 100.0 a 108.4) es su promedio,
+    # 104.2; sin siembra sería 108.4, el close de la única vela de WS.
+    assert snap.metrics.vwap == pytest.approx(104.2, rel=1e-6)
 
 
 async def test_ranked_ordena_por_score_descendente(orq):
@@ -364,3 +442,26 @@ async def test_poll_tickers_no_propaga_fallo_de_rest(orq):
 
     assert orq.tickers == {}
     assert orq.dirty == set()
+
+
+async def test_apply_universe_no_espera_a_que_terminen_los_bootstraps(orq):
+    """Regresión C1: en frío, apply_universe no debe bloquear ~25 minutos
+    esperando ensure_profile de cada símbolo antes de suscribir el WS."""
+    orq.ws = WsFalso()
+    orq.bootstrapper = BootstrapperLento(orq.cfg.profile)
+    update = UniverseUpdate(
+        symbols=frozenset({"AAAUSDT"}), added=frozenset({"AAAUSDT"}),
+        removed=frozenset(), ordered=["AAAUSDT"],
+    )
+
+    # si apply_universe esperase al bootstrap (que nunca se libera aquí),
+    # esto colgaría hasta el timeout: fallo limpio en vez de bloquear la
+    # suite entera.
+    await asyncio.wait_for(orq.apply_universe(update, now_ms=14 * DIA), timeout=0.5)
+
+    assert orq.ws.subscribed == [["AAAUSDT"]]  # el WS ya está suscrito...
+    assert orq.bootstrapper.terminados == []  # ...aunque el bootstrap real no ha terminado
+
+    orq.bootstrapper.evento.set()
+    await asyncio.sleep(0)  # deja correr la tarea de fondo ya lanzada
+    assert orq.bootstrapper.terminados == ["AAAUSDT"]

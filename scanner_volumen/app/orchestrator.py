@@ -18,7 +18,7 @@ from scanner_volumen.bitget.ws import WsEvent
 from scanner_volumen.config import Config
 from scanner_volumen.engine.candles import CandleBuffer
 from scanner_volumen.engine.metrics import MetricsBuilder
-from scanner_volumen.engine.profile import VolumeProfile
+from scanner_volumen.engine.profile import VolumeProfile, placeholder_profile
 from scanner_volumen.models import State, Ticker
 from scanner_volumen.scoring.score import score_symbol
 from scanner_volumen.scoring.states import StateMachine, Transition
@@ -26,6 +26,7 @@ from scanner_volumen.storage.repos import CandleRepo, ProfileRepo, SignalRepo
 
 ESTADO_MINIMO_PERSISTIDO = State.HOT
 MINUTO_MS = 60_000
+DIA_MS = 1440 * MINUTO_MS
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +53,11 @@ class Orchestrator:
         # símbolos que acaban de recibir un "snapshot" (reconexión de WS) y
         # todavía no han pasado por refill_gap; el bucle principal lo consume.
         self.reconnected: set[str] = set()
+        # bootstraps reales lanzados en segundo plano por apply_universe,
+        # indexados por símbolo; evita lanzar dos a la vez para el mismo
+        # símbolo y mantiene una referencia viva para que la tarea no se
+        # recolecte a mitad de vuelo.
+        self._bootstrap_tasks: dict[str, asyncio.Task] = {}
 
         self._metrics = MetricsBuilder(cfg.engine, cfg.profile)
         self._states = StateMachine(cfg.states)
@@ -64,11 +70,43 @@ class Orchestrator:
     async def ensure_profile(self, symbol: str, now_ms: int) -> VolumeProfile:
         if symbol in self.profiles:
             return self.profiles[symbol]
-        perfil = self.profile_repo.load(symbol)
-        if perfil is None:
-            perfil = await self.bootstrapper.bootstrap_symbol(symbol, now_ms)
+        perfil = await self._load_or_bootstrap(symbol, now_ms)
         self.profiles[symbol] = perfil
+        await self.seed_buffer(symbol, now_ms)
         return perfil
+
+    async def _load_or_bootstrap(self, symbol: str, now_ms: int) -> VolumeProfile:
+        """Perfil real: de disco si ya existe, o descargado por completo si no.
+
+        Bloquea hasta tener el perfil definitivo; existe separado de
+        `ensure_profile` para que `apply_universe` pueda lanzarlo en una
+        tarea de fondo sin esperar a que termine (C1) mientras
+        `ensure_profile` sigue siendo síncrono para quien lo llama
+        directamente.
+        """
+        perfil = self.profile_repo.load(symbol)
+        if perfil is not None:
+            self.bootstrapper.mark_loaded(symbol)
+            return perfil
+        return await self.bootstrapper.bootstrap_symbol(symbol, now_ms)
+
+    async def seed_buffer(self, symbol: str, now_ms: int) -> None:
+        """Siembra el buffer con el histórico ya persistido en SQLite.
+
+        Sin esto, `Orchestrator.buffers` solo se rellena con lo que llega por
+        WS desde que arrancó el proceso: `session_volume` y `vwap` medirían
+        "desde que arrancó el proceso" en vez de "desde las 00:00 UTC" (C3),
+        aunque el bootstrap ya hubiese guardado semanas de velas en disco.
+        Carga desde el inicio del día en curso, o desde `now_ms - capacity`
+        si eso cae más atrás (para no pedir más de lo que el buffer puede
+        retener), lo que sea anterior.
+        """
+        buffer = self.buffers.setdefault(symbol, CandleBuffer(symbol))
+        inicio_dia = (now_ms // DIA_MS) * DIA_MS
+        desde = min(inicio_dia, now_ms - buffer.capacity * MINUTO_MS)
+        historicas = self.candle_repo.load(symbol, desde)
+        if historicas:
+            buffer.backfill(historicas)
 
     async def handle_ws_event(self, event: WsEvent) -> None:
         if event.kind not in ("snapshot", "update") or not event.symbol:
@@ -224,17 +262,55 @@ class Orchestrator:
     # --- ciclo de vida ---
 
     async def apply_universe(self, update, now_ms: int) -> None:
-        for simbolo in update.ordered:
-            await self.ensure_profile(simbolo, now_ms)
+        """Aplica un cambio de universo sin bloquear en el bootstrap (C1).
+
+        En frío, descargar 14 días de histórico son ~101 páginas REST por
+        símbolo tras un token bucket de 10 req/s: esperar a `ensure_profile`
+        de cada símbolo antes de suscribir el WS dejaría el escáner ~25 min
+        sin una sola vela ni un ticker. Por eso el WS se suscribe primero, y
+        el bootstrap real de cada símbolo se lanza como tarea de fondo,
+        sembrando antes un perfil provisional de baja confianza para que el
+        símbolo puntúe desde el primer minuto vía el fallback de mediana
+        rolling en vez de quedarse sin puntuar hasta que termine su descarga.
+        """
         for simbolo in update.removed:
             self.buffers.pop(simbolo, None)
             self.profiles.pop(simbolo, None)
             self.state.drop(simbolo)
+            tarea = self._bootstrap_tasks.pop(simbolo, None)
+            if tarea is not None:
+                tarea.cancel()
+
         if self.ws is not None:
             if update.added:
                 await self.ws.subscribe(sorted(update.added))
             if update.removed:
                 await self.ws.unsubscribe(sorted(update.removed))
+
+        for simbolo in update.ordered:
+            if simbolo in self.profiles or simbolo in self._bootstrap_tasks:
+                continue
+            self.profiles[simbolo] = placeholder_profile(simbolo)
+            await self.seed_buffer(simbolo, now_ms)
+            tarea = asyncio.create_task(self._bootstrap_en_fondo(simbolo, now_ms))
+            self._bootstrap_tasks[simbolo] = tarea
+
+    async def _bootstrap_en_fondo(self, symbol: str, now_ms: int) -> None:
+        """Obtiene el perfil real y sustituye el provisional cuando termina.
+
+        Fire-and-forget desde `apply_universe`: un fallo aquí no debe tumbar
+        el bucle principal, así que se registra y se abandona ese símbolo con
+        el perfil provisional hasta el siguiente refresco de universo.
+        """
+        try:
+            perfil = await self._load_or_bootstrap(symbol, now_ms)
+            self.profiles[symbol] = perfil
+            await self.seed_buffer(symbol, now_ms)
+            self.dirty.add(symbol)
+        except Exception as exc:  # noqa: BLE001 - un bootstrap de fondo fallido no tumba el bucle
+            log.warning("bootstrap en segundo plano fallido para %s: %s", symbol, exc)
+        finally:
+            self._bootstrap_tasks.pop(symbol, None)
 
     async def run(self) -> None:
         """Bucle principal del escáner en vivo.

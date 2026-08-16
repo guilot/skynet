@@ -17,6 +17,7 @@ MINUTO_MS = 60_000
 class CandleBuffer:
     def __init__(self, symbol: str, capacity: int = 1500) -> None:
         self.symbol = symbol
+        self.capacity = capacity
         self._closed: deque[Candle] = deque(maxlen=capacity)
         self._current: Candle | None = None
         self._by_ts: dict[int, Candle] = {}
@@ -85,3 +86,39 @@ class CandleBuffer:
         if self._current is not None and self._current.ts >= day_start_ms:
             total += self._current.quote_vol
         return total
+
+    def backfill(self, candles: list[Candle]) -> int:
+        """Inserta velas históricas (p. ej. leídas de SQLite en el arranque)
+        sin tocar la vela en curso.
+
+        A diferencia de `upsert`, que descarta cualquier vela más antigua que
+        `_current` para que un mensaje de WS tardío no reabra una vela ya
+        cerrada, `backfill` es la puerta explícita para sembrar el histórico:
+        solo admite velas estrictamente anteriores a `_current` (o cualquier
+        vela si aún no hay vela en curso), ignora las que ya están en el
+        buffer y respeta la capacidad, descartando las más antiguas si no
+        caben todas. Devuelve cuántas quedaron efectivamente insertadas.
+        """
+        limite = self._current.ts if self._current is not None else None
+        existentes = {c.ts for c in self._closed}
+        candidatas: dict[int, Candle] = {}
+        for vela in candles:
+            if limite is not None and vela.ts >= limite:
+                continue
+            if vela.ts in existentes:
+                continue
+            candidatas[vela.ts] = vela
+        if not candidatas:
+            return 0
+
+        combinadas = sorted([*self._closed, *candidatas.values()], key=lambda c: c.ts)
+        maxlen = self._closed.maxlen
+        if maxlen is not None and len(combinadas) > maxlen:
+            combinadas = combinadas[-maxlen:]
+
+        ts_finales = {c.ts for c in combinadas}
+        insertadas = sum(1 for ts in candidatas if ts in ts_finales)
+
+        self._closed = deque(combinadas, maxlen=maxlen)
+        self._by_ts = {c.ts: c for c in combinadas}
+        return insertadas
