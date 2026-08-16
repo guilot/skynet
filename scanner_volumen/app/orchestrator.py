@@ -12,6 +12,7 @@ import asyncio
 import logging
 import time
 
+from scanner_volumen.app.bootstrap import plan_history_requests
 from scanner_volumen.app.state import ScannerState, SymbolSnapshot
 from scanner_volumen.bitget.rest import MAX_HISTORY_LIMIT
 from scanner_volumen.bitget.ws import WsEvent
@@ -53,6 +54,12 @@ class Orchestrator:
         # símbolos que acaban de recibir un "snapshot" (reconexión de WS) y
         # todavía no han pasado por refill_gap; el bucle principal lo consume.
         self.reconnected: set[str] = set()
+        # ts de la vela que era `current()` justo ANTES de aplicar un
+        # snapshot de reconexión, indexado por símbolo. refill_gap mide el
+        # hueco contra este valor en vez de contra buffer.current(), porque
+        # para cuando corre ya se le aplicaron las velas del snapshot y
+        # current() sería la más reciente (hueco ~= 0, C4a).
+        self._reconnect_gap_from: dict[str, int] = {}
         # bootstraps reales lanzados en segundo plano por apply_universe,
         # indexados por símbolo; evita lanzar dos a la vez para el mismo
         # símbolo y mantiene una referencia viva para que la tarea no se
@@ -94,8 +101,40 @@ class Orchestrator:
         perfil = self.profile_repo.load(symbol)
         if perfil is not None:
             self.bootstrapper.mark_loaded(symbol)
+            await self._rellenar_hueco_de_reinicio(symbol, now_ms)
             return perfil
         return await self.bootstrapper.bootstrap_symbol(symbol, now_ms)
+
+    async def _rellenar_hueco_de_reinicio(self, symbol: str, now_ms: int) -> None:
+        """Cubre en SQLite el hueco de histórico de un símbolo cuyo perfil
+        ya vivía en disco (reinicio en caliente).
+
+        `bootstrap_symbol` es hoy el único llamador de `plan_history_requests`,
+        y solo se invoca cuando NO hay perfil guardado: con perfil en disco el
+        hueco entre la parada y el reinicio nunca se rellenaba (C4c), pese a
+        que la spec y el README prometen que "los reinicios posteriores solo
+        rellenan el hueco". Usa el mismo `plan_history_requests` que
+        `bootstrap_symbol` -sin reconstruir el perfil, que ya es válido y no
+        hace falta recalcular aquí-. No toca el buffer directamente: el
+        `seed_buffer` que corre justo después en `ensure_profile` relee de
+        SQLite y recoge estas velas recién guardadas.
+        """
+        if self.rest is None:
+            return
+        paginas = plan_history_requests(
+            self.candle_repo.latest_ts(symbol), now_ms, self.cfg.profile.history_days
+        )
+        for end_time in paginas:
+            try:
+                velas = await self.rest.get_history_candles(symbol, end_time_ms=end_time)
+            except Exception as exc:  # noqa: BLE001 - una página perdida no aborta el relleno
+                log.warning(
+                    "página de relleno (reinicio en caliente) fallida para %s en %d: %s",
+                    symbol, end_time, exc,
+                )
+                continue
+            if velas:
+                self.candle_repo.save_many(symbol, velas)
 
     async def seed_buffer(self, symbol: str, now_ms: int) -> None:
         """Siembra el buffer con el histórico ya persistido en SQLite.
@@ -119,6 +158,18 @@ class Orchestrator:
         if event.kind not in ("snapshot", "update") or not event.symbol:
             return
         buffer = self.buffers.setdefault(event.symbol, CandleBuffer(event.symbol))
+        if event.kind == "snapshot":
+            # capturamos el estado del buffer ANTES de aplicar las velas del
+            # snapshot: si lo hiciéramos después, `current()` ya sería la
+            # vela más reciente que el propio snapshot acaba de traer, y
+            # refill_gap mediría un hueco ~= 0 (C4a). Si no había vela
+            # previa (símbolo nuevo), no hay hueco real que medir contra
+            # historia: se limpia cualquier entrada vieja.
+            previa = buffer.current()
+            if previa is not None:
+                self._reconnect_gap_from[event.symbol] = previa.ts
+            else:
+                self._reconnect_gap_from.pop(event.symbol, None)
         cerradas = []
         for vela in event.candles:
             if buffer.upsert(vela):
@@ -211,16 +262,24 @@ class Orchestrator:
         buffer = self.buffers.get(symbol)
         if buffer is None or self.rest is None:
             return
-        actual = buffer.current()
-        if actual is None:
-            return
-        hueco_min = (now_ms - actual.ts) // 60_000
+        # el hueco se mide contra la última vela que teníamos ANTES del
+        # snapshot de reconexión (capturada en handle_ws_event), no contra
+        # buffer.current() ya refrescado por el propio snapshot (C4a). Si no
+        # hay una entrada capturada (p. ej. refill_gap se llama fuera del
+        # flujo de reconexión), se cae al comportamiento anterior.
+        anterior_ts = self._reconnect_gap_from.pop(symbol, None)
+        if anterior_ts is None:
+            actual = buffer.current()
+            if actual is None:
+                return
+            anterior_ts = actual.ts
+        hueco_min = (now_ms - anterior_ts) // 60_000
         if hueco_min <= self.MINUTOS_TOLERADOS_DE_HUECO:
             return
 
         # Misma convención que plan_history_requests: la última vela guardada
         # ya cubre su propio minuto, así que el hueco empieza en el siguiente.
-        desde = actual.ts + MINUTO_MS
+        desde = anterior_ts + MINUTO_MS
         minutos = max(0, (now_ms - desde) // MINUTO_MS)
         # Se verificó contra la API real que `endTime` es exclusivo (una
         # petición con endTime a las 20:08 devolvió velas hasta las 20:07), así
@@ -259,8 +318,12 @@ class Orchestrator:
         if not recibidas:
             return
 
-        for vela in sorted(recibidas, key=lambda c: c.ts):
-            buffer.upsert(vela)
+        # `backfill`, no `upsert`: las velas recibidas son anteriores a la
+        # vela en curso (que ya llegó por el snapshot), y `upsert` las
+        # descartaría en silencio por ser "más viejas que la actual" -ese es
+        # justo su propósito normal, evitar que un mensaje de WS tardío
+        # reabra una vela ya cerrada- pero aquí es contraproducente (C4b).
+        buffer.backfill(recibidas)
         self.candle_repo.save_many(symbol, recibidas)
         self.dirty.add(symbol)
 

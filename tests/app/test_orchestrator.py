@@ -316,6 +316,12 @@ async def test_refill_gap_pagina_hacia_atras_hasta_cubrir_todo_el_hueco(orq):
     )
 
     ahora = 14 * DIA + 500 * MINUTO
+    # reconexión real: el snapshot trae la vela EN CURSO (ahora), como haría
+    # el WS de verdad; eso es lo que fija la vela previa como límite de
+    # backfill y activa la medición correcta del hueco (C4a/C4b).
+    await orq.handle_ws_event(
+        WsEvent(kind="snapshot", symbol="AAAUSDT", candles=[vela(ahora)])
+    )
     await orq.refill_gap("AAAUSDT", now_ms=ahora)
 
     assert len(orq.rest.llamadas) == 3
@@ -343,6 +349,9 @@ async def test_refill_gap_cubre_el_hueco_en_el_multiplo_exacto_de_200_min(orq):
 
     desde = 14 * DIA + MINUTO
     ahora = desde + 200 * MINUTO  # minutos == 200 exactos
+    await orq.handle_ws_event(
+        WsEvent(kind="snapshot", symbol="AAAUSDT", candles=[vela(ahora)])
+    )
     await orq.refill_gap("AAAUSDT", now_ms=ahora)
 
     assert len(orq.rest.llamadas) == 2  # 1 página no bastaría para cubrir `desde`
@@ -365,6 +374,9 @@ async def test_refill_gap_cubre_el_hueco_en_el_multiplo_exacto_de_400_min(orq):
 
     desde = 14 * DIA + MINUTO
     ahora = desde + 400 * MINUTO  # minutos == 400 exactos
+    await orq.handle_ws_event(
+        WsEvent(kind="snapshot", symbol="AAAUSDT", candles=[vela(ahora)])
+    )
     await orq.refill_gap("AAAUSDT", now_ms=ahora)
 
     assert len(orq.rest.llamadas) == 3  # 2 páginas no bastarían para cubrir `desde`
@@ -418,6 +430,63 @@ async def test_un_fallo_de_rest_al_rellenar_no_propaga(orq):
         WsEvent(kind="update", symbol="AAAUSDT", candles=[vela(14 * DIA)])
     )
     await orq.refill_gap("AAAUSDT", now_ms=14 * DIA + 300 * MINUTO)  # no lanza
+
+
+async def test_refill_gap_se_dispara_con_un_snapshot_real_tras_parada_larga(orq):
+    """Regresión (a)+(b) de C4: un snapshot real de reconexión -no un
+    `update`- es lo único que activa `reconnected`, y por eso es la única
+    forma honesta de probar refill_gap end-to-end. Antes del fix, las velas
+    del snapshot entraban en el buffer ANTES de marcar el símbolo, así que
+    cuando el bucle principal drenaba `reconnected` y llamaba a refill_gap,
+    buffer.current() ya era la vela recién llegada del propio snapshot:
+    hueco_min ~= 0 y no se pedía nada por REST. Y aunque se pidiera, las
+    velas traídas quedarían por detrás de `_current` y `upsert` las
+    descartaría en silencio."""
+    orq.rest = RestFalsoParaHuecos()
+    await orq.ensure_profile("AAAUSDT", now_ms=14 * DIA)
+    await orq.handle_ws_event(
+        WsEvent(kind="update", symbol="AAAUSDT", candles=[vela(14 * DIA)])
+    )
+
+    ahora = 14 * DIA + 500 * MINUTO  # el WS estuvo caído ~8h20
+    # reconexión real: el WS manda un snapshot con la vela en curso ACTUAL,
+    # no la vieja de antes de la caída.
+    await orq.handle_ws_event(
+        WsEvent(kind="snapshot", symbol="AAAUSDT", candles=[vela(ahora)])
+    )
+    assert "AAAUSDT" in orq.reconnected
+
+    await orq.refill_gap("AAAUSDT", now_ms=ahora)
+
+    assert orq.rest.llamadas != []  # el hueco real (500 min) sí debe disparar peticiones
+    ts_cubiertos = {c.ts for c in orq.buffers["AAAUSDT"].all_closed()}
+    assert (14 * DIA + MINUTO) in ts_cubiertos  # el hueco quedó relleno, no descartado
+
+
+async def test_ensure_profile_rellena_el_hueco_en_un_reinicio_en_caliente(orq):
+    """Regresión (c) de C4: con el perfil ya en disco (reinicio en
+    caliente), ensure_profile debe pedir igualmente el histórico que falta
+    desde la última vela guardada. Antes del fix, bootstrap_symbol -único
+    llamador de plan_history_requests- solo se invocaba cuando NO había
+    perfil guardado, así que con perfil en disco el hueco de la parada no
+    se rellenaba nunca, contradiciendo la spec y el README."""
+    orq.rest = RestFalsoParaHuecos()
+    base = 14 * DIA
+    orq.candle_repo.save_many("AAAUSDT", [vela(base)])  # última vela antes de la parada
+
+    velas_perfil = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(14) for m in range(1440)]
+    perfil = build_profile("AAAUSDT", velas_perfil, orq.cfg.profile)
+    orq.profile_repo.save(perfil)  # perfil ya en disco: simula el reinicio en caliente
+
+    ahora = base + 300 * MINUTO  # hueco de 5h desde la última vela persistida
+    await orq.ensure_profile("AAAUSDT", now_ms=ahora)
+
+    assert orq.rest.llamadas != []  # se pidió histórico real para tapar el hueco
+    assert orq.bootstrapper.pedidos == []  # no se reconstruyó el perfil: ya era válido
+    ts_guardados = {c.ts for c in orq.candle_repo.load("AAAUSDT", base)}
+    assert (base + MINUTO) in ts_guardados  # el hueco quedó cubierto en SQLite
+    ts_en_buffer = {c.ts for c in orq.buffers["AAAUSDT"].all_closed()}
+    assert (base + MINUTO) in ts_en_buffer  # y seed_buffer lo recogió en el buffer
 
 
 async def test_snapshot_marca_el_simbolo_como_reconectado(orq):
