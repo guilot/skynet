@@ -216,6 +216,53 @@ async def test_refill_gap_pagina_hacia_atras_hasta_cubrir_todo_el_hueco(orq):
     assert "AAAUSDT" in orq.dirty
 
 
+async def test_refill_gap_cubre_el_hueco_en_el_multiplo_exacto_de_200_min(orq):
+    # Caso límite: `minutos` (el tramo [desde, now_ms) en minutos) cae justo
+    # en 200, un múltiplo exacto de MAX_HISTORY_LIMIT. Con una sola página
+    # (ceil(200/200)=1) la vela de `desde` queda fuera si `endTime` resultase
+    # ser exclusivo; la página de más garantiza que quede cubierta pase lo
+    # que pase con esa semántica.
+    orq.rest = RestFalsoParaHuecos()
+    await orq.ensure_profile("AAAUSDT", now_ms=14 * DIA)
+    await orq.handle_ws_event(
+        WsEvent(kind="update", symbol="AAAUSDT", candles=[vela(14 * DIA)])
+    )
+
+    desde = 14 * DIA + MINUTO
+    ahora = desde + 200 * MINUTO  # minutos == 200 exactos
+    await orq.refill_gap("AAAUSDT", now_ms=ahora)
+
+    assert len(orq.rest.llamadas) == 2  # 1 página no bastaría para cubrir `desde`
+    fin_pedidos = [end for (_sym, end, _lim) in orq.rest.llamadas]
+    assert fin_pedidos == [ahora, ahora - 200 * MINUTO]
+
+    ts_cubiertos = {c.ts for c in orq.buffers["AAAUSDT"].all_closed()}
+    assert desde in ts_cubiertos  # la vela justo tras el hueco no se pierde
+
+
+async def test_refill_gap_cubre_el_hueco_en_el_multiplo_exacto_de_400_min(orq):
+    # Mismo caso límite que arriba pero en el segundo múltiplo (400 min), para
+    # confirmar que la página de más se añade en cada frontera, no solo en la
+    # primera.
+    orq.rest = RestFalsoParaHuecos()
+    await orq.ensure_profile("AAAUSDT", now_ms=14 * DIA)
+    await orq.handle_ws_event(
+        WsEvent(kind="update", symbol="AAAUSDT", candles=[vela(14 * DIA)])
+    )
+
+    desde = 14 * DIA + MINUTO
+    ahora = desde + 400 * MINUTO  # minutos == 400 exactos
+    await orq.refill_gap("AAAUSDT", now_ms=ahora)
+
+    assert len(orq.rest.llamadas) == 3  # 2 páginas no bastarían para cubrir `desde`
+    fin_pedidos = [end for (_sym, end, _lim) in orq.rest.llamadas]
+    assert fin_pedidos == [ahora, ahora - 200 * MINUTO, ahora - 400 * MINUTO]
+    assert fin_pedidos[-1] == desde  # la última página termina justo en `desde`
+
+    ts_cubiertos = {c.ts for c in orq.buffers["AAAUSDT"].all_closed()}
+    assert desde in ts_cubiertos  # la vela justo tras el hueco no se pierde
+
+
 async def test_refill_gap_respeta_el_tope_de_paginas_y_avisa(orq, caplog):
     # Hueco deliberadamente mayor de lo que MAX_PAGINAS_DE_RELLENO cubre: debe
     # pedir como máximo el tope de páginas y avisar del tramo sin cubrir, en

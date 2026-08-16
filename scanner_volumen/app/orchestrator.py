@@ -179,7 +179,17 @@ class Orchestrator:
         # ya cubre su propio minuto, así que el hueco empieza en el siguiente.
         desde = actual.ts + MINUTO_MS
         minutos = max(0, (now_ms - desde) // MINUTO_MS)
-        paginas_necesarias = -(-minutos // MAX_HISTORY_LIMIT)  # división hacia arriba
+        # Se verificó contra la API real que `endTime` es exclusivo (una
+        # petición con endTime a las 20:08 devolvió velas hasta las 20:07), así
+        # que en teoría `minutos` páginas ya cubrirían el tramo [desde, now_ms].
+        # Pero este método existe justo para que un hueco silencioso no
+        # falsee el VWAP y el RVOL de sesión, así que no queremos que su
+        # corrección dependa de un detalle de la API que no podemos
+        # reverificar desde los tests: se pide una página de más (+1) a
+        # propósito, como seguro, para que la cuenta salga sea cual sea la
+        # semántica real de `endTime`. La redundancia sale gratis porque
+        # CandleRepo.save_many hace upsert.
+        paginas_necesarias = -(-(minutos + 1) // MAX_HISTORY_LIMIT)  # división hacia arriba
         paginas_a_pedir = min(paginas_necesarias, self.MAX_PAGINAS_DE_RELLENO)
 
         if paginas_necesarias > self.MAX_PAGINAS_DE_RELLENO:
