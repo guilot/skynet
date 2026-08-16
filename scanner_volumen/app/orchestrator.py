@@ -65,6 +65,13 @@ class Orchestrator:
         # símbolo y mantiene una referencia viva para que la tarea no se
         # recolecte a mitad de vuelo.
         self._bootstrap_tasks: dict[str, asyncio.Task] = {}
+        # rellenos de hueco de reinicio en caliente lanzados en segundo
+        # plano por apply_universe (ver `_resolver_perfil`), indexados por
+        # símbolo; registro separado de `_bootstrap_tasks` porque un
+        # símbolo con perfil ya en disco nunca pasa por el bootstrap real
+        # (Finding 2) y por tanto no debe contarse como "bootstrap en
+        # vuelo" para el guard de dedup de `apply_universe`.
+        self._gap_fill_tasks: dict[str, asyncio.Task] = {}
         # símbolos cuyo `self.profiles[simbolo]` es hoy un `placeholder_profile`
         # y no un perfil real; el dict `profiles` no distingue por sí solo
         # entre ambos, así que sin este registro un bootstrap fallido dejaría
@@ -93,31 +100,104 @@ class Orchestrator:
         """Perfil real: de disco si ya existe, o descargado por completo si no.
 
         Bloquea hasta tener el perfil definitivo; existe separado de
-        `ensure_profile` para que `apply_universe` pueda lanzarlo en una
+        `ensure_profile` para que `_bootstrap_en_fondo` pueda lanzarlo en una
         tarea de fondo sin esperar a que termine (C1) mientras
         `ensure_profile` sigue siendo síncrono para quien lo llama
-        directamente.
+        directamente. El caso de perfil ya en disco cubre también el hueco
+        de reinicio en caliente de forma síncrona (`hueco_en_fondo=False`):
+        quien llama aquí -`ensure_profile` o el bootstrap de fondo- ya
+        espera a un resultado definitivo, así que no gana nada difiriendo
+        el relleno.
         """
-        perfil = self.profile_repo.load(symbol)
+        perfil = await self._resolver_perfil(symbol, now_ms, hueco_en_fondo=False)
         if perfil is not None:
-            self.bootstrapper.mark_loaded(symbol)
-            await self._rellenar_hueco_de_reinicio(symbol, now_ms)
             return perfil
         return await self.bootstrapper.bootstrap_symbol(symbol, now_ms)
+
+    async def _resolver_perfil(
+        self, symbol: str, now_ms: int, *, hueco_en_fondo: bool
+    ) -> VolumeProfile | None:
+        """Único punto del código que resuelve un "reinicio en caliente".
+
+        Carga el perfil de disco si ya existe; si lo hay, lo marca cargado
+        en el bootstrapper y dispara el relleno del hueco de histórico
+        entre la parada y el reinicio (C4c: sin esto la spec y el README
+        prometen algo que el código no cumplía). Devuelve `None` si no hay
+        nada en disco, para que el llamador sepa que hace falta un
+        bootstrap real por REST.
+
+        `_load_or_bootstrap` (usado por `ensure_profile` y por el bootstrap
+        de fondo) y `apply_universe` compartían antes cada uno su propia
+        copia de este "si hay perfil en disco..."; con dos copias
+        divergentes, solo una -la de `_load_or_bootstrap`, inalcanzable en
+        producción porque `apply_universe` nunca la invoca- rellenaba el
+        hueco. `hueco_en_fondo` es la única diferencia legítima entre los
+        dos llamadores: `apply_universe` no puede permitirse esperar a que
+        termine un relleno por REST antes de seguir con el resto del
+        universo (mismo motivo que el bootstrap frío, C1), así que pide el
+        relleno en una tarea de fondo separada (`_gap_fill_tasks`);
+        `ensure_profile`, en cambio, es una llamada directa que sí espera un
+        perfil "terminado".
+        """
+        perfil = self.profile_repo.load(symbol)
+        if perfil is None:
+            return None
+        self.bootstrapper.mark_loaded(symbol)
+        if hueco_en_fondo:
+            self._lanzar_relleno_de_hueco_en_fondo(symbol, now_ms)
+        else:
+            await self._rellenar_hueco_de_reinicio(symbol, now_ms)
+        return perfil
+
+    def _lanzar_relleno_de_hueco_en_fondo(self, symbol: str, now_ms: int) -> None:
+        """Lanza `_rellenar_hueco_de_reinicio` sin esperarlo (usado por
+        `apply_universe`, ver `_resolver_perfil`).
+
+        Sin `self.rest` el relleno no hace nada (mismo guard que
+        `_rellenar_hueco_de_reinicio`): lanzar la tarea igualmente solo
+        dejaría una `Task` colgando sin ningún trabajo real que hacer, así
+        que se corta aquí. El dedup por símbolo evita lanzar dos rellenos a
+        la vez si `apply_universe` viera el mismo símbolo dos veces antes de
+        que el primero termine.
+        """
+        if self.rest is None or symbol in self._gap_fill_tasks:
+            return
+        tarea = asyncio.create_task(self._rellenar_hueco_en_fondo(symbol, now_ms))
+        self._gap_fill_tasks[symbol] = tarea
+
+    async def _rellenar_hueco_en_fondo(self, symbol: str, now_ms: int) -> None:
+        """Cubre el hueco por REST y vuelve a sembrar el buffer con lo que
+        quedó guardado en SQLite.
+
+        `apply_universe` ya sembró el buffer con lo que había en disco ANTES
+        de que este relleno terminase (por eso corre en segundo plano, C1);
+        sin este segundo `seed_buffer`, las velas del hueco quedarían en
+        SQLite pero nunca llegarían al buffer, y `session_volume`/`vwap`
+        seguirían calculándose con el hueco sin cubrir hasta el siguiente
+        reinicio.
+        """
+        try:
+            await self._rellenar_hueco_de_reinicio(symbol, now_ms)
+            await self.seed_buffer(symbol, now_ms)
+            self.dirty.add(symbol)
+        finally:
+            self._gap_fill_tasks.pop(symbol, None)
 
     async def _rellenar_hueco_de_reinicio(self, symbol: str, now_ms: int) -> None:
         """Cubre en SQLite el hueco de histórico de un símbolo cuyo perfil
         ya vivía en disco (reinicio en caliente).
 
-        `bootstrap_symbol` es hoy el único llamador de `plan_history_requests`,
-        y solo se invoca cuando NO hay perfil guardado: con perfil en disco el
-        hueco entre la parada y el reinicio nunca se rellenaba (C4c), pese a
-        que la spec y el README prometen que "los reinicios posteriores solo
-        rellenan el hueco". Usa el mismo `plan_history_requests` que
-        `bootstrap_symbol` -sin reconstruir el perfil, que ya es válido y no
-        hace falta recalcular aquí-. No toca el buffer directamente: el
-        `seed_buffer` que corre justo después en `ensure_profile` relee de
-        SQLite y recoge estas velas recién guardadas.
+        `bootstrap_symbol` es hoy el único llamador de `plan_history_requests`
+        aparte de este método, y antes solo se invocaba cuando NO había
+        perfil guardado: con perfil en disco el hueco entre la parada y el
+        reinicio nunca se rellenaba (C4c), pese a que la spec y el README
+        prometen que "los reinicios posteriores solo rellenan el hueco".
+        Usa el mismo `plan_history_requests` que `bootstrap_symbol` -sin
+        reconstruir el perfil, que ya es válido y no hace falta recalcular
+        aquí-. No toca el buffer directamente: quien llama a este método
+        (`_resolver_perfil`, directa o vía `_rellenar_hueco_en_fondo`)
+        siempre hace un `seed_buffer` después, que relee de SQLite y recoge
+        estas velas recién guardadas.
         """
         if self.rest is None:
             return
@@ -162,13 +242,33 @@ class Orchestrator:
             # capturamos el estado del buffer ANTES de aplicar las velas del
             # snapshot: si lo hiciéramos después, `current()` ya sería la
             # vela más reciente que el propio snapshot acaba de traer, y
-            # refill_gap mediría un hueco ~= 0 (C4a). Si no había vela
-            # previa (símbolo nuevo), no hay hueco real que medir contra
-            # historia: se limpia cualquier entrada vieja.
+            # refill_gap mediría un hueco ~= 0 (C4a).
             previa = buffer.current()
+            if previa is None:
+                # reinicio en caliente: `seed_buffer` siembra el buffer vía
+                # `backfill`, que deliberadamente nunca asigna `_current`
+                # (ninguna de esas velas está "en curso" de verdad, ver
+                # `CandleBuffer.backfill`). Sin este fallback, `current()`
+                # siendo None se confundiría con un símbolo nuevo sin
+                # historia, y el primer snapshot tras el reinicio perdería
+                # el hueco real (refill_gap acabaría comparando contra la
+                # propia vela que el snapshot trae, hueco ~= 0).
+                cerradas_previas = buffer.closed(1)
+                previa = cerradas_previas[-1] if cerradas_previas else None
             if previa is not None:
-                self._reconnect_gap_from[event.symbol] = previa.ts
+                # `setdefault`, no asignación directa: si llegan dos
+                # snapshots antes de que el bucle principal drene
+                # `reconnected` y llame a refill_gap, el segundo snapshot ya
+                # ve como `current()` la vela que trajo el primero, así que
+                # sobrescribir aquí acortaría el hueco real al tramo entre
+                # ambos snapshots en vez de medirlo desde la última vela de
+                # antes de la caída.
+                self._reconnect_gap_from.setdefault(event.symbol, previa.ts)
             else:
+                # símbolo genuinamente nuevo (sin vela en curso ni historia
+                # seedeada): no hay hueco real que medir, se limpia
+                # cualquier entrada vieja que pudiera quedar de un ciclo
+                # anterior del símbolo.
                 self._reconnect_gap_from.pop(event.symbol, None)
         cerradas = []
         for vela in event.candles:
@@ -261,18 +361,30 @@ class Orchestrator:
         """
         buffer = self.buffers.get(symbol)
         if buffer is None or self.rest is None:
+            # se limpia igualmente: dejar la entrada viva aquí sería un
+            # leak silencioso -nunca se popea si no se llega a esta línea-
+            # que además envenenaría un refill_gap posterior si `rest` o
+            # `buffer` se recuperan más tarde para el mismo símbolo, con un
+            # `anterior_ts` de una reconexión ya vieja.
+            self._reconnect_gap_from.pop(symbol, None)
             return
         # el hueco se mide contra la última vela que teníamos ANTES del
         # snapshot de reconexión (capturada en handle_ws_event), no contra
         # buffer.current() ya refrescado por el propio snapshot (C4a). Si no
         # hay una entrada capturada (p. ej. refill_gap se llama fuera del
-        # flujo de reconexión), se cae al comportamiento anterior.
+        # flujo de reconexión), se cae a la vela en curso y, si tampoco la
+        # hay (reinicio en caliente antes del primer WS), a la última vela
+        # cerrada ya seedeada -mismo fallback que handle_ws_event.
         anterior_ts = self._reconnect_gap_from.pop(symbol, None)
         if anterior_ts is None:
             actual = buffer.current()
-            if actual is None:
-                return
-            anterior_ts = actual.ts
+            if actual is not None:
+                anterior_ts = actual.ts
+            else:
+                cerradas = buffer.closed(1)
+                if not cerradas:
+                    return
+                anterior_ts = cerradas[-1].ts
         hueco_min = (now_ms - anterior_ts) // 60_000
         if hueco_min <= self.MINUTOS_TOLERADOS_DE_HUECO:
             return
@@ -349,17 +461,28 @@ class Orchestrator:
           perfiles reales) sino `self._placeholder_symbols`.
         - Si el perfil ya existe en disco (arranque en caliente), se carga
           de forma síncrona aquí mismo y se usa directamente: ni placeholder
-          ni tarea de fondo, porque esa maquinaria existe para el bootstrap
-          lento por REST, no para una lectura local de SQLite.
+          ni tarea de fondo de bootstrap, porque esa maquinaria existe para
+          el bootstrap lento por REST, no para una lectura local de SQLite.
+          Pero el reinicio en caliente puede tener igualmente un hueco de
+          histórico que tapar (C4c, ver `_resolver_perfil`), y taparlo por
+          REST sí puede ser lento: por eso ese relleno concreto SÍ se lanza
+          en su propia tarea de fondo (`_gap_fill_tasks`), separada de
+          `_bootstrap_tasks` para no confundir al guard de dedup de más
+          arriba con un bootstrap real en vuelo.
         """
         for simbolo in update.removed:
             self.buffers.pop(simbolo, None)
             self.profiles.pop(simbolo, None)
             self._placeholder_symbols.discard(simbolo)
+            self._reconnect_gap_from.pop(simbolo, None)
             self.state.drop(simbolo)
+            self._metrics.forget(simbolo)
             tarea = self._bootstrap_tasks.pop(simbolo, None)
             if tarea is not None:
                 tarea.cancel()
+            tarea_hueco = self._gap_fill_tasks.pop(simbolo, None)
+            if tarea_hueco is not None:
+                tarea_hueco.cancel()
 
         if self.ws is not None:
             if update.added:
@@ -375,14 +498,19 @@ class Orchestrator:
 
             # lectura síncrona barata en disco primero (Finding 2): un
             # arranque en caliente no debe pasar por placeholder + tarea de
-            # fondo, esa maquinaria existe solo para el bootstrap lento por
-            # REST, no para un SELECT local.
-            perfil_de_disco = self.profile_repo.load(simbolo)
+            # fondo de bootstrap, esa maquinaria existe solo para el
+            # bootstrap lento por REST, no para un SELECT local. El relleno
+            # del hueco de reinicio sí puede ser lento, así que
+            # `_resolver_perfil` lo lanza en segundo plano
+            # (`hueco_en_fondo=True`) en vez de esperarlo aquí.
+            perfil_de_disco = await self._resolver_perfil(
+                simbolo, now_ms, hueco_en_fondo=True
+            )
             if perfil_de_disco is not None:
-                self.bootstrapper.mark_loaded(simbolo)
                 self.profiles[simbolo] = perfil_de_disco
                 self._placeholder_symbols.discard(simbolo)
                 await self.seed_buffer(simbolo, now_ms)
+                self.dirty.add(simbolo)
                 continue
 
             self.profiles[simbolo] = placeholder_profile(simbolo)

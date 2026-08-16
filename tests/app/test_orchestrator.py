@@ -489,6 +489,200 @@ async def test_ensure_profile_rellena_el_hueco_en_un_reinicio_en_caliente(orq):
     assert (base + MINUTO) in ts_en_buffer  # y seed_buffer lo recogió en el buffer
 
 
+async def test_apply_universe_rellena_el_hueco_en_un_reinicio_en_caliente(orq):
+    """Regresión Fase 2 Tarea 3: el relleno de hueco de reinicio en caliente
+    debe ser alcanzable desde `apply_universe`, el único punto de entrada
+    real en producción (`__main__.py` solo llama a `apply_universe`;
+    `ensure_profile` no se usa fuera de los tests). Antes del fix, el
+    camino cálido de `apply_universe` hacía su propia copia de
+    "load + mark_loaded + seed_buffer" sin pasar nunca por
+    `_rellenar_hueco_de_reinicio`, así que ningún reinicio real rellenaba
+    el hueco, pese a que `test_ensure_profile_rellena_el_hueco_en_un_reinicio_en_caliente`
+    -que ejercita un camino que producción nunca toma- estaba en verde."""
+    orq.ws = WsFalso()
+    orq.rest = RestFalsoParaHuecos()
+    base = 14 * DIA
+    orq.candle_repo.save_many("AAAUSDT", [vela(base)])  # última vela antes de la parada
+
+    velas_perfil = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(14) for m in range(1440)]
+    perfil = build_profile("AAAUSDT", velas_perfil, orq.cfg.profile)
+    orq.profile_repo.save(perfil)  # perfil ya en disco: simula el reinicio en caliente
+
+    ahora = base + 300 * MINUTO  # hueco de 5h desde la última vela persistida
+    update = UniverseUpdate(
+        symbols=frozenset({"AAAUSDT"}), added=frozenset({"AAAUSDT"}),
+        removed=frozenset(), ordered=["AAAUSDT"],
+    )
+    await orq.apply_universe(update, now_ms=ahora)
+    # el relleno corre en segundo plano (no debe bloquear apply_universe,
+    # ver el test de no-bloqueo más abajo): se deja correr la tarea.
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert orq.rest.llamadas != []  # se pidió histórico real para tapar el hueco
+    ts_guardados = {c.ts for c in orq.candle_repo.load("AAAUSDT", base)}
+    assert (base + MINUTO) in ts_guardados  # el hueco quedó cubierto en SQLite
+    ts_en_buffer = {c.ts for c in orq.buffers["AAAUSDT"].all_closed()}
+    assert (base + MINUTO) in ts_en_buffer  # y llegó también al buffer
+
+
+async def test_reconexion_tras_reinicio_en_caliente_mide_el_hueco_contra_lo_seedeado(orq):
+    """Regresión Fase 2 Tarea 3: tras un reinicio en caliente, `seed_buffer`
+    siembra el buffer vía `backfill`, que deliberadamente nunca asigna
+    `_current` -ninguna de esas velas está "en curso" de verdad-, así que
+    `buffer.current()` es `None` hasta que llega el primer evento de WS.
+    Antes del fix, el primer snapshot de reconexión veía `current() is
+    None`, lo confundía con un símbolo nuevo sin historia y borraba
+    cualquier entrada de `_reconnect_gap_from`; `refill_gap` caía entonces
+    a `buffer.current()`, que para ese momento ya era la propia vela que el
+    snapshot acababa de traer -hueco ~= 0, sin pedir nada por REST-."""
+    orq.rest = None  # apply_universe no debe disparar el relleno de fondo aquí:
+    orq.ws = WsFalso()  # se quiere aislar el efecto de handle_ws_event + refill_gap
+    base = 14 * DIA
+    orq.candle_repo.save_many("AAAUSDT", [vela(base)])  # última vela antes de la parada
+
+    velas_perfil = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(14) for m in range(1440)]
+    perfil = build_profile("AAAUSDT", velas_perfil, orq.cfg.profile)
+    orq.profile_repo.save(perfil)
+
+    update = UniverseUpdate(
+        symbols=frozenset({"AAAUSDT"}), added=frozenset({"AAAUSDT"}),
+        removed=frozenset(), ordered=["AAAUSDT"],
+    )
+    await orq.apply_universe(update, now_ms=base)
+
+    # tras el reinicio en caliente, antes de cualquier evento de WS: el
+    # buffer tiene la vela histórica pero ninguna "en curso".
+    assert orq.buffers["AAAUSDT"].current() is None
+    assert {c.ts for c in orq.buffers["AAAUSDT"].all_closed()} == {base}
+
+    orq.rest = RestFalsoParaHuecos()  # ahora sí, para medir refill_gap
+    ahora = base + 300 * MINUTO  # el WS estuvo caído ~5h
+    await orq.handle_ws_event(
+        WsEvent(kind="snapshot", symbol="AAAUSDT", candles=[vela(ahora)])
+    )
+    # el hueco se capturó contra la última vela SEEDEADA, no contra None
+    assert orq._reconnect_gap_from["AAAUSDT"] == base
+
+    await orq.refill_gap("AAAUSDT", now_ms=ahora)
+
+    assert orq.rest.llamadas != []  # el hueco real (300 min) sí disparó peticiones
+    ts_cubiertos = {c.ts for c in orq.buffers["AAAUSDT"].all_closed()}
+    assert (base + MINUTO) in ts_cubiertos  # el hueco quedó relleno, no descartado
+
+
+class RestLentoParaHuecos:
+    """REST cuyo `get_history_candles` no termina hasta que el test lo
+    libera explícitamente, para comprobar que el relleno de hueco de
+    reinicio en caliente no bloquea `apply_universe` (mismo espíritu que
+    `BootstrapperLento` para el camino frío)."""
+
+    def __init__(self):
+        self.evento = asyncio.Event()
+        self.llamadas: list[tuple] = []
+
+    async def get_history_candles(self, symbol, end_time_ms, limit=200):
+        self.llamadas.append((symbol, end_time_ms, limit))
+        await self.evento.wait()
+        return [vela(end_time_ms - m * MINUTO, close=100.0, vol=100.0) for m in range(limit)]
+
+
+async def test_apply_universe_no_espera_al_relleno_de_hueco_en_caliente(orq):
+    """Regresión Fase 2 Tarea 3: análoga a
+    `test_apply_universe_no_espera_a_que_terminen_los_bootstraps`, pero para
+    el camino cálido (perfil ya en disco). El relleno del hueco de reinicio
+    corre por REST igual que el bootstrap frío, y tampoco debe bloquear
+    `apply_universe`: el WS ya está suscrito y el símbolo ya puntúa con su
+    perfil real desde el primer minuto, aunque el relleno tarde arbitrariamente."""
+    orq.ws = WsFalso()
+    orq.rest = RestLentoParaHuecos()
+    base = 14 * DIA
+    orq.candle_repo.save_many("AAAUSDT", [vela(base)])
+
+    velas_perfil = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(14) for m in range(1440)]
+    perfil = build_profile("AAAUSDT", velas_perfil, orq.cfg.profile)
+    orq.profile_repo.save(perfil)
+
+    ahora = base + 300 * MINUTO
+    update = UniverseUpdate(
+        symbols=frozenset({"AAAUSDT"}), added=frozenset({"AAAUSDT"}),
+        removed=frozenset(), ordered=["AAAUSDT"],
+    )
+
+    # si apply_universe esperase al relleno (que nunca se libera aquí),
+    # esto colgaría hasta el timeout: fallo limpio en vez de bloquear la
+    # suite entera.
+    await asyncio.wait_for(orq.apply_universe(update, now_ms=ahora), timeout=0.5)
+    await asyncio.sleep(0)  # deja que la tarea de fondo arranque y llegue a su primer await
+
+    assert orq.ws.subscribed == [["AAAUSDT"]]  # el WS ya está suscrito...
+    assert orq.profiles["AAAUSDT"].confidence == "high"  # ...con el perfil real, no un placeholder
+    assert orq.rest.llamadas != []  # ...el relleno ya se lanzó...
+    # ...pero el buffer solo tiene lo que ya había en disco antes del hueco
+    assert {c.ts for c in orq.buffers["AAAUSDT"].all_closed()} == {base}
+
+    orq.rest.evento.set()
+    for _ in range(5):
+        await asyncio.sleep(0)  # deja correr el relleno de fondo ya lanzado
+
+    ts_en_buffer = {c.ts for c in orq.buffers["AAAUSDT"].all_closed()}
+    assert (base + MINUTO) in ts_en_buffer  # ahora sí, el hueco llegó al buffer
+
+
+async def test_un_segundo_snapshot_no_pisa_el_hueco_mas_grande_del_primero(orq):
+    """Regresión ítem menor de Fase 2 Tarea 3: si llegan dos snapshots de
+    reconexión antes de que el bucle principal drene `reconnected` y llame
+    a `refill_gap` (p. ej. dos reconexiones seguidas de WS), el segundo no
+    debe sobrescribir con `current().ts` -que para entonces ya es la vela
+    que trajo el PRIMER snapshot- el baseline más antiguo y correcto que
+    dejó el primero."""
+    await orq.handle_ws_event(
+        WsEvent(kind="update", symbol="AAAUSDT", candles=[vela(14 * DIA)])
+    )
+    primer_snapshot = 14 * DIA + 300 * MINUTO
+    await orq.handle_ws_event(
+        WsEvent(kind="snapshot", symbol="AAAUSDT", candles=[vela(primer_snapshot)])
+    )
+    assert orq._reconnect_gap_from["AAAUSDT"] == 14 * DIA  # baseline real, antes de la caída
+
+    segundo_snapshot = primer_snapshot + MINUTO
+    await orq.handle_ws_event(
+        WsEvent(kind="snapshot", symbol="AAAUSDT", candles=[vela(segundo_snapshot)])
+    )
+    # sin `setdefault`, esto pisaría el baseline con `primer_snapshot`
+    # (la vela que ya es `current()` para cuando llega el segundo snapshot),
+    # perdiendo la mayor parte del hueco real.
+    assert orq._reconnect_gap_from["AAAUSDT"] == 14 * DIA
+
+
+async def test_apply_universe_limpia_el_hueco_de_reconexion_y_el_historial_de_rvol_al_quitar_un_simbolo(orq):
+    """Regresión ítems menores de Fase 2 Tarea 3: `apply_universe` ya
+    limpiaba `buffers`, `profiles` y `_placeholder_symbols` al quitar un
+    símbolo del universo, pero dejaba fugar `_reconnect_gap_from` (un
+    símbolo que vuelve a entrar heredaría el baseline de una reconexión ya
+    vieja) y el historial de RVOL de `MetricsBuilder` (crecimiento sin
+    límite con la rotación normal del universo)."""
+    await orq.ensure_profile("AAAUSDT", now_ms=14 * DIA)
+    orq.set_ticker(Ticker("AAAUSDT", 100.0, 6.4, 5e6, 100.0, 0.0001, 0))
+    await orq.handle_ws_event(
+        WsEvent(kind="update", symbol="AAAUSDT", candles=[vela(14 * DIA)])
+    )
+    await orq.handle_ws_event(
+        WsEvent(kind="snapshot", symbol="AAAUSDT", candles=[vela(14 * DIA + MINUTO)])
+    )
+    orq.evaluate(now_ms=14 * DIA + 90_000)  # deja una muestra en _rvol_history
+    assert "AAAUSDT" in orq._reconnect_gap_from
+    assert "AAAUSDT" in orq._metrics._rvol_history
+
+    update = UniverseUpdate(
+        symbols=frozenset(), added=frozenset(), removed=frozenset({"AAAUSDT"}), ordered=[],
+    )
+    await orq.apply_universe(update, now_ms=14 * DIA + 100_000)
+
+    assert "AAAUSDT" not in orq._reconnect_gap_from
+    assert "AAAUSDT" not in orq._metrics._rvol_history
+
+
 async def test_snapshot_marca_el_simbolo_como_reconectado(orq):
     # es la señal que consume el bucle principal para disparar refill_gap tras
     # una reconexión; un "update" normal no debe activarla.

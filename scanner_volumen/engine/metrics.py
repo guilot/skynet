@@ -66,6 +66,16 @@ class MetricsBuilder:
         # simbolo -> deque de (ts_ms, rvol_1m_closed)
         self._rvol_history: dict[str, deque[tuple[int, float]]] = {}
 
+    def forget(self, symbol: str) -> None:
+        """Descarta el historial de RVOL de un simbolo que salio del universo.
+
+        `apply_universe` ya limpia buffers, perfiles y placeholders de un
+        simbolo eliminado; sin esto, `_rvol_history` seguiria creciendo sin
+        limite con cada simbolo que entra y sale del universo a lo largo de
+        dias de operacion, aunque ese simbolo ya no se evalue nunca mas.
+        """
+        self._rvol_history.pop(symbol, None)
+
     def record_rvol(self, symbol: str, rvol: float, ts: int) -> None:
         """Registra una muestra de RVOL cerrado, estampada por el ts (ms) de
         la vela que la produjo -- nunca por el reloj de pared -- y
