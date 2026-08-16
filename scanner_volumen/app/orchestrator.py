@@ -180,6 +180,22 @@ class Orchestrator:
             await self._rellenar_hueco_de_reinicio(symbol, now_ms)
             await self.seed_buffer(symbol, now_ms)
             self.dirty.add(symbol)
+        except Exception as exc:  # noqa: BLE001 - un relleno de fondo fallido no debe tumbar el bucle
+            # a diferencia de `_bootstrap_en_fondo`, aquí NO hay placeholder:
+            # `self.profiles[symbol]` ya es un perfil real (el camino cálido
+            # lo asigna síncronamente en `apply_universe` antes de lanzar esta
+            # tarea), así que sin marcar algo el guard de dedup de
+            # `apply_universe` ("ya tiene un perfil real: nada que hacer")
+            # daría al símbolo por resuelto para siempre y el hueco (mismo
+            # fallo silencioso-de-métricas de Finding 1, por otra puerta)
+            # nunca se reintentaría. Se reutiliza `_placeholder_symbols` como
+            # el marcador general de "este símbolo necesita que
+            # apply_universe lo vuelva a resolver" -su propio docstring en
+            # `apply_universe` ya documenta que ese set puede convivir con
+            # perfiles reales en `self.profiles`, no solo con placeholders-
+            # aunque el perfil de este símbolo nunca deje de ser real.
+            log.warning("relleno de hueco en segundo plano fallido para %s: %s", symbol, exc)
+            self._placeholder_symbols.add(symbol)
         finally:
             self._gap_fill_tasks.pop(symbol, None)
 
@@ -473,10 +489,18 @@ class Orchestrator:
         for simbolo in update.removed:
             self.buffers.pop(simbolo, None)
             self.profiles.pop(simbolo, None)
+            self.tickers.pop(simbolo, None)
             self._placeholder_symbols.discard(simbolo)
             self._reconnect_gap_from.pop(simbolo, None)
             self.state.drop(simbolo)
             self._metrics.forget(simbolo)
+            # decisión deliberada, no accidental: se descarta también la
+            # histéresis/cooldown de alerta del símbolo (ver el docstring de
+            # `StateMachine.forget`), por la misma clase de crecimiento sin
+            # límite que motivó `_metrics.forget` -y para que un reingreso
+            # sea "nuevo" en todos los sentidos, igual que ya lo es sin
+            # buffer, sin perfil y sin historial de RVOL.
+            self._states.forget(simbolo)
             tarea = self._bootstrap_tasks.pop(simbolo, None)
             if tarea is not None:
                 tarea.cancel()
@@ -493,6 +517,17 @@ class Orchestrator:
         for simbolo in update.ordered:
             if simbolo in self._bootstrap_tasks:
                 continue  # ya hay un bootstrap en vuelo para este símbolo
+            # Nota: este guard NO mira `_gap_fill_tasks` -a propósito, pero es
+            # un acoplamiento no obvio y por eso se deja explícito aquí. Hoy
+            # es seguro porque el camino cálido asigna `self.profiles[simbolo]`
+            # de forma SÍNCRONA (línea más abajo) antes de lanzar el relleno
+            # de fondo, así que la siguiente pasada de `apply_universe` ya lo
+            # atrapa en el guard de perfil justo debajo, sin necesitar mirar
+            # `_gap_fill_tasks` para evitar un segundo relleno concurrente
+            # (`_lanzar_relleno_de_hueco_en_fondo` tiene su propio dedup para
+            # eso). Si el camino cálido dejara alguna vez de asignar el
+            # perfil de forma síncrona, este guard tendría que empezar a
+            # mirar `_gap_fill_tasks` también.
             if simbolo in self.profiles and simbolo not in self._placeholder_symbols:
                 continue  # ya tiene un perfil real: nada que hacer (Finding 1)
 

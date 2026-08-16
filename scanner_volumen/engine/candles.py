@@ -26,6 +26,19 @@ class CandleBuffer:
         """Devuelve True si abre una vela nueva, False si actualiza la actual
         o si la vela es más antigua que la actual (se ignora)."""
         if self._current is None:
+            # Invariante de la clase: `_current.ts` nunca debe estar también
+            # en `_closed` (`session_volume` y el VWAP de sesión suman ambos
+            # y duplicarían ese minuto). En reinicio en caliente `_current`
+            # arranca en None y `backfill` -que no conoce el reloj de pared,
+            # `CandleBuffer` no puede importar `datetime.now`- no tiene forma
+            # de saber qué minuto sigue abierto, así que puede haber sembrado
+            # en `_closed` exactamente la vela que ahora llega por WS como la
+            # vela en curso (p. ej. el relleno de hueco de fondo terminó
+            # antes de que llegara el primer mensaje de WS de ese símbolo, y
+            # `endTime` del REST es exclusivo así que la última página trae
+            # la vela parcial todavía abierta). Se corrige aquí, en el único
+            # punto que asigna `_current`, en vez de en `backfill`.
+            self._evict_closed_ts(candle.ts)
             self._current = candle
             return True
         if candle.ts == self._current.ts:
@@ -37,6 +50,19 @@ class CandleBuffer:
         self._cerrar_actual()
         self._current = candle
         return True
+
+    def _evict_closed_ts(self, ts: int) -> None:
+        """Retira `ts` de `_closed`/`_by_ts` si ya estaba ahí.
+
+        Mantiene el invariante "ningún ts vive a la vez en `_closed` y en
+        `_current`" en el único caso en que puede romperse (ver `upsert`).
+        """
+        if ts not in self._by_ts:
+            return
+        self._by_ts.pop(ts, None)
+        self._closed = deque(
+            (c for c in self._closed if c.ts != ts), maxlen=self._closed.maxlen
+        )
 
     def _cerrar_actual(self) -> None:
         if self._current is None:

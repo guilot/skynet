@@ -139,3 +139,34 @@ def test_backfill_respeta_la_capacidad():
     insertadas = buf.backfill([vela(m) for m in range(1, 6)])
     assert insertadas == 3
     assert [c.ts for c in buf.all_closed()] == [3 * MINUTO, 4 * MINUTO, 5 * MINUTO]
+
+
+def test_upsert_tras_backfill_que_alcanzo_el_minuto_en_curso_no_duplica():
+    """Regresión: reinicio en caliente. `backfill` con `_current is None` no
+    puede saber qué minuto sigue "en curso" (no conoce el reloj de pared), así
+    que puede sembrar en `_closed` justo la vela que luego llega por WS como
+    vela en curso -p. ej. el relleno de hueco de fondo termina antes de que
+    llegue el primer mensaje de WS, y `endTime` del REST es exclusivo, así
+    que la última página trae la vela parcial todavía abierta. El invariante
+    de la clase es que ningún ts vive a la vez en `_closed` y en `_current`;
+    sin el fix, ese minuto queda en ambos y `session_volume` lo cuenta dos
+    veces."""
+    buf = CandleBuffer("AAAUSDT")
+    # backfill llega hasta "ahora" inclusive porque no hay _current todavía
+    # que le marque dónde parar (simula el relleno de hueco de fondo).
+    buf.backfill([vela(1, vol=10), vela(2, vol=10), vela(3, vol=10)])
+    assert buf.current() is None
+    assert {c.ts for c in buf.all_closed()} == {1 * MINUTO, 2 * MINUTO, 3 * MINUTO}
+
+    # ahora llega por WS la vela del minuto 3, la misma que backfill ya había
+    # cerrado, como vela en curso (parcial, con otro volumen).
+    assert buf.upsert(vela(3, vol=4)) is True
+
+    ts_cerrados = {c.ts for c in buf.all_closed()}
+    assert buf.current().ts == 3 * MINUTO
+    assert 3 * MINUTO not in ts_cerrados  # ya no vive también en _closed
+    assert ts_cerrados == {1 * MINUTO, 2 * MINUTO}
+
+    # session_volume cuenta el minuto 3 una sola vez, con el volumen parcial
+    # que trajo el WS (4), no 10 (backfill) + 4 (WS) = 14.
+    assert buf.session_volume(day_start_ms=0) == 1000 + 1000 + 400

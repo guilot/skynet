@@ -49,6 +49,20 @@ class StateMachine:
     def state_of(self, symbol: str) -> State:
         return self._states.get(symbol, _SymbolState()).state
 
+    def forget(self, symbol: str) -> None:
+        """Descarta el estado (histéresis + cooldown de alerta) de un símbolo
+        que salió del universo.
+
+        Mismo motivo que `MetricsBuilder.forget`: sin esto, `_states`
+        crecería sin límite con la rotación normal del universo a lo largo de
+        días de operación. Es una decisión deliberada, no un descuido: al
+        volver a entrar, el símbolo arranca en `State.NORMAL` sin cooldown de
+        alerta previo, igual que arranca sin buffer, sin perfil y sin
+        historial de RVOL (`apply_universe` ya limpia todo lo demás) -un
+        reingreso hereda un símbolo "nuevo" en todos los sentidos, no solo en
+        algunos."""
+        self._states.pop(symbol, None)
+
     def _estado_para(self, score: float) -> State:
         if score >= self._cfg.extreme:
             return State.EXTREME

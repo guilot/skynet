@@ -629,6 +629,76 @@ async def test_apply_universe_no_espera_al_relleno_de_hueco_en_caliente(orq):
     assert (base + MINUTO) in ts_en_buffer  # ahora sí, el hueco llegó al buffer
 
 
+class CandleRepoFallaLaPrimeraVezAlGuardar:
+    """Envoltorio sobre un CandleRepo real que falla en su primer save_many
+    y tiene éxito después, para reproducir Finding 2: `_rellenar_hueco_en_fondo`
+    tenía try/finally sin except, así que un fallo aquí escapaba de la tarea
+    de fondo -el finally ya había popeado su única referencia, así que se
+    recolectaba con una excepción sin recuperar en vez de solo loggear-."""
+
+    def __init__(self, real):
+        self._real = real
+        self.intentos = 0
+
+    def save_many(self, symbol, candles):
+        self.intentos += 1
+        if self.intentos == 1:
+            raise RuntimeError("disco lleno")
+        return self._real.save_many(symbol, candles)
+
+    def __getattr__(self, nombre):
+        return getattr(self._real, nombre)
+
+
+async def test_relleno_de_hueco_en_fondo_fallido_no_escapa_y_se_reintenta(orq):
+    """Regresión Finding 2: sin `except` en `_rellenar_hueco_en_fondo`, un
+    fallo en `candle_repo.save_many` escapaba sin recuperar de la tarea de
+    fondo, y encima el símbolo quedaba con un perfil real en `self.profiles`
+    sin ninguna marca de placeholder -así que el guard de dedup de
+    `apply_universe` lo daba por resuelto para siempre y el hueco quedaba sin
+    cubrir el resto del proceso (el mismo fallo silencioso de métricas del
+    Finding 1, por otra puerta)."""
+    orq.ws = WsFalso()
+    orq.rest = RestFalsoParaHuecos()
+    base = 14 * DIA
+    orq.candle_repo.save_many("AAAUSDT", [vela(base)])  # última vela antes de la parada
+
+    velas_perfil = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(14) for m in range(1440)]
+    perfil = build_profile("AAAUSDT", velas_perfil, orq.cfg.profile)
+    orq.profile_repo.save(perfil)  # perfil ya en disco: simula el reinicio en caliente
+
+    orq.candle_repo = CandleRepoFallaLaPrimeraVezAlGuardar(orq.candle_repo)
+
+    ahora = base + 300 * MINUTO  # hueco de 5h desde la última vela persistida
+    update = UniverseUpdate(
+        symbols=frozenset({"AAAUSDT"}), added=frozenset({"AAAUSDT"}),
+        removed=frozenset(), ordered=["AAAUSDT"],
+    )
+    await orq.apply_universe(update, now_ms=ahora)
+    for _ in range(5):
+        await asyncio.sleep(0)  # deja correr el relleno de fondo (falla)
+
+    assert orq.candle_repo.intentos == 1  # el intento falló, no se retiró en silencio
+    assert "AAAUSDT" not in orq._gap_fill_tasks  # el finally sí limpió la tarea
+    assert orq.profiles["AAAUSDT"].confidence == "high"  # el perfil real se conserva
+    # marcado para reintento: sin esto, el siguiente apply_universe lo daría
+    # por resuelto (Finding 1 por otra puerta) y el hueco nunca se cubriría.
+    assert "AAAUSDT" in orq._placeholder_symbols
+
+    # segundo refresco de universo, mismo símbolo aún en `ordered`: reintenta
+    # el relleno, que esta vez tiene éxito.
+    await orq.apply_universe(update, now_ms=ahora + MINUTO)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert orq.candle_repo.intentos >= 2
+    assert "AAAUSDT" not in orq._placeholder_symbols  # ya no necesita reintento
+    ts_guardados = {c.ts for c in orq.candle_repo.load("AAAUSDT", base)}
+    assert (base + MINUTO) in ts_guardados  # el hueco quedó cubierto en SQLite
+    ts_en_buffer = {c.ts for c in orq.buffers["AAAUSDT"].all_closed()}
+    assert (base + MINUTO) in ts_en_buffer  # y llegó también al buffer
+
+
 async def test_un_segundo_snapshot_no_pisa_el_hueco_mas_grande_del_primero(orq):
     """Regresión ítem menor de Fase 2 Tarea 3: si llegan dos snapshots de
     reconexión antes de que el bucle principal drene `reconnected` y llame
@@ -660,8 +730,9 @@ async def test_apply_universe_limpia_el_hueco_de_reconexion_y_el_historial_de_rv
     limpiaba `buffers`, `profiles` y `_placeholder_symbols` al quitar un
     símbolo del universo, pero dejaba fugar `_reconnect_gap_from` (un
     símbolo que vuelve a entrar heredaría el baseline de una reconexión ya
-    vieja) y el historial de RVOL de `MetricsBuilder` (crecimiento sin
-    límite con la rotación normal del universo)."""
+    vieja), el historial de RVOL de `MetricsBuilder`, `self.tickers` y el
+    estado de `StateMachine` (crecimiento sin límite con la rotación normal
+    del universo, en los cuatro casos)."""
     await orq.ensure_profile("AAAUSDT", now_ms=14 * DIA)
     orq.set_ticker(Ticker("AAAUSDT", 100.0, 6.4, 5e6, 100.0, 0.0001, 0))
     await orq.handle_ws_event(
@@ -670,9 +741,11 @@ async def test_apply_universe_limpia_el_hueco_de_reconexion_y_el_historial_de_rv
     await orq.handle_ws_event(
         WsEvent(kind="snapshot", symbol="AAAUSDT", candles=[vela(14 * DIA + MINUTO)])
     )
-    orq.evaluate(now_ms=14 * DIA + 90_000)  # deja una muestra en _rvol_history
+    orq.evaluate(now_ms=14 * DIA + 90_000)  # deja una muestra en _rvol_history y en _states
     assert "AAAUSDT" in orq._reconnect_gap_from
     assert "AAAUSDT" in orq._metrics._rvol_history
+    assert "AAAUSDT" in orq.tickers
+    assert "AAAUSDT" in orq._states._states
 
     update = UniverseUpdate(
         symbols=frozenset(), added=frozenset(), removed=frozenset({"AAAUSDT"}), ordered=[],
@@ -681,6 +754,8 @@ async def test_apply_universe_limpia_el_hueco_de_reconexion_y_el_historial_de_rv
 
     assert "AAAUSDT" not in orq._reconnect_gap_from
     assert "AAAUSDT" not in orq._metrics._rvol_history
+    assert "AAAUSDT" not in orq.tickers
+    assert "AAAUSDT" not in orq._states._states
 
 
 async def test_snapshot_marca_el_simbolo_como_reconectado(orq):
