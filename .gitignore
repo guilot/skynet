@@ -22,3 +22,4 @@ config.local.toml
 # Editores
 .vscode/
 .idea/
+.superpowers/
