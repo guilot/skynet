@@ -1,0 +1,77 @@
+[market]
+venue = "USDT-FUTURES"
+
+[universe]
+min_volume_24h = 1_000_000
+max_symbols = 150
+exclude_rwa = true
+refresh_minutes = 15
+exit_grace_minutes = 60
+
+[profile]
+history_days = 14
+smoothing_window_minutes = 7
+min_days_for_confidence = 3
+rolling_fallback_candles = 120
+
+[engine]
+tick_seconds = 1.0
+ticker_poll_seconds = 3.0
+live_rvol_min_elapsed_seconds = 15
+zscore_window_minutes = 60
+zscore_min_samples = 8
+burst_lookback_minutes = 5
+demand_burst_min_denominator = 0.5
+
+[rest]
+rate_limit_per_second = 10
+
+[maintenance]
+interval_hours = 24
+
+[dashboard]
+stale_after_seconds = 30
+
+[states]
+watch = 50
+hot = 65
+signal = 80
+extreme = 90
+exit_margin = 5
+exit_ticks = 3
+cooldown_minutes = 15
+alert_min_state = "SIGNAL"
+
+[orchestrator]
+persisted_min_state = "HOT"
+gap_tolerance_minutes = 3
+
+[supply]
+refresh_hours = 6
+
+[outcomes]
+horizons_minutes = [1, 5, 15, 30, 60]
+poll_seconds = 60
+
+[server]
+host = "127.0.0.1"
+port = 8000
+db_path = "data/scanner.db"
+
+[score]
+neutral_multiplier = 0.5
+
+[score.curves]
+ret_1m       = { max_points = 4,  breakpoints = [[0.0, 0], [0.3, 2], [0.8, 4]] }
+ret_3m       = { max_points = 6,  breakpoints = [[0.0, 0], [0.8, 3], [2.0, 6]] }
+ret_5m       = { max_points = 10, breakpoints = [[0.0, 0], [1.5, 5], [3.5, 10]] }
+ret_15m      = { max_points = 8,  breakpoints = [[0.0, 0], [2.5, 4], [5.0, 8]] }
+ret_1h       = { max_points = 6,  breakpoints = [[0.0, 0], [4.0, 3], [8.0, 6]] }
+ret_24h      = { max_points = 6,  breakpoints = [[0.0, 0], [5.0, 3], [12.0, 6]] }
+rvol_1m      = { max_points = 15, breakpoints = [[1.0, 0], [3.0, 7], [5.0, 11], [10.0, 15]] }
+rvol_5m      = { max_points = 10, breakpoints = [[1.0, 0], [2.0, 4], [3.0, 7], [6.0, 10]] }
+rvol_session = { max_points = 5,  breakpoints = [[1.0, 0], [2.0, 3], [4.0, 5]] }
+demand_burst = { max_points = 10, breakpoints = [[1.0, 0], [1.5, 5], [2.5, 10]] }
+z_return     = { max_points = 7,  breakpoints = [[1.0, 0], [2.0, 3], [3.0, 5], [4.5, 7]] }
+market_cap   = { max_points = 5,  breakpoints = [[1_000_000_000, 0], [300_000_000, 2], [80_000_000, 5]] }
+vwap         = { max_points = 8,  breakpoints = [[-20.0, -8], [-2.0, 0], [2.0, 8], [6.0, 8], [10.0, 0], [15.0, -8]] }
