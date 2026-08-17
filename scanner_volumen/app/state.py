@@ -55,6 +55,15 @@ class ScannerState:
     # potencialmente obsoleta si `updated_ms` no avanza; configurable via
     # `dashboard.stale_after_seconds`, lo fija __main__ al arrancar.
     stale_after_ms: int = 30_000
+    # I-2(a): "ahora" en el reloj del exchange (nunca `time.time()`), para
+    # que el dashboard compare `updated_ms` contra el MISMO reloj en los dos
+    # lados. Antes, `app.js` restaba `updated_ms` (reloj del exchange)
+    # contra `Date.now()` (reloj del NAVEGADOR del cliente): un visitante
+    # con el reloj 30s desfasado activaba o desactivaba el marcador de
+    # obsolescencia permanentemente, el mismo tipo de seam de dos relojes
+    # que motivó I6/C-1. __main__ lo refresca cada tick del bucle evaluador
+    # con `orq.now_ms(ahora_ms())`, igual que el resto del motor.
+    now_ms: int = 0
     bootstrap_done: int = 0
     bootstrap_total: int = 0
 
@@ -77,6 +86,7 @@ class ScannerState:
             "connected": self.connected,
             "ws_connected": self.ws_connected,
             "stale_after_ms": self.stale_after_ms,
+            "now_ms": self.now_ms,
             "bootstrap": {"done": self.bootstrap_done, "total": self.bootstrap_total},
             "rows": [s.to_dict() for s in self.ranked()],
         }

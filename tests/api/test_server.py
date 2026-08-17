@@ -76,6 +76,18 @@ def test_state_incluye_ws_connected_y_el_umbral_de_obsolescencia(entorno):
     assert cuerpo["stale_after_ms"] == 30_000  # valor por defecto de ScannerState
 
 
+def test_state_incluye_now_ms_del_reloj_del_exchange():
+    """Regresión I-2(a): `app.js` comparaba `Date.now()` -el reloj del
+    NAVEGADOR- contra `updated_ms` -el reloj del EXCHANGE-, el mismo tipo de
+    seam de dos relojes que motivó I6/C-1. El servidor debe mandar su propio
+    `now_ms` (el mismo reloj del exchange que el resto del sistema, nunca
+    `time.time()`) para que la comparación de obsolescencia se haga contra
+    el mismo reloj en los dos lados, no contra el del navegador."""
+    estado = ScannerState()
+    estado.now_ms = 1_234_567
+    assert estado.to_dict()["now_ms"] == 1_234_567
+
+
 def test_state_incluye_el_progreso_del_bootstrap(cliente):
     cuerpo = cliente.get("/api/state").json()
     assert cuerpo["bootstrap"] == {"done": 3, "total": 12}

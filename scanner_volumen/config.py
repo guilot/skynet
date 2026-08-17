@@ -5,6 +5,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from scanner_volumen.models import State
+
 
 @dataclass(frozen=True)
 class MarketConfig:
@@ -141,16 +143,41 @@ class Config:
     server: ServerConfig
 
 
-# Las 13 curvas que `score_symbol` necesita para puntuar los tres bloques
-# (MOMENTUM 6 + DEMAND 4 + STRUCTURE 3, ver scoring/score.py). `score_symbol`
-# filtra con `if clave in cfg.curves`, así que una curva ausente en el TOML
-# anularía en silencio esa dimensión del score sin ningún error: se valida
-# aquí, al cargar, en vez de dejar que falle en silencio en producción.
-CURVAS_ESPERADAS = frozenset({
-    "ret_1m", "ret_3m", "ret_5m", "ret_15m", "ret_1h", "ret_24h",
-    "rvol_1m", "rvol_5m", "rvol_session", "demand_burst",
-    "z_return", "market_cap", "vwap",
-})
+# Los tres bloques del score (MOMENTUM 6 + DEMAND 4 + STRUCTURE 3, ver
+# `scoring/score.py::score_symbol`). Viven aquí y no en score.py -que los
+# importa de vuelta- para que `CURVAS_ESPERADAS`, justo abajo, pueda
+# derivarse de las mismas tuplas en vez de mantener una cuarta lista con los
+# mismos 13 nombres escrita a mano (Minor: antes eran dos copias
+# independientes; una curva nueva en un bloque de score.py sin añadirla
+# también aquí habría quedado sin validar en el arranque). `score.py` ya
+# importa de `config.py` para `ScoreConfig`/`ScoreCurve`, así que esto no
+# invierte la dirección de dependencia.
+CLAVES_MOMENTUM = ("ret_1m", "ret_3m", "ret_5m", "ret_15m", "ret_1h", "ret_24h")
+CLAVES_DEMAND = ("rvol_1m", "rvol_5m", "rvol_session", "demand_burst")
+CLAVES_STRUCTURE = ("vwap", "z_return", "market_cap")
+
+# Las 13 curvas que `score_symbol` necesita para puntuar los tres bloques de
+# arriba. `score_symbol` filtra con `if clave in cfg.curves`, así que una
+# curva ausente en el TOML anularía en silencio esa dimensión del score sin
+# ningún error: se valida aquí, al cargar, en vez de dejar que falle en
+# silencio en producción.
+CURVAS_ESPERADAS = frozenset((*CLAVES_MOMENTUM, *CLAVES_DEMAND, *CLAVES_STRUCTURE))
+
+_ESTADOS_VALIDOS = {s.value for s in State}
+
+
+def _validar_estado(campo: str, valor: str) -> None:
+    """Valida que `valor` sea un `State` real, en un único punto de fallo
+    al cargar la config (Minor). Sin esto, un typo en `alert_min_state` o
+    `persisted_min_state` no fallaba hasta construir `StateMachine` u
+    `Orchestrator` -bien dentro del arranque de la app, con un
+    `ValueError` de `State(...)` sin ningún contexto sobre qué campo del
+    TOML lo causó- en vez de fallar aquí, igual que ya hacen las curvas."""
+    if valor not in _ESTADOS_VALIDOS:
+        raise ValueError(
+            f"{campo} no es un State válido: {valor!r} "
+            f"(válidos: {sorted(_ESTADOS_VALIDOS)})"
+        )
 
 
 def load_config(path: Path) -> Config:
@@ -170,6 +197,11 @@ def load_config(path: Path) -> Config:
         raise ValueError(
             f"faltan curvas de score en config.toml: {sorted(faltantes)}"
         )
+
+    _validar_estado("states.alert_min_state", raw["states"]["alert_min_state"])
+    _validar_estado(
+        "orchestrator.persisted_min_state", raw["orchestrator"]["persisted_min_state"]
+    )
 
     return Config(
         market=MarketConfig(**raw["market"]),

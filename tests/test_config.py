@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from scanner_volumen.config import load_config
+from scanner_volumen.config import CURVAS_ESPERADAS, load_config
 
 # Anclado a la ubicación del propio fichero, no al cwd: sin esto la suite
 # solo pasa si pytest se lanza desde la raíz del repo.
@@ -83,6 +83,55 @@ def test_carga_el_host_puerto_y_ruta_de_base_de_datos_del_servidor():
     assert cfg.server.host == "127.0.0.1"
     assert cfg.server.port == 8000
     assert cfg.server.db_path == "data/scanner.db"
+
+def test_falla_si_alert_min_state_no_es_un_estado_valido(tmp_path):
+    """Minor: antes, un typo en `alert_min_state` no fallaba hasta construir
+    `StateMachine` (bien dentro del arranque de la app, `State(cfg.value)`
+    lanzando `ValueError` sin contexto); debe fallar en `load_config`, un
+    único punto de fallo al arrancar, igual que ya hacen las curvas."""
+    toml_roto = CONFIG_PATH.read_text().replace(
+        'alert_min_state = "SIGNAL"', 'alert_min_state = "SIGNL"',
+    )
+    destino = tmp_path / "config_roto.toml"
+    destino.write_text(toml_roto)
+    with pytest.raises(ValueError, match="alert_min_state"):
+        load_config(destino)
+
+
+def test_falla_si_persisted_min_state_no_es_un_estado_valido(tmp_path):
+    toml_roto = CONFIG_PATH.read_text().replace(
+        'persisted_min_state = "HOT"', 'persisted_min_state = "CALIENTE"',
+    )
+    destino = tmp_path / "config_roto.toml"
+    destino.write_text(toml_roto)
+    with pytest.raises(ValueError, match="persisted_min_state"):
+        load_config(destino)
+
+
+def test_curvas_esperadas_se_deriva_de_los_bloques_del_score_no_se_duplica():
+    """Minor: `CURVAS_ESPERADAS` (13 nombres) y los tres bloques de
+    `score_symbol` (MOMENTUM/DEMAND/STRUCTURE, en scoring/score.py) eran dos
+    copias independientes de la misma lista de claves -- una curva nueva en
+    un bloque de score.py sin añadirla aquí quedaría sin validar en el
+    arranque. Debe derivarse de las mismas tuplas que usa score.py, no
+    mantenerse como una lista aparte escrita a mano."""
+    import scanner_volumen.config as config_mod
+    from scanner_volumen.scoring.score import (
+        CLAVES_DEMAND, CLAVES_MOMENTUM, CLAVES_STRUCTURE,
+    )
+
+    # identidad, no solo igualdad de valor: score.py debe importar las
+    # mismas tuplas de config.py, no mantener su propia copia idéntica a
+    # mano (eso pasaría igual esta aserción por casualidad de valor, sin
+    # detectar la duplicación real).
+    assert CLAVES_MOMENTUM is config_mod.CLAVES_MOMENTUM
+    assert CLAVES_DEMAND is config_mod.CLAVES_DEMAND
+    assert CLAVES_STRUCTURE is config_mod.CLAVES_STRUCTURE
+
+    assert CURVAS_ESPERADAS == frozenset(
+        (*CLAVES_MOMENTUM, *CLAVES_DEMAND, *CLAVES_STRUCTURE)
+    )
+
 
 def test_falla_si_falta_una_curva_de_score(tmp_path):
     """score_symbol filtra con `if clave in cfg.curves`: una curva ausente

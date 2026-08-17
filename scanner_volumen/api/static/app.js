@@ -53,10 +53,14 @@ function pintar(datos) {
       }
       estadosPrevios.set(f.symbol, ORDEN_ESTADOS[f.state]);
       const dudoso = f.profile_confidence === "low" ? "baja-confianza" : "";
-      // I1: fila marcada como obsoleta si no se actualiza desde hace más del
-      // umbral configurado (`dashboard.stale_after_seconds`), señal de que
-      // ese símbolo dejó de recibir datos aunque el badge general siga verde.
-      const obsoleta = Date.now() - f.updated_ms > datos.stale_after_ms ? "obsoleta" : "";
+      // I1/I-2(a): fila marcada como obsoleta si no se actualiza desde hace
+      // más del umbral configurado (`dashboard.stale_after_seconds`), señal
+      // de que ese símbolo dejó de recibir velas aunque el badge general
+      // siga verde. Se compara contra `datos.now_ms` -el reloj del
+      // EXCHANGE que manda el propio servidor-, nunca contra `Date.now()`
+      // (el reloj del NAVEGADOR): un visitante con el reloj desfasado no
+      // debe poder activar o desactivar este marcador él solo.
+      const obsoleta = datos.now_ms - f.updated_ms > datos.stale_after_ms ? "obsoleta" : "";
       return `<tr class="${f.state} ${obsoleta}" data-symbol="${f.symbol}">
         <td>${i + 1}</td>
         <td class="${dudoso}">${f.symbol}</td>

@@ -11,7 +11,7 @@ import pytest
 
 from scanner_volumen.app.orchestrator import Orchestrator
 from scanner_volumen.bitget.parsing import parse_contracts, parse_tickers
-from scanner_volumen.bitget.ws import decode_message
+from scanner_volumen.bitget.ws import WsEvent, decode_message
 from scanner_volumen.config import load_config
 from scanner_volumen.engine.profile import build_profile
 from scanner_volumen.models import Candle
@@ -82,12 +82,35 @@ async def test_la_sesion_ws_grabada_atraviesa_el_sistema_completo(orq):
         if evento.symbol in tickers:
             orq.set_ticker(tickers[evento.symbol])
         await orq.ensure_profile(evento.symbol, now_ms=0)
-        await orq.handle_ws_event(evento)
-        ultimo_ts = max(ultimo_ts, max(c.ts for c in evento.candles))
-        orq.evaluate(now_ms=ultimo_ts + 30_000)
+        if evento.kind == "snapshot":
+            # I-1: el snapshot de reconexión trae ~500 min de velas reales
+            # ya cerradas de una sola vez. Entregado como un único WsEvent
+            # (como antes), `MetricsBuilder.record_rvol` solo registra en su
+            # historial la ÚLTIMA vela cerrada -se llama una vez por
+            # evaluate(), no una vez por vela-, así que los ~500 min reales
+            # de historial que trae el propio fixture quedaban sin explotar
+            # y `demand_burst` nunca alcanzaba una muestra a
+            # -burst_lookback_minutes (5 min): quedaba en None para los tres
+            # símbolos durante toda la sesión grabada. Se reproduce vela a
+            # vela -mismos datos grabados, ninguno inventado-, cada una con
+            # su propio evaluate(), como llegarían de verdad si el WS las
+            # hubiese entregado en vivo en vez de todas juntas en un
+            # snapshot de reconexión: así record_rvol sí acumula el
+            # historial real que exige burst_lookback_minutes.
+            for vela in sorted(evento.candles, key=lambda c: c.ts):
+                await orq.handle_ws_event(
+                    WsEvent(kind="update", symbol=evento.symbol, candles=[vela])
+                )
+                ultimo_ts = max(ultimo_ts, vela.ts)
+                orq.evaluate(now_ms=ultimo_ts + 30_000)
+        else:
+            await orq.handle_ws_event(evento)
+            ultimo_ts = max(ultimo_ts, max(c.ts for c in evento.candles))
+            orq.evaluate(now_ms=ultimo_ts + 30_000)
         procesados += 1
 
-    assert procesados == 27  # 3 snapshots + 24 updates
+    assert procesados == 27  # 3 snapshots + 24 updates (mensajes de nivel superior,
+    # no las velas individuales en que se desglosa cada snapshot arriba)
     ranking = orq.state.ranked()
     assert len(ranking) == 3
     assert {s.symbol for s in ranking} == {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
@@ -104,18 +127,31 @@ async def test_la_sesion_ws_grabada_atraviesa_el_sistema_completo(orq):
     # inventado). Cualquier cambio en engine/, scoring/ o en config.toml que
     # altere el resultado numérico debe mover deliberadamente este valor, no
     # dejarlo pasar en silencio -- las aserciones de rango (0-100) de arriba
-    # las pasaría igualmente un score constante, que es justo el defecto
-    # (C2/C3) que esta prueba de integración no cazó en su momento.
+    # las pasaría igualmente un score constante. El valor de abajo ya
+    # incluye el fix de I-1 (demand_burst deja de ser None para SOLUSDT, ver
+    # la aserción explícita más abajo): subió respecto al valor previo a I-1
+    # en exactamente los 10 puntos máximos de la curva `demand_burst`.
     sol = next(s for s in ranking if s.symbol == "SOLUSDT")
-    assert abs(sol.breakdown.total - 42.56894228594851) < 1e-6
+    assert abs(sol.breakdown.total - 52.56894228594851) < 1e-6
+
+    # I-1: demand_burst debe dejar de ser None para al menos un símbolo --
+    # antes del fix de la replay (ver arriba), lo era para los tres durante
+    # toda la sesión grabada, porque la sesión es demasiado corta para que
+    # record_rvol (una muestra por evaluate(), no por vela) acumule un -5 min
+    # real. Con la replay vela a vela lo alcanzan los tres.
+    for s in ranking:
+        assert s.metrics.demand_burst is not None, (
+            f"{s.symbol}: demand_burst sigue en None, la replay no lo alcanzó"
+        )
 
     # Cada uno de los tres bloques del score (MOMENTUM 40 / DEMAND 40 /
     # STRUCTURE 20) debe tener al menos un componente no nulo para cada
-    # símbolo. Por sí sola, esta aserción habría destapado C2 (demand_burst
-    # inalcanzable con record_rvol por tick en vez de por vela cerrada
-    # dejaba rvol_1m/5m/session como únicos aportes de DEMAND, pero un bug
-    # que además rompiera esos habría dejado el bloque entero en 0 sin que
-    # ningún test lo notara).
+    # símbolo, para que un bug que dejara un bloque entero en 0 no pase
+    # desapercibido bajo el rango 0-100 de arriba. Nota: por sí sola esta
+    # aserción NO habría destapado C2 (demand_burst inalcanzable) -- con
+    # demand_burst en None, rvol_1m/5m/session ya bastaban para que el
+    # bloque DEMAND no fuera cero; la aserción explícita de demand_burst de
+    # arriba es la que de verdad lo cubre.
     for s in ranking:
         componentes = s.breakdown.components
         assert any(componentes.get(k, 0.0) != 0.0 for k in CLAVES_MOMENTUM), (

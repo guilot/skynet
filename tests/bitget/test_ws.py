@@ -249,6 +249,89 @@ async def test_run_notifica_conectado_tras_resuscribir_y_desconectado_al_caer(mo
     assert estados == [True, False, True, False]
 
 
+class _ConexionMedioAbierta:
+    """Simula una conexión "half-open": el lado de lectura no da ningún
+    error (el iterador de mensajes se queda bloqueado para siempre, como un
+    socket muerto que nadie cierra) pero el lado de escritura sí falla. Es
+    el caso que reproduce C-2: el latido (`_latido`) intenta un `send` de
+    ping, revienta con `ConnectionResetError`, y esa excepción -no
+    `CancelledError`- es lo único con lo que se encuentra `await ping` en el
+    `finally` de `run` cuando llega una cancelación externa mientras el
+    bucle de lectura sigue bloqueado."""
+
+    def __init__(self) -> None:
+        self._nunca = asyncio.Event()
+
+    async def __aenter__(self) -> "_ConexionMedioAbierta":
+        return self
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+    def __aiter__(self):
+        return self._generador()
+
+    async def _generador(self):
+        await self._nunca.wait()  # nunca se libera: el "socket" nunca entrega nada
+        yield  # inalcanzable, solo para que esto sea un generador
+
+    async def send(self, data: str) -> None:
+        raise ConnectionResetError("conexión muerta a medias")
+
+
+async def test_c2_una_cancelacion_externa_no_queda_atrapada_tras_un_ping_muerto(monkeypatch):
+    """Regresión C-2: `await ping` re-lanza lo que sea que mató a la tarea
+    de latido. Si el latido murió por su cuenta con una excepción que NO es
+    `CancelledError` (aquí, `ConnectionResetError` al fallar `send("ping")`),
+    esa excepción sustituye a la `CancelledError` real que estaba en curso
+    cuando alguien cancela `run` desde fuera mientras el bucle de lectura
+    sigue bloqueado (conexión half-open). El `except Exception` de más
+    arriba la atrapa, registra "WebSocket caído" y reconecta otra vez en vez
+    de dejar que la cancelación externa se propague: el proceso nunca
+    terminaría al apagarse.
+
+    Se reproduce de forma determinista: `INTERVALO_PING` se acelera para que
+    el latido falle enseguida y la tarea de ping ya esté *terminada* (no
+    pendiente) para cuando llega la cancelación externa -- ese orden es la
+    clave del bug, `Task.cancel()` sobre una tarea ya terminada con
+    excepción no cambia esa excepción por `CancelledError`."""
+    monkeypatch.setattr(ws_mod, "INTERVALO_PING", 0.01)
+    monkeypatch.setattr(ws_mod, "BACKOFF_INICIAL", 0.01)
+    monkeypatch.setattr(ws_mod, "BACKOFF_MAXIMO", 0.01)
+
+    conexion = _ConexionMedioAbierta()
+    cliente = BitgetWebsocket(
+        venue="USDT-FUTURES", url="wss://fake", connect_factory=lambda u: conexion
+    )
+
+    async def on_event(_ev):
+        pass
+
+    tarea = asyncio.create_task(cliente.run(on_event))
+    # deja tiempo de sobra para que el latido dispare su ping, falle, y la
+    # tarea de ping quede *terminada* con ConnectionResetError antes de cancelar.
+    await asyncio.sleep(0.1)
+
+    tarea.cancel()
+    # `asyncio.wait` con timeout (a diferencia de `wait_for`) NUNCA cancela
+    # ni espera indefinidamente: solo informa si `tarea` sigue pendiente
+    # tras el plazo. Es deliberado -- con el bug presente, la propia
+    # cancelación de `tarea` queda atrapada por el mismo `except Exception`
+    # una y otra vez, así que ni siquiera `wait_for` (que cancelaría nolens
+    # volens y esperaría a que eso surta efecto) terminaría nunca.
+    terminadas, pendientes = await asyncio.wait({tarea}, timeout=1.0)
+
+    if tarea in pendientes:
+        tarea.cancel()  # limpieza best-effort, no bloqueante
+        pytest.fail(
+            "la tarea no terminó 1s después de cancelarla: la cancelación "
+            "quedó atrapada por el ConnectionResetError del latido muerto"
+        )
+
+    assert tarea in terminadas
+    assert tarea.cancelled()
+
+
 async def test_run_notifica_conectado_aunque_no_haya_simbolos_suscritos(monkeypatch):
     """Una conexión nueva está viva en cuanto se abre, aunque todavía no haya
     ningún símbolo que suscribir (arranque en frío, antes del primer

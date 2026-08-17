@@ -9,13 +9,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from scanner_volumen.config import ScoreConfig, ScoreCurve
+from scanner_volumen.config import (
+    CLAVES_DEMAND, CLAVES_MOMENTUM, CLAVES_STRUCTURE, ScoreConfig, ScoreCurve,
+)
 from scanner_volumen.engine.metrics import SymbolMetrics
 from scanner_volumen.models import Direction
 
-CLAVES_MOMENTUM = ("ret_1m", "ret_3m", "ret_5m", "ret_15m", "ret_1h", "ret_24h")
-CLAVES_DEMAND = ("rvol_1m", "rvol_5m", "rvol_session", "demand_burst")
-CLAVES_STRUCTURE = ("vwap", "z_return", "market_cap")
+# CLAVES_MOMENTUM/DEMAND/STRUCTURE viven en config.py (Minor), no aquí: así
+# `config.CURVAS_ESPERADAS` se deriva de las mismas tuplas que usa
+# `score_symbol` más abajo, en vez de mantener una lista aparte con los
+# mismos 13 nombres escrita a mano. Se re-exportan con el import de arriba
+# para no romper a quien ya las importaba desde este módulo.
 
 
 def piecewise(value: float | None, curve: ScoreCurve) -> float:

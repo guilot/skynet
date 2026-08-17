@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import statistics
 
-MUESTRAS_MINIMAS_Z = 8
-
 
 def demand_burst(
     rvol_now: float | None,
@@ -32,14 +30,17 @@ def demand_burst(
 def z_return(
     recent_returns: list[float],
     current: float,
-    min_samples: int = MUESTRAS_MINIMAS_Z,
+    *,
+    min_samples: int,
 ) -> float | None:
     """Desviaciones típicas del retorno actual respecto a los recientes.
 
     Con menos de `min_samples` valores el resultado no es interpretable, y
-    con desviación cero la división es imposible: en ambos casos None. El
-    valor por defecto es el histórico de V1; quien llama en producción
-    (`MetricsBuilder`) lo pasa explícitamente desde `config.toml`.
+    con desviación cero la división es imposible: en ambos casos None.
+    `min_samples` es obligatorio (Minor) -a diferencia de `min_denominator`
+    en `demand_burst`, aquí no queda ningún valor por defecto duplicando en
+    `engine/` el `zscore_min_samples` de `config.toml`; quien llama en
+    producción (`MetricsBuilder`) ya lo pasaba siempre explícito.
     """
     if len(recent_returns) < min_samples:
         return None

@@ -80,8 +80,8 @@ class Orchestrator:
 
         self._metrics = MetricsBuilder(cfg.engine, cfg.profile)
         self._states = StateMachine(cfg.states)
-        # ratchet del reloj del exchange (I6): último ts de ticker visto,
-        # nunca retrocede. Ver `now_ms`.
+        # ratchet del reloj del exchange (I6/C-1): último ts visto entre
+        # tickers y velas del WS, nunca retrocede. Ver `now_ms`.
         self._clock_ms: int | None = None
         # umbral de negocio (severidad mínima que se persiste en `signals`),
         # desde config.toml: el TOML guarda el nombre del estado como texto
@@ -93,32 +93,104 @@ class Orchestrator:
     def set_ticker(self, ticker: Ticker) -> None:
         self.tickers[ticker.symbol] = ticker
 
+    # Tolerancia máxima entre un candidato a "ahora" (ticker o vela) y
+    # `wall_clock_ms` antes de descartarlo como implausible (C-1): ni
+    # `parse_tickers` ni `parse_candle` validan `ts`, y `_clock_ms` es
+    # irrecuperable dentro de un proceso -el ratchet nunca retrocede- y
+    # ahora alimenta `candle_repo.prune(now_ms - 14d)`, un borrado masivo.
+    # Generoso a propósito: una caída real de REST/WS de varios días (ver
+    # MAX_PAGINAS_DE_RELLENO, hasta ~66h) debe seguir aceptándose sin más
+    # que un jitter razonable del reloj local; solo se busca cazar un ts
+    # disparatado (bug de parseo, confusión s/ms, reloj del exchange roto).
+    MAX_DERIVA_RELOJ_MS = 30 * DIA_MS
+
+    def _newest_candle_floor(self) -> int | None:
+        """Cota inferior de "ahora" derivada de las velas del WS (C-1).
+
+        `poll_tickers` capta y registra cualquier fallo de REST y simplemente
+        vuelve: si `/tickers` falla durante minutos mientras el WS sigue
+        entregando velas, `now_ms` no debe congelarse en el último ticker
+        bueno. La vela CERRADA más reciente de cualquier símbolo es una
+        fuente independiente y continuamente disponible de "ahora" -el
+        minuto en que cerró esa vela ya terminó, así que el instante actual
+        es como mínimo `ts + 60_000`-. Se usa `closed(1)`, no `current()`,
+        porque tras un reinicio en caliente `seed_buffer` siembra el buffer
+        vía `backfill`, que deliberadamente nunca asigna `_current`
+        (`CandleBuffer.backfill`): `closed(1)` sigue disponible en ese caso,
+        `current()` no.
+        """
+        mejor: int | None = None
+        for buffer in self.buffers.values():
+            cerradas = buffer.closed(1)
+            if not cerradas:
+                continue
+            candidato = cerradas[-1].ts + MINUTO_MS
+            if mejor is None or candidato > mejor:
+                mejor = candidato
+        return mejor
+
     def now_ms(self, wall_clock_ms: int) -> int:
         """Fuente de "ahora" para todo el bucle principal (I6), salvo el
         propio arranque: el reloj del exchange, nunca el de pared.
 
         `models.Ticker.ts` es el timestamp que Bitget estampa en cada
         respuesta de `/tickers`; `poll_tickers` lo refresca cada
-        `engine.ticker_poll_seconds`. Se toma el máximo entre todos los
-        símbolos conocidos -un solo ticker desfasado no debe tirar del
-        resto- y el resultado nunca retrocede (ratchet): `evaluate`,
-        `refill_gap`, el mantenimiento diario y el resto del motor asumen
-        `now_ms` monótono creciente (límite del día en curso, historial de
-        RVOL, cooldown de la máquina de estados, cómputo de huecos), así
-        que ni una corrección de reloj en el exchange ni un ticker puntual
-        desfasado pueden mover el tiempo hacia atrás.
+        `engine.ticker_poll_seconds`. Pero `/tickers` es una fuente que
+        puede fallar (REST caído) sin que el WS se entere: por eso (C-1) el
+        candidato también incluye `_newest_candle_floor()`, derivado de las
+        velas que el WS sigue entregando de forma independiente. Se toma el
+        máximo entre todos los símbolos conocidos y ambas fuentes -un solo
+        ticker o vela desfasados no deben tirar del resto- y el resultado
+        nunca retrocede (ratchet): `evaluate`, `refill_gap`, el
+        mantenimiento diario y el resto del motor asumen `now_ms` monótono
+        creciente (límite del día en curso, historial de RVOL, cooldown de
+        la máquina de estados, cómputo de huecos, y ahora también
+        `candle_repo.prune`), así que ni una corrección de reloj en el
+        exchange ni una lectura puntual desfasada pueden mover el tiempo
+        hacia atrás. Cualquier candidato que diste de `wall_clock_ms` más de
+        `MAX_DERIVA_RELOJ_MS` se descarta como implausible antes de
+        ratchetear (ver la constante).
 
-        `wall_clock_ms` solo se usa como respaldo mientras no ha llegado
-        ningún ticker todavía (arranque en frío, antes de la primera
-        respuesta de `/tickers`): es el único momento en que el reloj de
+        `wall_clock_ms` solo se usa como respaldo mientras `_clock_ms` sigue
+        sin establecer -arranque en frío, antes de la primera respuesta de
+        `/tickers` o vela de WS-: es el único momento en que el reloj de
         pared sigue siendo legítimo aquí, spec §13 ("nunca la hora local").
-        En cuanto hay al menos un ticker, `wall_clock_ms` se ignora por
-        completo, incluso si diverge mucho del reloj del exchange -ese es
-        justo el escenario de deriva que la spec identifica como riesgo.
+        En cuanto `_clock_ms` se establece, `wall_clock_ms` se ignora por
+        completo para el "ahora" devuelto, incluso si diverge mucho del
+        reloj del exchange -ese es justo el escenario de deriva que la spec
+        identifica como riesgo-, salvo para el filtro de implausibilidad de
+        arriba.
+
+        Nota sobre "nunca retrocede": la garantía solo aplica una vez
+        `_clock_ms` está establecido. Antes de eso, cada llamada devuelve
+        `wall_clock_ms` directamente (sin ratchetear ese valor); si el reloj
+        local va adelantado respecto al del exchange, el primer ticker o
+        vela puede hacer que el valor devuelto dé un paso atrás justo en esa
+        transición. Es un caso aceptado, no un bug: `wall_clock_ms` nunca es
+        una fuente de verdad aquí (spec §13), así que no se ratchetea a
+        través de él -hacerlo reintroduciría la propia deriva del reloj
+        local que este método existe para ignorar-.
         """
-        candidato = max((t.ts for t in self.tickers.values()), default=None)
-        if candidato is not None and (self._clock_ms is None or candidato > self._clock_ms):
-            self._clock_ms = candidato
+        candidatos: list[int] = []
+        for nombre, candidato in (
+            ("ticker", max((t.ts for t in self.tickers.values()), default=None)),
+            ("vela", self._newest_candle_floor()),
+        ):
+            if candidato is None:
+                continue
+            if abs(candidato - wall_clock_ms) > self.MAX_DERIVA_RELOJ_MS:
+                log.warning(
+                    "candidato a reloj de %s descartado por implausible: "
+                    "%d (reloj local %d)", nombre, candidato, wall_clock_ms,
+                )
+                continue
+            candidatos.append(candidato)
+
+        candidato_final = max(candidatos, default=None)
+        if candidato_final is not None and (
+            self._clock_ms is None or candidato_final > self._clock_ms
+        ):
+            self._clock_ms = candidato_final
         if self._clock_ms is None:
             return wall_clock_ms
         return self._clock_ms
@@ -357,6 +429,37 @@ class Orchestrator:
 
     # --- evaluación ---
 
+    @staticmethod
+    def _ultima_vela_ts(buffer: CandleBuffer, respaldo: int) -> int:
+        """Ts de la vela más reciente conocida del buffer (I-2b).
+
+        `SymbolSnapshot.updated_ms` usaba `now_ms` -el instante de
+        evaluación-, pero `poll_tickers` marca sucio cada símbolo con
+        buffer cada `ticker_poll_seconds` sin importar si el WS sigue vivo,
+        así que `evaluate` seguía reescribiendo `updated_ms` aunque el WS
+        llevara minutos muerto: el marcador de obsolescencia del dashboard
+        (`now_ms - updated_ms > stale_after_ms`) nunca disparaba en el
+        escenario exacto para el que existe. Se ancla en cambio al ts de la
+        última vela real -la del WS, la única fuente de velas-, que deja de
+        avanzar en cuanto el WS deja de entregar.
+
+        Prioriza la vela en curso (más fresca); si no hay (p. ej. justo tras
+        un reinicio en caliente, antes del primer evento de WS: `seed_buffer`
+        siembra vía `backfill`, que deliberadamente nunca asigna `_current`),
+        cae a la última cerrada. `respaldo` (el propio `now_ms`) solo se usa
+        si el buffer no tiene ninguna vela todavía -no debería ocurrir en la
+        práctica, `evaluate` ya exige `buffer is not None`, pero es más
+        honesto que devolver un `None`/0 que el dashboard confundiría con
+        "obsoleto desde siempre"-.
+        """
+        actual = buffer.current()
+        if actual is not None:
+            return actual.ts
+        cerradas = buffer.closed(1)
+        if cerradas:
+            return cerradas[-1].ts
+        return respaldo
+
     def evaluate(self, now_ms: int) -> list[Transition]:
         transiciones: list[Transition] = []
         pendientes, self.dirty = self.dirty, set()
@@ -378,7 +481,8 @@ class Orchestrator:
             self.state.put(
                 SymbolSnapshot(
                     symbol=simbolo, metrics=metricas, breakdown=desglose,
-                    state=self._states.state_of(simbolo), updated_ms=now_ms,
+                    state=self._states.state_of(simbolo),
+                    updated_ms=self._ultima_vela_ts(buffer, now_ms),
                 )
             )
 
@@ -634,17 +738,47 @@ class Orchestrator:
         que hubiera en SQLite pisaría el resultado del bootstrap de fondo
         si terminara justo después, y ese símbolo ya se recalculará solo en
         el próximo ciclo de mantenimiento una vez tenga perfil real.
+
+        I-3: nada de esto tenía ningún `await` -medido: `candle_repo.load`
+        de 14 días x 150 símbolos ≈ 9.1s más `build_profile` x150 ≈ 2.0s-,
+        así que corría entero de un tirón y bloqueaba el hilo del event
+        loop durante ~12s seguidos: ni el WS, ni `poll_tickers`, ni el
+        dashboard, ni el propio latido de `BitgetWebsocket` podían avanzar
+        mientras tanto. `sqlite3.Connection` se abre con
+        `check_same_thread=False` justo para permitir esto: el trabajo
+        síncrono por símbolo (I/O de disco + CPU de `build_profile`) se
+        delega a `asyncio.to_thread`, uno por símbolo -no todos a la vez-,
+        para que el event loop recupere el control entre cada uno.
         """
         desde = now_ms - self.cfg.profile.history_days * DIA_MS
-        self.candle_repo.prune(desde)
+        await asyncio.to_thread(self.candle_repo.prune, desde)
 
         for simbolo in list(self.profiles):
             if simbolo in self._placeholder_symbols:
                 continue
-            velas = self.candle_repo.load(simbolo, desde)
-            if not velas:
+            perfil = await asyncio.to_thread(
+                self._recalcular_perfil_de_mantenimiento, simbolo, desde, now_ms
+            )
+            if perfil is None:
                 continue
-            perfil = build_profile(simbolo, velas, self.cfg.profile)
-            self.profile_repo.save(perfil, now_ms)
             self.profiles[simbolo] = perfil
             self.dirty.add(simbolo)
+
+    def _recalcular_perfil_de_mantenimiento(
+        self, symbol: str, desde: int, now_ms: int
+    ) -> VolumeProfile | None:
+        """Cuerpo síncrono de un símbolo de `run_maintenance` (I-3).
+
+        Aislado en su propio método para que `asyncio.to_thread` pueda
+        ejecutarlo en un hilo aparte; no toca ningún estado del orquestador
+        directamente (`self.profiles`/`self.dirty`) -eso lo hace el
+        llamador, de vuelta en el hilo del event loop, para no mutar
+        estructuras compartidas desde un hilo de fondo-. Devuelve `None` si
+        no hay velas que recalcular, igual que hacía el bucle original.
+        """
+        velas = self.candle_repo.load(symbol, desde)
+        if not velas:
+            return None
+        perfil = build_profile(symbol, velas, self.cfg.profile)
+        self.profile_repo.save(perfil, now_ms)
+        return perfil

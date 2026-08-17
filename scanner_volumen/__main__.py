@@ -51,6 +51,103 @@ def ahora_ms() -> int:
     return time.time_ns() // 1_000_000
 
 
+# --- cuerpos de los bucles principales, extraídos como corrutinas con nombre ---
+#
+# I-5: `__main__.py` no tenía ninguna cobertura, y ahí vivieron los defectos
+# de esta fase (los call sites de `orq.now_ms(ahora_ms())`, el bucle de
+# mantenimiento, `_marcar_ws_conectado`, `stale_after_ms` y el cableado de
+# `OutcomeTracker(horizons=...)`). Cada bucle de `main()` era antes un
+# `while True` anidado con el cuerpo de un solo paso inline: imposible de
+# ejercitar sin levantar `httpx.AsyncClient`, `uvicorn` y un `main()` entero.
+# Extraer el cuerpo de cada paso a una función con nombre, a nivel de módulo
+# y con sus dependencias como parámetros explícitos, permite probarlas con
+# dobles de prueba (ver tests/test_main.py) sin tocar red ni reloj de pared
+# real. `main()` sigue siendo el único sitio que arma el `while True` con su
+# `asyncio.sleep` de cadencia -eso no aporta nada probarlo por separado-.
+
+
+async def paso_tickers(
+    orq: Orchestrator,
+    rest: BitgetRest,
+    selector: UniverseSelector,
+    bootstrapper: Bootstrapper,
+    supply: SupplyCache,
+    ahora: int,
+    ultimo_universo: int,
+    refresh_minutes: float,
+) -> int:
+    """Un paso de `bucle_tickers`: refresca tickers y, si toca, el universo.
+
+    El refresco de ticker en sí se delega en `orq.poll_tickers` (probado
+    aparte): marca sucios los símbolos que ya tienen buffer y nunca propaga
+    un fallo de REST. La selección de universo no puede delegarse igual
+    porque necesita la lista completa de tickers -incluidos símbolos que el
+    orquestador todavía no conoce- que `poll_tickers` no expone.
+
+    Devuelve el nuevo `ultimo_universo`: el `while True` de `bucle_tickers`
+    lo hace persistir entre iteraciones, así que el llamador es quien debe
+    quedarse con el valor devuelto. Un fallo de REST (tickers o universo) se
+    registra y deja `orq.state.connected` en `False`; nunca propaga, para
+    que un solo ciclo fallido no tumbe el bucle entero.
+    """
+    try:
+        await orq.poll_tickers(ahora)
+        if ahora - ultimo_universo >= refresh_minutes * 60_000:
+            contratos = await rest.get_contracts()
+            tickers_universo = await rest.get_tickers()
+            actualizacion = selector.select(contratos, tickers_universo, ahora)
+            bootstrapper.expect(actualizacion.ordered)
+            await orq.apply_universe(actualizacion, ahora)
+            await supply.refresh(actualizacion.ordered, ahora)
+            ultimo_universo = ahora
+        orq.state.connected = True
+    except Exception as exc:  # noqa: BLE001
+        orq.state.connected = False
+        log.warning("actualización de universo fallida: %s", exc)
+    return ultimo_universo
+
+
+async def paso_evaluador(orq: Orchestrator, bootstrapper: Bootstrapper, ahora: int) -> None:
+    """Un paso de `bucle_evaluador`: drena reconexiones, evalúa y refresca
+    el progreso del bootstrap. Ver `paso_tickers` sobre por qué está
+    extraído como función con nombre (I-5)."""
+    orq.state.now_ms = ahora  # I-2(a): "ahora" del exchange, para el dashboard
+    for simbolo in list(orq.reconnected):
+        orq.reconnected.discard(simbolo)
+        await orq.refill_gap(simbolo, ahora)
+    for t in orq.evaluate(ahora):
+        if t.should_alert:
+            log.info("ALERTA %s %s score=%.1f", t.symbol, t.current.value, t.score)
+    hecho, total = bootstrapper.progress()
+    orq.state.bootstrap_done, orq.state.bootstrap_total = hecho, total
+
+
+async def paso_outcomes(tracker: OutcomeTracker, ahora: int) -> None:
+    """Un paso de `bucle_outcomes`. Ver `paso_tickers` (I-5)."""
+    try:
+        tracker.run_once(ahora)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("seguimiento de resultados fallido: %s", exc)
+
+
+async def paso_mantenimiento(orq: Orchestrator, ahora: int) -> None:
+    """Un paso de `bucle_mantenimiento` (I2 poda + I4 recálculo). Ver
+    `paso_tickers` (I-5)."""
+    try:
+        await orq.run_maintenance(ahora)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("mantenimiento diario fallido: %s", exc)
+
+
+def marcar_ws_conectado(state, conectado: bool) -> None:
+    """Callback de `BitgetWebsocket.run` (I1): mueve `state.ws_connected`.
+
+    Función independiente (en vez de una closure anidada en `main()`, como
+    antes) para poder probarla directamente con un `ScannerState` de
+    prueba, sin construir un `Orchestrator` completo."""
+    state.ws_connected = conectado
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s"
@@ -86,53 +183,31 @@ async def main() -> None:
         async def bucle_tickers() -> None:
             """Refresca tickers y, con su propia cadencia, el universo.
 
-            El refresco de ticker en sí se delega en `orq.poll_tickers`
-            (probado en Task 16): marca sucios los símbolos que ya tienen
-            buffer y nunca propaga un fallo de REST. La selección de
-            universo no puede delegarse igual porque necesita la lista
-            completa de tickers -incluidos símbolos que el orquestador
-            todavía no conoce- que `poll_tickers` no expone.
+            El cuerpo de cada iteración vive en `paso_tickers` (I-5), a
+            nivel de módulo, para poder probarlo sin levantar `main()`
+            entera; aquí solo se arma el `while True` con su cadencia
+            (`ticker_poll_seconds`) y se hace persistir `ultimo_universo`
+            entre iteraciones.
             """
             ultimo_universo = 0
             while True:
                 ahora = orq.now_ms(ahora_ms())
-                try:
-                    await orq.poll_tickers(ahora)
-                    if ahora - ultimo_universo >= cfg.universe.refresh_minutes * 60_000:
-                        contratos = await rest.get_contracts()
-                        tickers_universo = await rest.get_tickers()
-                        actualizacion = selector.select(contratos, tickers_universo, ahora)
-                        bootstrapper.expect(actualizacion.ordered)
-                        await orq.apply_universe(actualizacion, ahora)
-                        await supply.refresh(actualizacion.ordered, ahora)
-                        ultimo_universo = ahora
-                    orq.state.connected = True
-                except Exception as exc:  # noqa: BLE001
-                    orq.state.connected = False
-                    log.warning("actualización de universo fallida: %s", exc)
+                ultimo_universo = await paso_tickers(
+                    orq, rest, selector, bootstrapper, supply,
+                    ahora, ultimo_universo, cfg.universe.refresh_minutes,
+                )
                 await asyncio.sleep(cfg.engine.ticker_poll_seconds)
 
         async def bucle_evaluador() -> None:
             while True:
                 ahora = orq.now_ms(ahora_ms())
-                for simbolo in list(orq.reconnected):
-                    orq.reconnected.discard(simbolo)
-                    await orq.refill_gap(simbolo, ahora)
-                for t in orq.evaluate(ahora):
-                    if t.should_alert:
-                        log.info("ALERTA %s %s score=%.1f", t.symbol,
-                                  t.current.value, t.score)
-                hecho, total = bootstrapper.progress()
-                orq.state.bootstrap_done, orq.state.bootstrap_total = hecho, total
+                await paso_evaluador(orq, bootstrapper, ahora)
                 await asyncio.sleep(cfg.engine.tick_seconds)
 
         async def bucle_outcomes() -> None:
             while True:
                 await asyncio.sleep(cfg.outcomes.poll_seconds)
-                try:
-                    tracker.run_once(orq.now_ms(ahora_ms()))
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("seguimiento de resultados fallido: %s", exc)
+                await paso_outcomes(tracker, orq.now_ms(ahora_ms()))
 
         async def bucle_mantenimiento() -> None:
             """Poda diaria (I2) y recálculo diario del perfil de volumen (I4).
@@ -142,17 +217,14 @@ async def main() -> None:
             """
             while True:
                 await asyncio.sleep(cfg.maintenance.interval_hours * 3600)
-                try:
-                    await orq.run_maintenance(orq.now_ms(ahora_ms()))
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("mantenimiento diario fallido: %s", exc)
-
-        def _marcar_ws_conectado(conectado: bool) -> None:
-            orq.state.ws_connected = conectado
+                await paso_mantenimiento(orq, orq.now_ms(ahora_ms()))
 
         log.info("dashboard en http://%s:%d", cfg.server.host, cfg.server.port)
         await asyncio.gather(
-            ws.run(orq.handle_ws_event, on_connection_change=_marcar_ws_conectado),
+            ws.run(
+                orq.handle_ws_event,
+                on_connection_change=lambda c: marcar_ws_conectado(orq.state, c),
+            ),
             bucle_tickers(),
             bucle_evaluador(),
             bucle_outcomes(),

@@ -206,6 +206,27 @@ class BitgetWebsocket:
                             tarea_actual = asyncio.current_task()
                             if tarea_actual is not None and tarea_actual.cancelling():
                                 raise
+                        except Exception as exc:  # noqa: BLE001
+                            # C-2: `ping` murió por su cuenta (p. ej. un
+                            # `send("ping")` que revienta con
+                            # `ConnectionResetError` en una conexión
+                            # "half-open", con el lado de lectura todavía
+                            # bloqueado). Si en ese instante llega una
+                            # cancelación externa de ESTA tarea mientras
+                            # está en el `await ping` de arriba, asyncio
+                            # también la entrega a través de ese mismo
+                            # await -pero `ping` ya está terminado con esta
+                            # excepción, así que lo que sale de `await ping`
+                            # es `exc`, no `CancelledError`-. Sin este
+                            # except, `exc` escapaba del `finally`, la
+                            # `CancelledError` real quedaba enterrada, y el
+                            # `except Exception` de más abajo la atrapaba,
+                            # registraba y reconectaba otra vez: el proceso
+                            # nunca terminaba al apagarse. Se recoge y se
+                            # ignora aquí -el propio bucle de lectura de
+                            # arriba ya se habrá roto o se romperá por la
+                            # misma caída de conexión que mató al latido-.
+                            log.debug("tarea de ping terminada con error: %s", exc)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - se registra y se reintenta

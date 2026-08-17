@@ -1,6 +1,7 @@
 # tests/app/test_orchestrator.py
 import asyncio
 import logging
+import time
 
 import pytest
 
@@ -142,7 +143,11 @@ async def test_evaluate_solo_procesa_los_simbolos_marcados(orq):
     orq.evaluate(now_ms=14 * DIA + 30_000)
     assert orq.dirty == set()
     orq.evaluate(now_ms=14 * DIA + 31_000)  # nada marcado: no hace trabajo
-    assert orq.state.snapshot("AAAUSDT").updated_ms == 14 * DIA + 30_000
+    # I-2(b): `updated_ms` sigue al ts de la última vela conocida (aquí, la
+    # del único evento de WS: `14 * DIA`), no al `now_ms` de evaluate(); el
+    # segundo evaluate() no hizo nada de todos modos, así que cualquiera de
+    # los dos valores demostraría "no hubo trabajo" -se deja el correcto-.
+    assert orq.state.snapshot("AAAUSDT").updated_ms == 14 * DIA
 
 
 async def test_un_pump_genera_transicion_y_se_persiste(orq):
@@ -998,6 +1003,51 @@ async def test_now_ms_no_retrocede_si_el_reloj_del_exchange_salta_hacia_atras(or
     assert orq.now_ms(wall_clock_ms=0) == 10_000  # no retrocede a 5_000
 
 
+async def test_now_ms_sigue_avanzando_con_velas_del_ws_aunque_rest_falle(orq):
+    """Regresión C-1: `now_ms` solo se alimentaba de `poll_tickers`. Si
+    `/tickers` falla durante una caída larga mientras el WS sigue entregando
+    velas, el reloj no debe congelarse -- eso ancla `outcomes.run_once` al
+    minuto equivocado y deja crecer `rvol_session` sin límite contra un
+    `cumulative_baseline` congelado (el mismo `inicio_dia`/`minuto_actual` de
+    siempre)."""
+    base = 14 * DIA
+    orq.set_ticker(Ticker("AAAUSDT", 100.0, 1.0, 5e6, 100.0, 0.0001, ts=base))
+    await orq.handle_ws_event(
+        WsEvent(kind="update", symbol="AAAUSDT", candles=[vela(base)])
+    )
+    assert orq.now_ms(wall_clock_ms=0) == base
+
+    # /tickers está caído (ningún set_ticker más) pero el WS sigue vivo:
+    # cada vela cerrada debe empujar el ratchet, no solo el último ticker bueno.
+    for m in range(1, 11):
+        await orq.handle_ws_event(
+            WsEvent(kind="update", symbol="AAAUSDT", candles=[vela(base + m * MINUTO)])
+        )
+        assert orq.now_ms(wall_clock_ms=0) >= base + m * MINUTO
+
+
+async def test_ticker_con_ts_implausible_no_mueve_el_reloj(orq):
+    """Regresión C-1: `parse_tickers` no valida `ts`, y `_clock_ms` es
+    irrecuperable dentro de un proceso (el ratchet nunca retrocede) y ahora
+    alimenta `candle_repo.prune(now_ms - 14d)`, un borrado masivo. Un ts de
+    ticker disparatado (p. ej. un año en el futuro respecto al reloj local)
+    no debe poder mover el ratchet."""
+    base = 14 * DIA
+    orq.set_ticker(Ticker("AAAUSDT", 100.0, 1.0, 5e6, 100.0, 0.0001, ts=base))
+    assert orq.now_ms(wall_clock_ms=base) == base
+
+    orq.set_ticker(
+        Ticker("AAAUSDT", 100.0, 1.0, 5e6, 100.0, 0.0001, ts=base + 365 * DIA)
+    )
+    assert orq.now_ms(wall_clock_ms=base) == base  # se descarta, no se ratchetea
+
+    # una vez descartado, un ticker de vuelta a un valor plausible sí avanza
+    orq.set_ticker(
+        Ticker("AAAUSDT", 100.0, 1.0, 5e6, 100.0, 0.0001, ts=base + MINUTO)
+    )
+    assert orq.now_ms(wall_clock_ms=base) == base + MINUTO
+
+
 async def test_una_senal_persistida_usa_el_reloj_del_exchange_no_el_de_pared(orq):
     """I6, test de anclaje: `signals.ts` -el valor que `outcomes.run_once`
     compara después contra velas estampadas por el exchange (spec §13,
@@ -1041,6 +1091,35 @@ async def test_una_senal_persistida_usa_el_reloj_del_exchange_no_el_de_pared(orq
     for f in filas:
         assert f["ts"] != reloj_de_pared_parado  # no vino del reloj de pared
         assert f["ts"] >= base + 120 * MINUTO      # siguió al ticker (reloj del exchange)
+
+
+# --- I-2: el marcador de obsolescencia del dashboard debe seguir a la vela ---
+
+async def test_updated_ms_sigue_al_ts_de_la_ultima_vela_no_al_de_evaluate(orq):
+    """Regresión I-2(b): `poll_tickers` marca sucio cada símbolo con buffer
+    cada `ticker_poll_seconds`, WS vivo o muerto, y antes del fix `evaluate`
+    reescribía `updated_ms` con su propio `now_ms` (el de la evaluación) en
+    cada pasada. Con el WS muerto y REST sano, ningún símbolo llegaba a
+    quedar obsoleto nunca: `updated_ms` avanzaba igual que si las velas
+    siguieran llegando. `updated_ms` debe seguir en cambio al ts de la
+    última vela conocida del propio símbolo -deja de avanzar exactamente
+    cuando el WS deja de entregar velas, que es la señal que este marcador
+    existe para detectar-."""
+    base = 14 * DIA
+    await orq.ensure_profile("AAAUSDT", now_ms=base)
+    orq.set_ticker(Ticker("AAAUSDT", 100.0, 1.0, 5e6, 100.0, 0.0001, 0))
+    await orq.handle_ws_event(
+        WsEvent(kind="update", symbol="AAAUSDT", candles=[vela(base)])
+    )
+    orq.evaluate(now_ms=base + 30_000)
+    assert orq.state.snapshot("AAAUSDT").updated_ms == base
+
+    # el WS deja de entregar velas, pero poll_tickers lo sigue marcando
+    # sucio cada tick igualmente (como en producción, WS vivo o muerto).
+    orq.dirty.add("AAAUSDT")
+    orq.evaluate(now_ms=base + 5 * MINUTO)  # 5 min después, sin ninguna vela nueva
+
+    assert orq.state.snapshot("AAAUSDT").updated_ms == base  # sigue anclado a la vela
 
 
 # --- I2 + I4: mantenimiento diario (poda de velas + recálculo de perfil) ---
@@ -1104,3 +1183,55 @@ async def test_run_maintenance_no_recalcula_placeholders_en_bootstrap(orq):
     await orq.run_maintenance(14 * DIA + DIA)
 
     assert orq.profile_repo.load("AAAUSDT") is None  # no se guardó nada de fondo
+
+
+async def test_run_maintenance_no_bloquea_el_event_loop(orq, monkeypatch):
+    """Regresión I-3: sin ningún `await` en la parte real de trabajo,
+    `run_maintenance` bloqueaba el hilo del event loop de principio a fin
+    (medido: `candle_repo.load` de 14 días x 150 símbolos ≈ 9.1s, más
+    `build_profile` x150 ≈ 2.0s) -- nada más podía correr durante esa
+    ventana: ni lecturas de WS, ni polls de ticker, ni el dashboard, ni el
+    propio latido del WS.
+
+    Se reproduce con un `candle_repo.load` sintético pero de verdad
+    bloqueante (`time.sleep`, no una corrutina lenta) para varios símbolos,
+    y una tarea concurrente que solo cuenta cuántas veces consigue correr
+    mientras tanto: con el bug, el event loop nunca vuelve a ella hasta que
+    `run_maintenance` termina del todo, así que `vueltas` se queda en 0."""
+    simbolos = [f"SYM{i}USDT" for i in range(6)]
+    base = 14 * DIA
+    for simbolo in simbolos:
+        await orq.ensure_profile(simbolo, now_ms=base)
+        orq.candle_repo.save_many(
+            simbolo, [vela(base + m * MINUTO) for m in range(5)]
+        )
+
+    real_load = orq.candle_repo.load
+
+    def load_lento(symbol, since_ms):
+        time.sleep(0.05)  # I/O síncrono lento, bloqueante de verdad
+        return real_load(symbol, since_ms)
+
+    monkeypatch.setattr(orq.candle_repo, "load", load_lento)
+
+    vueltas = 0
+
+    async def latido():
+        nonlocal vueltas
+        while True:
+            await asyncio.sleep(0.01)
+            vueltas += 1
+
+    tarea_latido = asyncio.create_task(latido())
+    try:
+        await orq.run_maintenance(base + DIA)
+    finally:
+        tarea_latido.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tarea_latido
+
+    # 6 símbolos x 50ms bloqueantes = ~300ms de trabajo sintético: si el
+    # event loop nunca se libera durante ese tramo, `latido` no consigue
+    # correr ni una vez. Con el fix (asyncio.to_thread por símbolo), debe
+    # intercalarse varias veces.
+    assert vueltas > 0
