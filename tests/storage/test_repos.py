@@ -261,7 +261,7 @@ def test_pending_outcomes_no_confunde_el_resultado_de_otro_horizonte(conn):
     repo = SignalRepo(conn)
     sid = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL)
     repo.save_outcome(sid, horizon_min=1, price=7.0, return_pct=4.2,
-                      mfe_pct=5.0, mae_pct=-0.5)
+                      mfe_pct=5.0, mae_pct=-0.5, candles_seen=2, candles_expected=2)
     pendientes = repo.pending_outcomes(now_ms=60 * MINUTO, horizons=(1, 5, 15, 30, 60))
     horizontes = sorted(h for _, _, _, h, _ in pendientes)
     assert horizontes == [5, 15, 30, 60]
@@ -271,9 +271,26 @@ def test_un_outcome_guardado_deja_de_estar_pendiente(conn):
     repo = SignalRepo(conn)
     sid = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL)
     repo.save_outcome(sid, horizon_min=1, price=7.0, return_pct=4.2,
-                      mfe_pct=5.0, mae_pct=-0.5)
+                      mfe_pct=5.0, mae_pct=-0.5, candles_seen=2, candles_expected=2)
     pendientes = repo.pending_outcomes(now_ms=6 * MINUTO, horizons=(1, 5, 15, 30, 60))
     assert sorted(h for _, _, _, h, _ in pendientes) == [5]
+
+
+def test_save_outcome_persiste_la_completitud_de_la_ventana(conn):
+    """Una ventana calculada sobre un hueco (candles_seen < candles_expected)
+    debe distinguirse en el propio dato persistido de una completa, no solo
+    en la lógica que la produjo: si `save_outcome` ignorara estos dos
+    argumentos, esta lectura devolvería NULL o los valores de otra fila."""
+    repo = SignalRepo(conn)
+    sid = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL)
+    repo.save_outcome(sid, horizon_min=5, price=7.0, return_pct=4.2,
+                      mfe_pct=5.0, mae_pct=-0.5, candles_seen=4, candles_expected=6)
+    fila = conn.execute(
+        "SELECT candles_seen, candles_expected FROM signal_outcomes "
+        "WHERE signal_id = ? AND horizon_min = 5", (sid,),
+    ).fetchone()
+    assert fila["candles_seen"] == 4
+    assert fila["candles_expected"] == 6
 
 
 def test_supply_repo_hace_upsert(conn):

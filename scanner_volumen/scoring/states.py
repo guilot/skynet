@@ -13,8 +13,6 @@ from dataclasses import dataclass
 from scanner_volumen.config import StatesConfig
 from scanner_volumen.models import State
 
-ESTADO_MINIMO_DE_ALERTA = State.SIGNAL
-
 
 @dataclass
 class _SymbolState:
@@ -45,6 +43,10 @@ class StateMachine:
     def __init__(self, cfg: StatesConfig) -> None:
         self._cfg = cfg
         self._states: dict[str, _SymbolState] = {}
+        # umbral de negocio (severidad mínima que dispara alerta), desde
+        # config.toml: el TOML guarda el nombre del estado como texto
+        # ("SIGNAL"), aquí se convierte una vez al enum real.
+        self._alerta_minima = State(cfg.alert_min_state)
 
     def state_of(self, symbol: str) -> State:
         return self._states.get(symbol, _SymbolState()).state
@@ -112,7 +114,7 @@ class StateMachine:
         escalado = nuevo.rank > anterior.rank
 
         alerta = False
-        if escalado and nuevo.rank >= ESTADO_MINIMO_DE_ALERTA.rank:
+        if escalado and nuevo.rank >= self._alerta_minima.rank:
             en_cooldown = False
             peor_que_la_ultima_alerta = True
             if actual.last_alert_ms is not None:

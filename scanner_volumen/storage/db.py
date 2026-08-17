@@ -84,6 +84,8 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     return_pct REAL NOT NULL,
     mfe_pct REAL NOT NULL,
     mae_pct REAL NOT NULL,
+    candles_seen INTEGER NOT NULL,
+    candles_expected INTEGER NOT NULL,
     PRIMARY KEY (signal_id, horizon_min),
     FOREIGN KEY (signal_id) REFERENCES signals(id)
 ) WITHOUT ROWID;

@@ -15,11 +15,17 @@ from scanner_volumen.bitget.ws import decode_message
 from scanner_volumen.config import load_config
 from scanner_volumen.engine.profile import build_profile
 from scanner_volumen.models import Candle
+from scanner_volumen.scoring.score import (
+    CLAVES_DEMAND, CLAVES_MOMENTUM, CLAVES_STRUCTURE,
+)
 from scanner_volumen.storage.db import open_db
 from scanner_volumen.storage.repos import CandleRepo, ProfileRepo, SignalRepo
 from scanner_volumen.universe.selector import UniverseSelector
 
 FIXTURES = Path(__file__).parent / "fixtures"
+# Anclado a la ubicación del propio fichero, no al cwd: sin esto la suite
+# solo pasa si pytest se lanza desde la raíz del repo.
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.toml"
 MINUTO = 60_000
 DIA = 1440 * MINUTO
 
@@ -50,7 +56,7 @@ class BootstrapperFalso:
 
 @pytest.fixture
 def orq(tmp_path):
-    cfg = load_config(Path("config.toml"))
+    cfg = load_config(CONFIG_PATH)
     conn = open_db(tmp_path / "t.db")
     yield Orchestrator(
         cfg=cfg, rest=None, ws=None,
@@ -93,6 +99,35 @@ async def test_la_sesion_ws_grabada_atraviesa_el_sistema_completo(orq):
         for i in range(len(ranking) - 1)
     )
 
+    # Aserción dorada: score exacto de SOLUSDT tras reproducir la sesión
+    # grabada, derivado ejecutando el pipeline real contra los fixtures (no
+    # inventado). Cualquier cambio en engine/, scoring/ o en config.toml que
+    # altere el resultado numérico debe mover deliberadamente este valor, no
+    # dejarlo pasar en silencio -- las aserciones de rango (0-100) de arriba
+    # las pasaría igualmente un score constante, que es justo el defecto
+    # (C2/C3) que esta prueba de integración no cazó en su momento.
+    sol = next(s for s in ranking if s.symbol == "SOLUSDT")
+    assert abs(sol.breakdown.total - 42.56894228594851) < 1e-6
+
+    # Cada uno de los tres bloques del score (MOMENTUM 40 / DEMAND 40 /
+    # STRUCTURE 20) debe tener al menos un componente no nulo para cada
+    # símbolo. Por sí sola, esta aserción habría destapado C2 (demand_burst
+    # inalcanzable con record_rvol por tick en vez de por vela cerrada
+    # dejaba rvol_1m/5m/session como únicos aportes de DEMAND, pero un bug
+    # que además rompiera esos habría dejado el bloque entero en 0 sin que
+    # ningún test lo notara).
+    for s in ranking:
+        componentes = s.breakdown.components
+        assert any(componentes.get(k, 0.0) != 0.0 for k in CLAVES_MOMENTUM), (
+            f"{s.symbol}: bloque MOMENTUM completamente en cero"
+        )
+        assert any(componentes.get(k, 0.0) != 0.0 for k in CLAVES_DEMAND), (
+            f"{s.symbol}: bloque DEMAND completamente en cero"
+        )
+        assert any(componentes.get(k, 0.0) != 0.0 for k in CLAVES_STRUCTURE), (
+            f"{s.symbol}: bloque STRUCTURE completamente en cero"
+        )
+
 
 async def test_reproducir_dos_veces_da_el_mismo_resultado(orq, tmp_path):
     """El motor es determinista: mismos datos y mismo now_ms, mismo score."""
@@ -112,7 +147,7 @@ async def test_reproducir_dos_veces_da_el_mismo_resultado(orq, tmp_path):
 
     primera = await reproducir(orq)
 
-    cfg = load_config(Path("config.toml"))
+    cfg = load_config(CONFIG_PATH)
     conn2 = open_db(tmp_path / "t2.db")
     otro = Orchestrator(
         cfg=cfg, rest=None, ws=None,
@@ -127,7 +162,7 @@ async def test_reproducir_dos_veces_da_el_mismo_resultado(orq, tmp_path):
 
 
 def test_el_universo_real_produce_candidatos_sin_rwa():
-    cfg = load_config(Path("config.toml"))
+    cfg = load_config(CONFIG_PATH)
     selector = UniverseSelector(cfg.universe)
     contratos = parse_contracts(
         json.loads((FIXTURES / "contracts_usdt_futures.json").read_text())

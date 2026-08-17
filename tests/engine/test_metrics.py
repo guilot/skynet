@@ -23,7 +23,9 @@ def perfil_plano(volumen=100.0):
 def constructor():
     return MetricsBuilder(
         EngineConfig(tick_seconds=1.0, ticker_poll_seconds=3.0,
-                     live_rvol_min_elapsed_seconds=15, zscore_window_minutes=60),
+                     live_rvol_min_elapsed_seconds=15, zscore_window_minutes=60,
+                     zscore_min_samples=8, burst_lookback_minutes=5,
+                     demand_burst_min_denominator=0.5),
         ProfileConfig(history_days=14, smoothing_window_minutes=0,
                       min_days_for_confidence=3, rolling_fallback_candles=120),
     )

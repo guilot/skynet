@@ -178,6 +178,12 @@ def test_registra_con_hueco_interno_si_los_datos_llegan_mas_alla_del_limite(repo
         "SELECT * FROM signal_outcomes WHERE horizon_min = 3"
     ).fetchone()
     assert fila["price"] == 104.0  # cierre de la última vela disponible dentro de la ventana (minuto 1)
+    # ventana incompleta: faltan los minutos 2 y 3 (el propio límite del
+    # horizonte). candles_expected = horizonte + 1 = 4 (minutos 0..3
+    # inclusive); solo llegaron 2 (minutos 0 y 1). Sin registrar esta
+    # completitud, esta fila sería indistinguible de una ventana entera.
+    assert fila["candles_seen"] == 2
+    assert fila["candles_expected"] == 4
 
 
 def test_guarda_el_resultado_correcto_para_el_horizonte(repos):
@@ -206,3 +212,6 @@ def test_guarda_el_resultado_correcto_para_el_horizonte(repos):
     assert abs(fila["return_pct"] - 4.0) < 1e-9
     assert abs(fila["mfe_pct"] - 8.0) < 1e-9      # máximo 108 (minuto 0-1), no 110 del minuto 2
     assert abs(fila["mae_pct"] + 1.0) < 1e-9      # mínimo 99 (vela de entrada), no 80 del minuto 2
+    # ventana completa: llegaron las 2 velas esperadas (minutos 0 y 1).
+    assert fila["candles_seen"] == 2
+    assert fila["candles_expected"] == 2

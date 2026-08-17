@@ -180,7 +180,32 @@ class BitgetWebsocket:
                             if evento is not None and evento.kind != "pong":
                                 await on_event(evento)
                     finally:
+                        # `cancel()` sola no basta: sin esperar la tarea, la
+                        # `CancelledError` que produce puede quedar sin
+                        # recoger y el runtime de asyncio la reporta como
+                        # excepción no manejada -ruido que, en un proceso de
+                        # larga vida con reconexiones frecuentes, esconde
+                        # errores reales entre falsos positivos.
                         ping.cancel()
+                        try:
+                            await ping
+                        except asyncio.CancelledError:
+                            # Si esta propia tarea (`run`, no `ping`) tiene
+                            # una cancelación externa pendiente, puede
+                            # llegar aquí como el MISMO `CancelledError`:
+                            # asyncio entrega la cancelación de una tarea a
+                            # lo que esté esperando en ese instante (aquí,
+                            # `ping`), así que "cancelé a ping" y "me
+                            # cancelaron a mí mientras esperaba a ping" son
+                            # indistinguibles por tipo de excepción. Tragarla
+                            # sin más apagaría silenciosamente la
+                            # cancelación real de este bucle de reconexión.
+                            # `Task.cancelling()` (3.11+) sí las distingue:
+                            # solo se sube cuando alguien llama a
+                            # `cancel()` sobre ESTA tarea.
+                            tarea_actual = asyncio.current_task()
+                            if tarea_actual is not None and tarea_actual.cancelling():
+                                raise
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - se registra y se reintenta

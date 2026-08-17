@@ -19,6 +19,9 @@ tick_seconds = 1.0
 ticker_poll_seconds = 3.0
 live_rvol_min_elapsed_seconds = 15
 zscore_window_minutes = 60
+zscore_min_samples = 8
+burst_lookback_minutes = 5
+demand_burst_min_denominator = 0.5
 
 [rest]
 rate_limit_per_second = 10
@@ -37,6 +40,23 @@ extreme = 90
 exit_margin = 5
 exit_ticks = 3
 cooldown_minutes = 15
+alert_min_state = "SIGNAL"
+
+[orchestrator]
+persisted_min_state = "HOT"
+gap_tolerance_minutes = 3
+
+[supply]
+refresh_hours = 6
+
+[outcomes]
+horizons_minutes = [1, 5, 15, 30, 60]
+poll_seconds = 60
+
+[server]
+host = "127.0.0.1"
+port = 8000
+db_path = "data/scanner.db"
 
 [score]
 neutral_multiplier = 0.5

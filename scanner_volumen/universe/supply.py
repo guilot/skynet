@@ -29,7 +29,12 @@ def base_coin_of(symbol: str) -> str:
 def match_coingecko(base_coin: str, coins: list[dict]) -> dict | None:
     """CoinGecko contiene muchos tokens con el mismo ticker. Se elige el de
     mayor capitalización, que es el que corresponde al listado en un exchange
-    grande. Es una heurística, y por eso `supply_cache` admite override manual.
+    grande. Es una heurística: la spec (§13) lista un override manual de
+    `supply_cache` como mitigación para un mapeo ambiguo, pero esa columna
+    no existe hoy -- ni aquí ni en el esquema de `supply_cache`
+    (`storage/db.py`) hay forma de forzar manualmente qué moneda de
+    CoinGecko corresponde a un símbolo. Un símbolo mal emparejado por esta
+    heurística no tiene hoy ninguna vía de corrección salvo editar el código.
     """
     objetivo = base_coin.lower()
     candidatos = [c for c in coins if str(c.get("symbol", "")).lower() == objetivo]

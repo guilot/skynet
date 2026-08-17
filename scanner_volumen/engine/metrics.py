@@ -27,7 +27,6 @@ from scanner_volumen.models import Ticker
 
 MINUTO_MS = 60_000
 DIA_MS = 1440 * MINUTO_MS
-BURST_LOOKBACK_MIN = 5
 # Dos horas de historial, una muestra por vela cerrada (una por minuto).
 RVOL_HISTORY_MINUTES = 120
 
@@ -195,13 +194,20 @@ class MetricsBuilder:
             )
             if r is not None
         ]
-        z = z_return(retornos_recientes, rets[1]) if rets[1] is not None else None
+        z = (
+            z_return(retornos_recientes, rets[1], min_samples=self._engine.zscore_min_samples)
+            if rets[1] is not None
+            else None
+        )
 
         burst = None
         if ultima_cerrada is not None:
             burst = demand_burst(
                 rvol_cerrado,
-                self._rvol_hace(symbol, ultima_cerrada.ts, BURST_LOOKBACK_MIN),
+                self._rvol_hace(
+                    symbol, ultima_cerrada.ts, self._engine.burst_lookback_minutes
+                ),
+                min_denominator=self._engine.demand_burst_min_denominator,
             )
             # se registra despues de consultar el historial, para que la
             # propia muestra de esta vela no pueda emparejarse consigo misma.

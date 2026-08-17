@@ -24,7 +24,6 @@ from scanner_volumen.scoring.score import score_symbol
 from scanner_volumen.scoring.states import StateMachine, Transition
 from scanner_volumen.storage.repos import CandleRepo, ProfileRepo, SignalRepo
 
-ESTADO_MINIMO_PERSISTIDO = State.HOT
 MINUTO_MS = 60_000
 DIA_MS = 1440 * MINUTO_MS
 
@@ -84,6 +83,10 @@ class Orchestrator:
         # ratchet del reloj del exchange (I6): último ts de ticker visto,
         # nunca retrocede. Ver `now_ms`.
         self._clock_ms: int | None = None
+        # umbral de negocio (severidad mínima que se persiste en `signals`),
+        # desde config.toml: el TOML guarda el nombre del estado como texto
+        # ("HOT"), aquí se convierte una vez al enum real.
+        self._persisted_min_state = State(cfg.orchestrator.persisted_min_state)
 
     # --- entrada de datos ---
 
@@ -383,7 +386,7 @@ class Orchestrator:
                 transiciones.append(transicion)
                 if (
                     transicion.escalated
-                    and transicion.current.rank >= ESTADO_MINIMO_PERSISTIDO.rank
+                    and transicion.current.rank >= self._persisted_min_state.rank
                 ):
                     self.signal_repo.insert(metricas, desglose, transicion.current)
 
@@ -391,7 +394,6 @@ class Orchestrator:
 
     # --- relleno de huecos tras reconexión ---
 
-    MINUTOS_TOLERADOS_DE_HUECO = 3
     # Tope de páginas de 200 velas que un solo relleno pedirá por REST. 20
     # páginas x 200 min = 4000 min (~66 h) de hueco cubierto: una caída de
     # WS de casi 3 días es ya un escenario extremo, y sin este tope un reloj
@@ -434,7 +436,7 @@ class Orchestrator:
                     return
                 anterior_ts = cerradas[-1].ts
         hueco_min = (now_ms - anterior_ts) // 60_000
-        if hueco_min <= self.MINUTOS_TOLERADOS_DE_HUECO:
+        if hueco_min <= self.cfg.orchestrator.gap_tolerance_minutes:
             return
 
         # Misma convención que plan_history_requests: la última vela guardada

@@ -18,7 +18,9 @@ def demand_burst(
     min_denominator: float = 0.5,
 ) -> float | None:
     """El denominador se acota por abajo: con un RVOL previo de 0.01 el cociente
-    sería enorme sin que eso signifique aceleración real."""
+    sería enorme sin que eso signifique aceleración real. El valor por
+    defecto es el histórico de V1; quien llama en producción
+    (`MetricsBuilder`) lo pasa explícitamente desde `config.toml`."""
     if rvol_now is None or rvol_before is None:
         return None
     denominador = max(rvol_before, min_denominator)
@@ -27,13 +29,19 @@ def demand_burst(
     return rvol_now / denominador
 
 
-def z_return(recent_returns: list[float], current: float) -> float | None:
+def z_return(
+    recent_returns: list[float],
+    current: float,
+    min_samples: int = MUESTRAS_MINIMAS_Z,
+) -> float | None:
     """Desviaciones típicas del retorno actual respecto a los recientes.
 
-    Con menos de MUESTRAS_MINIMAS_Z valores el resultado no es interpretable, y
-    con desviación cero la división es imposible: en ambos casos None.
+    Con menos de `min_samples` valores el resultado no es interpretable, y
+    con desviación cero la división es imposible: en ambos casos None. El
+    valor por defecto es el histórico de V1; quien llama en producción
+    (`MetricsBuilder`) lo pasa explícitamente desde `config.toml`.
     """
-    if len(recent_returns) < MUESTRAS_MINIMAS_Z:
+    if len(recent_returns) < min_samples:
         return None
     desviacion = statistics.pstdev(recent_returns)
     if desviacion <= 0:

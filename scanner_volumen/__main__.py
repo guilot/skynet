@@ -56,7 +56,7 @@ async def main() -> None:
         level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s"
     )
     cfg = load_config(Path("config.toml"))
-    conn = open_db(Path("data/scanner.db"))
+    conn = open_db(Path(cfg.server.db_path))
 
     candle_repo = CandleRepo(conn)
     profile_repo = ProfileRepo(conn)
@@ -66,17 +66,21 @@ async def main() -> None:
     async with httpx.AsyncClient(base_url=BASE_URL, timeout=20.0) as http:
         rest = BitgetRest(cfg.market.venue, cfg.rest.rate_limit_per_second, http)
         ws = BitgetWebsocket(cfg.market.venue)
-        supply = SupplyCache(supply_repo, http)
+        supply = SupplyCache(supply_repo, http, refresh_hours=cfg.supply.refresh_hours)
         bootstrapper = Bootstrapper(rest, candle_repo, profile_repo, cfg.profile)
         selector = UniverseSelector(cfg.universe)
         orq = Orchestrator(cfg, rest, ws, candle_repo, profile_repo,
                             signal_repo, supply, bootstrapper)
         orq.state.stale_after_ms = int(cfg.dashboard.stale_after_seconds * 1000)
-        tracker = OutcomeTracker(signal_repo, candle_repo)
+        tracker = OutcomeTracker(
+            signal_repo, candle_repo, horizons=cfg.outcomes.horizons_minutes
+        )
 
         app = create_app(orq.state, signal_repo)
         servidor = uvicorn.Server(
-            uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="warning")
+            uvicorn.Config(
+                app, host=cfg.server.host, port=cfg.server.port, log_level="warning"
+            )
         )
 
         async def bucle_tickers() -> None:
@@ -124,7 +128,7 @@ async def main() -> None:
 
         async def bucle_outcomes() -> None:
             while True:
-                await asyncio.sleep(60)
+                await asyncio.sleep(cfg.outcomes.poll_seconds)
                 try:
                     tracker.run_once(orq.now_ms(ahora_ms()))
                 except Exception as exc:  # noqa: BLE001
@@ -146,7 +150,7 @@ async def main() -> None:
         def _marcar_ws_conectado(conectado: bool) -> None:
             orq.state.ws_connected = conectado
 
-        log.info("dashboard en http://127.0.0.1:8000")
+        log.info("dashboard en http://%s:%d", cfg.server.host, cfg.server.port)
         await asyncio.gather(
             ws.run(orq.handle_ws_event, on_connection_change=_marcar_ws_conectado),
             bucle_tickers(),

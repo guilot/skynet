@@ -87,6 +87,19 @@ class OutcomeTracker:
             if resultado is None:
                 continue
             final, ret, mfe, mae = resultado
-            self._signals.save_outcome(signal_id, horizonte, final, ret, mfe, mae)
+            # Progreso más allá de `fin` no garantiza que la propia ventana
+            # esté completa: puede haber un hueco interno (p. ej. una caída
+            # de WS ya cubierta por `refill_gap`, o un símbolo poco líquido
+            # que no publica todos los minutos) y `velas` simplemente omite
+            # los minutos ausentes. Se registra cuántas velas se vieron
+            # frente a cuántas debería haber (inicio y fin inclusive, cada
+            # minuto) para que V3 pueda descartar o ponderar filas
+            # calculadas sobre un hueco en vez de tratarlas como idénticas a
+            # una ventana completa.
+            velas_esperadas = (fin - inicio) // MINUTO_MS + 1
+            self._signals.save_outcome(
+                signal_id, horizonte, final, ret, mfe, mae,
+                candles_seen=len(velas), candles_expected=velas_esperadas,
+            )
             escritos += 1
         return escritos

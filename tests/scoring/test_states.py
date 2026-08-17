@@ -7,7 +7,8 @@ MINUTO = 60_000
 
 def cfg(**kwargs):
     base = dict(watch=50, hot=65, signal=80, extreme=90,
-                exit_margin=5, exit_ticks=3, cooldown_minutes=15)
+                exit_margin=5, exit_ticks=3, cooldown_minutes=15,
+                alert_min_state="SIGNAL")
     base.update(kwargs)
     return StatesConfig(**base)
 

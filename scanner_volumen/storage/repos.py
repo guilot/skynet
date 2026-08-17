@@ -189,13 +189,22 @@ class SignalRepo:
     def save_outcome(
         self, signal_id: int, horizon_min: int, price: float,
         return_pct: float, mfe_pct: float, mae_pct: float,
+        candles_seen: int, candles_expected: int,
     ) -> None:
+        """`candles_seen`/`candles_expected` registran si la ventana del
+        horizonte estaba completa (para que V3 pueda calibrar los pesos del
+        score con evidencia limpia). Un hueco de datos (p. ej. una caída de
+        WS ya cubierta por `refill_gap`, o un símbolo poco líquido) deja
+        `candles_seen < candles_expected`; sin esto, esa fila era
+        indistinguible de una ventana completa."""
         self._conn.execute(
             """INSERT INTO signal_outcomes
-               (signal_id, horizon_min, price, return_pct, mfe_pct, mae_pct)
-               VALUES (?, ?, ?, ?, ?, ?)
+               (signal_id, horizon_min, price, return_pct, mfe_pct, mae_pct,
+                candles_seen, candles_expected)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(signal_id, horizon_min) DO NOTHING""",
-            (signal_id, horizon_min, price, return_pct, mfe_pct, mae_pct),
+            (signal_id, horizon_min, price, return_pct, mfe_pct, mae_pct,
+             candles_seen, candles_expected),
         )
         self._conn.commit()
 
