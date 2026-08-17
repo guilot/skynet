@@ -88,6 +88,29 @@ class Orchestrator:
         # cada uno de esos refrescos. La única puerta de reingreso es
         # `_reevaluar_rechazados`, desde el mantenimiento diario.
         self._rejected_thin_book: set[str] = set()
+        # símbolos cuyo perfil actual todavía NO ha pasado por `_admite_libro`
+        # (arranque en frío: siguen con el placeholder que `apply_universe`
+        # les asigna mientras su bootstrap real corre en segundo plano). El
+        # filtro de libro fino solo puede aplicarse una vez existe un perfil
+        # real -mientras tanto el símbolo ya se puntúa, rankea y muestra en el
+        # dashboard con normalidad vía el fallback de mediana rolling, pero
+        # nadie ha comprobado todavía si su libro es lo bastante líquido para
+        # que ese score signifique algo. Sin esta memoria, un pump durante esa
+        # ventana podía escalar a HOT y `evaluate` persistía la fila antes de
+        # que el rechazo por libro fino llegara (medido en real: 56 filas en
+        # 52 min de arranque en frío, la mayoría de libros de $0-800/min que
+        # el filtro rechazó en cuanto llegó su perfil) -contaminando
+        # precisamente el dataset que `signals` existe para dejar calibrar.
+        # Se llena en `apply_universe` al asignar el placeholder y se vacía
+        # dentro de `_admite_libro` en cuanto un perfil real (sea cual sea su
+        # `confidence`) pasa por la puerta, aceptado o rechazado: baja
+        # confianza (listing reciente) no es lo mismo que "sin validar", así
+        # que un perfil real de baja confianza que ya pasó la puerta sale de
+        # este set igual que uno de alta confianza. Nunca lo toca el reuso de
+        # `_placeholder_symbols` en `_rellenar_hueco_en_fondo` -ese caso ya
+        # tiene un perfil real y validado, solo pide que `apply_universe` lo
+        # reconsidere por un hueco de histórico, no por el libro-.
+        self._pending_book_validation: set[str] = set()
 
         self._metrics = MetricsBuilder(cfg.engine, cfg.profile)
         self._states = StateMachine(cfg.states)
@@ -232,8 +255,15 @@ class Orchestrator:
         forma de demostrar que es líquido, y negarle la entrada por falta
         de datos sería indistinguible de penalizar el arranque en frío que
         el propio placeholder existe para no penalizar.
+
+        Este es también el único punto que saca a un símbolo de
+        `_pending_book_validation`: en cuanto esta función decide -acepte o
+        rechace- el símbolo deja de estar "sin validar" para `evaluate`, que
+        usa ese set para decidir si puede persistir en `signals` (ver su
+        comentario en `__init__`).
         """
         tipico = perfil.typical_volume()
+        self._pending_book_validation.discard(symbol)
         if tipico is None or tipico >= self.cfg.universe.min_profile_median_volume:
             return True
 
@@ -601,6 +631,13 @@ class Orchestrator:
                 if (
                     transicion.escalated
                     and transicion.current.rank >= self._persisted_min_state.rank
+                    # el libro fino solo puede evaluarse una vez existe un
+                    # perfil real (`_admite_libro`); mientras el símbolo siga
+                    # con el placeholder de arranque en frío, se sigue
+                    # puntuando/rankeando/mostrando con normalidad, pero no
+                    # se escribe en `signals` -ver el comentario de
+                    # `_pending_book_validation` en `__init__`.
+                    and simbolo not in self._pending_book_validation
                 ):
                     self.signal_repo.insert(metricas, desglose, transicion.current)
 
@@ -756,6 +793,10 @@ class Orchestrator:
             # que dejarlo en `_rejected_thin_book` sería una fuga lenta
             # (mismo espíritu que el resto de la limpieza de este bucle).
             self._rejected_thin_book.discard(simbolo)
+            # mismo espíritu: un símbolo que sale del universo ya no puede
+            # "validarse" nunca (no va a recibir más velas ni bootstrap), así
+            # que dejarlo aquí sería otra fuga lenta.
+            self._pending_book_validation.discard(simbolo)
             tarea = self._bootstrap_tasks.pop(simbolo, None)
             if tarea is not None:
                 tarea.cancel()
@@ -812,6 +853,11 @@ class Orchestrator:
 
             self.profiles[simbolo] = placeholder_profile(simbolo)
             self._placeholder_symbols.add(simbolo)
+            # el placeholder nunca ha pasado por `_admite_libro` (siempre
+            # tiene `typical_volume() is None`, ver su docstring): hasta que
+            # el bootstrap real termine y lo valide, `evaluate` no debe
+            # persistir señales para este símbolo aunque puntúe HOT o más.
+            self._pending_book_validation.add(simbolo)
             await self.seed_buffer(simbolo, now_ms)
             tarea = asyncio.create_task(self._bootstrap_en_fondo(simbolo, now_ms))
             self._bootstrap_tasks[simbolo] = tarea

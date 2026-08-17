@@ -1425,3 +1425,199 @@ async def test_run_maintenance_excluye_un_simbolo_activo_cuyo_perfil_se_ha_vuelt
     assert "AAAUSDT" not in orq.buffers
     assert "AAAUSDT" in orq._rejected_thin_book
     assert orq.ws.unsubscribed == [["AAAUSDT"]]
+
+
+# --- arranque en frío: no persistir signals antes de validar el libro ---
+#
+# El filtro de libro fino solo puede aplicarse una vez existe un perfil real
+# (`_admite_libro`). En frío, el símbolo se puntúa desde el primer minuto con
+# el placeholder + fallback de mediana rolling (C1), y puede llegar a HOT
+# antes de que su bootstrap real termine. Medido en real: un arranque en frío
+# de 52 min escribió 56 filas en `signals`, la mayoría de libros de $0-800/min
+# que el filtro rechazó en cuanto llegó su perfil -exactamente el ruido que el
+# filtro existe para excluir del dataset de calibración. `evaluate` no debe
+# persistir nada para un símbolo hasta que `_admite_libro` lo haya evaluado
+# contra `min_profile_median_volume`, sin importar el resultado.
+
+class BootstrapperLentoConfigurable:
+    """Como `BootstrapperLento` (no resuelve hasta que el test libera el
+    evento), pero con volumen por minuto configurable, para controlar si el
+    perfil resultante pasa o no el filtro de libro fino una vez resuelto."""
+
+    def __init__(self, cfg, vol):
+        self._cfg = cfg
+        self._vol = vol
+        self.terminados: list[str] = []
+        self.evento = asyncio.Event()
+
+    async def bootstrap_symbol(self, symbol, now_ms):
+        await self.evento.wait()
+        self.terminados.append(symbol)
+        velas = [vela(d * DIA + m * MINUTO, vol=self._vol)
+                 for d in range(14) for m in range(1440)]
+        return build_profile(symbol, velas, self._cfg)
+
+    def expect(self, symbols):
+        pass
+
+    def progress(self):
+        return (len(self.terminados), len(self.terminados))
+
+    def mark_loaded(self, symbol):
+        pass
+
+
+async def _calentar_y_pumpear(orq, symbol, base, vol_base, vol_pump):
+    """Reproduce el mismo patrón que `test_un_pump_genera_transicion_y_se_
+    persiste`: `rolling_fallback_candles` (120, config.toml) velas planas de
+    calentamiento y luego 8 velas de pump con precio y volumen crecientes.
+    Devuelve cuántas transiciones escalaron a HOT o más."""
+    for m in range(0, 120):
+        await orq.handle_ws_event(
+            WsEvent(kind="update", symbol=symbol,
+                    candles=[vela(base + m * MINUTO, close=100.0, vol=vol_base)])
+        )
+        orq.evaluate(now_ms=base + m * MINUTO + 59_000)
+
+    escaladas_a_hot_o_mas = 0
+    for i, m in enumerate(range(120, 128)):
+        await orq.handle_ws_event(
+            WsEvent(kind="update", symbol=symbol,
+                    candles=[vela(base + m * MINUTO, close=100.0 + i * 3, vol=vol_pump)])
+        )
+        transiciones = orq.evaluate(now_ms=base + m * MINUTO + 59_000)
+        escaladas_a_hot_o_mas += sum(
+            1 for t in transiciones
+            if t.escalated and t.current.rank >= State.HOT.rank
+        )
+    return escaladas_a_hot_o_mas
+
+
+async def test_arranque_en_frio_no_persiste_antes_de_validar_libro_pero_si_despues(orq):
+    """Método: un símbolo que llega a HOT (o más) mientras su perfil real
+    todavía no se ha resuelto no debe persistir ninguna fila en `signals`; en
+    cuanto se valida con un libro por encima del umbral, las escaladas
+    posteriores sí deben persistirse con normalidad."""
+    orq.ws = WsFalso()
+    orq.bootstrapper = BootstrapperLentoConfigurable(orq.cfg.profile, vol=2500.0)  # libro líquido
+    update = UniverseUpdate(
+        symbols=frozenset({"AAAUSDT"}), added=frozenset({"AAAUSDT"}),
+        removed=frozenset(), ordered=["AAAUSDT"],
+    )
+    await orq.apply_universe(update, now_ms=14 * DIA)  # bootstrap real no resuelto todavía
+    assert orq.profiles["AAAUSDT"].confidence == "low"  # placeholder
+    assert "AAAUSDT" in orq._pending_book_validation
+
+    base = 14 * DIA
+    orq.set_ticker(Ticker("AAAUSDT", 130.0, 14.0, 5e6, 100.0, 0.0001, 0))
+    escaladas_sin_validar = await _calentar_y_pumpear(
+        orq, "AAAUSDT", base, vol_base=100.0, vol_pump=1200.0
+    )
+
+    assert escaladas_sin_validar >= 1  # sí llegó a HOT o más...
+    assert orq.state.snapshot("AAAUSDT").state.rank >= State.HOT.rank  # ...visible en el dashboard...
+    assert orq.signal_repo.recent(since_ms=0) == []  # ...pero nada persistido: libro sin validar
+
+    # el bootstrap real termina ahora, con un libro claramente líquido
+    orq.bootstrapper.evento.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert orq.profiles["AAAUSDT"].confidence == "high"  # perfil real, ya no placeholder
+    assert "AAAUSDT" not in orq._pending_book_validation  # validado
+
+    # arranca en limpio para una nueva escalada inequívoca con el perfil real
+    orq._states.forget("AAAUSDT")
+    base2 = base + 200 * MINUTO
+    escaladas_validado = await _calentar_y_pumpear(
+        orq, "AAAUSDT", base2, vol_base=2500.0, vol_pump=30_000.0
+    )
+
+    assert escaladas_validado >= 1
+    assert len(orq.signal_repo.recent(since_ms=0)) == escaladas_validado  # ya validado: sí persiste
+
+
+async def test_un_simbolo_rechazado_por_libro_fino_nunca_persiste_aunque_hubiera_llegado_a_hot(orq):
+    """Método: si cuando el perfil llega resulta tener libro fino, el símbolo
+    debe quedar exactamente como si nunca hubiera llegado a HOT -ninguna fila
+    en `signals`- sin importar que su score, mientras estaba sin validar,
+    llegara a HOT o más."""
+    orq.ws = WsFalso()
+    orq.bootstrapper = BootstrapperLentoConfigurable(orq.cfg.profile, vol=50.0)  # libro fino
+    update = UniverseUpdate(
+        symbols=frozenset({"AAAUSDT"}), added=frozenset({"AAAUSDT"}),
+        removed=frozenset(), ordered=["AAAUSDT"],
+    )
+    await orq.apply_universe(update, now_ms=14 * DIA)
+    assert "AAAUSDT" in orq._pending_book_validation
+
+    base = 14 * DIA
+    orq.set_ticker(Ticker("AAAUSDT", 130.0, 14.0, 5e6, 100.0, 0.0001, 0))
+    await _calentar_y_pumpear(orq, "AAAUSDT", base, vol_base=100.0, vol_pump=1200.0)
+
+    assert orq.state.snapshot("AAAUSDT").state.rank >= State.HOT.rank  # llegó a HOT...
+    assert orq.signal_repo.recent(since_ms=0) == []  # ...pero nada persistido: aún sin validar
+
+    orq.bootstrapper.evento.set()  # el bootstrap resuelve ahora: libro fino
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert "AAAUSDT" not in orq.profiles  # expulsado del universo activo
+    assert "AAAUSDT" in orq._rejected_thin_book
+    assert orq.signal_repo.recent(since_ms=0) == []  # nunca se persistió nada
+
+
+class BootstrapperListingReciente:
+    """Simula un listing reciente: solo 1 día de histórico (`confidence`
+    queda en "low"), pero con volumen típico claramente por encima del umbral
+    de libro fino -así el perfil resultante es real (no placeholder) y pasa
+    por `_admite_libro`, aunque siga usando el fallback de mediana rolling
+    para puntuar (mismo criterio que un placeholder: `confidence != "high"`)."""
+
+    def __init__(self, cfg, vol):
+        self._cfg = cfg
+        self._vol = vol
+        self.pedidos: list[str] = []
+
+    async def bootstrap_symbol(self, symbol, now_ms):
+        self.pedidos.append(symbol)
+        velas = [vela(m * MINUTO, vol=self._vol) for m in range(1440)]
+        return build_profile(symbol, velas, self._cfg)
+
+    def expect(self, symbols):
+        pass
+
+    def progress(self):
+        return (len(self.pedidos), len(self.pedidos))
+
+    def mark_loaded(self, symbol):
+        pass
+
+
+async def test_un_simbolo_de_baja_confianza_ya_validado_si_persiste(orq):
+    """Dos matices distintos: baja confianza (listing reciente) no es lo
+    mismo que "sin validar". Un símbolo con poco histórico usa el mismo
+    fallback de mediana rolling que un placeholder, pero si su perfil real ya
+    pasó por `_admite_libro` (libro líquido), debe seguir persistiendo
+    señales con normalidad -el diseño del proyecto es marcar los listings
+    nuevos, nunca excluirlos."""
+    orq.ws = WsFalso()
+    orq.bootstrapper = BootstrapperListingReciente(orq.cfg.profile, vol=5000.0)
+    update = UniverseUpdate(
+        symbols=frozenset({"AAAUSDT"}), added=frozenset({"AAAUSDT"}),
+        removed=frozenset(), ordered=["AAAUSDT"],
+    )
+    await orq.apply_universe(update, now_ms=14 * DIA)
+    for _ in range(5):
+        await asyncio.sleep(0)  # deja correr el bootstrap de fondo
+
+    assert orq.profiles["AAAUSDT"].confidence == "low"  # listing reciente...
+    assert "AAAUSDT" not in orq._placeholder_symbols  # ...pero perfil real, no placeholder
+    assert "AAAUSDT" not in orq._pending_book_validation  # ...y ya validado contra el libro fino
+
+    base = 14 * DIA
+    orq.set_ticker(Ticker("AAAUSDT", 130.0, 14.0, 5e6, 100.0, 0.0001, 0))
+    escaladas = await _calentar_y_pumpear(orq, "AAAUSDT", base, vol_base=100.0, vol_pump=1200.0)
+
+    assert escaladas >= 1
+    assert len(orq.signal_repo.recent(since_ms=0)) == escaladas  # baja confianza sí persiste
