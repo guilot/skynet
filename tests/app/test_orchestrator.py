@@ -509,7 +509,7 @@ async def test_apply_universe_rellena_el_hueco_en_un_reinicio_en_caliente(orq):
     base = 14 * DIA
     orq.candle_repo.save_many("AAAUSDT", [vela(base)])  # última vela antes de la parada
 
-    velas_perfil = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(14) for m in range(1440)]
+    velas_perfil = [vela(d * DIA + m * MINUTO, vol=3000.0) for d in range(14) for m in range(1440)]
     perfil = build_profile("AAAUSDT", velas_perfil, orq.cfg.profile)
     orq.profile_repo.save(perfil, now_ms=base)  # perfil ya en disco: simula el reinicio en caliente
 
@@ -546,7 +546,7 @@ async def test_reconexion_tras_reinicio_en_caliente_mide_el_hueco_contra_lo_seed
     base = 14 * DIA
     orq.candle_repo.save_many("AAAUSDT", [vela(base)])  # última vela antes de la parada
 
-    velas_perfil = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(14) for m in range(1440)]
+    velas_perfil = [vela(d * DIA + m * MINUTO, vol=3000.0) for d in range(14) for m in range(1440)]
     perfil = build_profile("AAAUSDT", velas_perfil, orq.cfg.profile)
     orq.profile_repo.save(perfil, now_ms=base)
 
@@ -604,7 +604,7 @@ async def test_apply_universe_no_espera_al_relleno_de_hueco_en_caliente(orq):
     base = 14 * DIA
     orq.candle_repo.save_many("AAAUSDT", [vela(base)])
 
-    velas_perfil = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(14) for m in range(1440)]
+    velas_perfil = [vela(d * DIA + m * MINUTO, vol=3000.0) for d in range(14) for m in range(1440)]
     perfil = build_profile("AAAUSDT", velas_perfil, orq.cfg.profile)
     orq.profile_repo.save(perfil, now_ms=base)
 
@@ -668,7 +668,7 @@ async def test_relleno_de_hueco_en_fondo_fallido_no_escapa_y_se_reintenta(orq):
     base = 14 * DIA
     orq.candle_repo.save_many("AAAUSDT", [vela(base)])  # última vela antes de la parada
 
-    velas_perfil = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(14) for m in range(1440)]
+    velas_perfil = [vela(d * DIA + m * MINUTO, vol=3000.0) for d in range(14) for m in range(1440)]
     perfil = build_profile("AAAUSDT", velas_perfil, orq.cfg.profile)
     orq.profile_repo.save(perfil, now_ms=base)  # perfil ya en disco: simula el reinicio en caliente
 
@@ -835,7 +835,11 @@ class BootstrapperFallaLaPrimeraVez:
         self.intentos.append(symbol)
         if self.intentos.count(symbol) == 1:
             raise RuntimeError("Bitget no responde")
-        velas = [vela(d * DIA + m * MINUTO, vol=100.0)
+        # vol=3000.0, no 100.0: el filtro de libro fino (min_profile_median_volume,
+        # config.toml) rechazaría un perfil con mediana 100 y este test no
+        # tiene nada que ver con esa puerta -solo con el reintento tras un
+        # bootstrap fallido.
+        velas = [vela(d * DIA + m * MINUTO, vol=3000.0)
                  for d in range(14) for m in range(1440)]
         return build_profile(symbol, velas, self._cfg)
 
@@ -931,7 +935,7 @@ async def test_apply_universe_en_caliente_usa_el_perfil_de_disco_sin_placeholder
     orq.ws = WsFalso()
     orq.bootstrapper = BootstrapperExplota(orq.cfg.profile)
 
-    velas = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(14) for m in range(1440)]
+    velas = [vela(d * DIA + m * MINUTO, vol=3000.0) for d in range(14) for m in range(1440)]
     perfil_real = build_profile("AAAUSDT", velas, orq.cfg.profile)
     orq.profile_repo.save(perfil_real, now_ms=14 * DIA)
 
@@ -1153,12 +1157,18 @@ async def test_run_maintenance_recalcula_el_perfil_de_volumen(orq):
     assert perfil_inicial.slots[0].median == pytest.approx(100.0)
 
     ahora = base + DIA
-    velas_nuevo_dia = [vela(base + m * MINUTO, vol=500.0) for m in range(1440)]
+    # vol=3000.0, no 500.0: por debajo de min_profile_median_volume
+    # (config.toml) el propio recálculo diario expulsaría a AAAUSDT del
+    # universo activo (ver test_run_maintenance_excluye_un_simbolo_activo_
+    # cuyo_perfil_se_ha_vuelto_fino) y `orq.profiles["AAAUSDT"]` no
+    # existiría más abajo; este test solo quiere comprobar que el
+    # recálculo diario sustituye el perfil, no ejercitar esa puerta.
+    velas_nuevo_dia = [vela(base + m * MINUTO, vol=3000.0) for m in range(1440)]
     orq.candle_repo.save_many("AAAUSDT", velas_nuevo_dia)
 
     await orq.run_maintenance(ahora)
 
-    assert orq.profiles["AAAUSDT"].slots[0].median == pytest.approx(500.0)
+    assert orq.profiles["AAAUSDT"].slots[0].median == pytest.approx(3000.0)
     assert orq.profiles["AAAUSDT"] is not perfil_inicial
     fila = orq.profile_repo._conn.execute(
         "SELECT updated_ms FROM profile_meta WHERE symbol = ?", ("AAAUSDT",)
@@ -1235,3 +1245,183 @@ async def test_run_maintenance_no_bloquea_el_event_loop(orq, monkeypatch):
     # correr ni una vez. Con el fix (asyncio.to_thread por símbolo), debe
     # intercalarse varias veces.
     assert vueltas > 0
+
+
+# --- filtro de universo en dos etapas: prefiltro barato (volumen 24h) +
+# puerta real (volumen típico del perfil, `VolumeProfile.typical_volume`) ---
+#
+# Medido contra el mercado real: HUSDT reporta $10M de volumen 24h pero una
+# mediana de minuto de $57; VELVETUSDT reporta $15M con una mediana de $767.
+# El volumen 24h no distingue "libro sostenible" de "dos ráfagas y
+# silencio", así que la puerta real es `min_profile_median_volume`
+# (config.toml), aplicada una vez existe el perfil -ver
+# `Orchestrator._admite_libro`.
+
+class BootstrapperLibroFino:
+    """Bootstrapper cuyo perfil resultante depende de un volumen por
+    minuto configurable por símbolo (`vol_por_simbolo`, mutable: el test de
+    reingreso lo cambia entre llamadas para simular que un libro mejora),
+    para ejercitar el filtro de libro fino sin tocar la red."""
+
+    def __init__(self, cfg, vol_por_simbolo):
+        self._cfg = cfg
+        self._vol = vol_por_simbolo
+        self.pedidos: list[str] = []
+
+    async def bootstrap_symbol(self, symbol, now_ms):
+        self.pedidos.append(symbol)
+        vol = self._vol[symbol]
+        velas = [vela(d * DIA + m * MINUTO, vol=vol)
+                 for d in range(14) for m in range(1440)]
+        return build_profile(symbol, velas, self._cfg)
+
+    def expect(self, symbols):
+        pass
+
+    def progress(self):
+        return (len(self.pedidos), len(self.pedidos))
+
+    def mark_loaded(self, symbol):
+        pass
+
+
+async def test_un_simbolo_con_libro_fino_sale_del_universo_activo_y_uno_liquido_se_queda(orq):
+    """Regresión del filtro de libro fino (Método, caso 1): un símbolo cuyo
+    perfil.typical_volume() está por debajo de min_profile_median_volume
+    debe salir del universo activo -desuscrito del WS, sin buffer, sin
+    perfil, y sin aparecer en ranked() tras evaluar-; uno por encima del
+    umbral debe seguir puntuando con normalidad."""
+    orq.ws = WsFalso()
+    # FINOUSDT: $50/min, muy por debajo del umbral de config.toml (2_000.0).
+    # LIQUIDOUSDT: $5_000/min, claramente por encima.
+    orq.bootstrapper = BootstrapperLibroFino(
+        orq.cfg.profile, {"FINOUSDT": 50.0, "LIQUIDOUSDT": 5000.0}
+    )
+    update = UniverseUpdate(
+        symbols=frozenset({"FINOUSDT", "LIQUIDOUSDT"}),
+        added=frozenset({"FINOUSDT", "LIQUIDOUSDT"}),
+        removed=frozenset(), ordered=["LIQUIDOUSDT", "FINOUSDT"],
+    )
+    await orq.apply_universe(update, now_ms=14 * DIA)
+    for _ in range(5):
+        await asyncio.sleep(0)  # deja correr los bootstraps de fondo
+
+    # el símbolo de libro fino sale del universo activo...
+    assert "FINOUSDT" not in orq.profiles
+    assert "FINOUSDT" not in orq.buffers
+    assert orq.ws.unsubscribed == [["FINOUSDT"]]
+    assert "FINOUSDT" in orq._rejected_thin_book
+
+    # ...mientras que el líquido se queda con su perfil real, suscrito
+    assert orq.profiles["LIQUIDOUSDT"].confidence == "high"
+    assert "LIQUIDOUSDT" in orq.buffers
+    assert all("LIQUIDOUSDT" not in llamada for llamada in orq.ws.unsubscribed)
+
+    # tras evaluar, solo el líquido aparece puntuado
+    orq.set_ticker(Ticker("LIQUIDOUSDT", 100.0, 1.0, 5e6, 100.0, 0.0001, 0))
+    await orq.handle_ws_event(
+        WsEvent(kind="update", symbol="LIQUIDOUSDT",
+                candles=[vela(14 * DIA, vol=5000.0)])
+    )
+    orq.evaluate(now_ms=14 * DIA + 30_000)
+    simbolos_en_ranking = {s.symbol for s in orq.state.ranked()}
+    assert simbolos_en_ranking == {"LIQUIDOUSDT"}
+
+
+async def test_un_simbolo_rechazado_por_libro_fino_no_se_reintenta_en_cada_refresco_de_universo(orq):
+    """Regresión del filtro de libro fino (Método, caso 2): el selector
+    sigue trayendo al símbolo rechazado en `ordered` cada refresco (15 min,
+    solo aplica el prefiltro barato de volumen 24h) -- sin memoria,
+    apply_universe descargaría 14 días de histórico del mismo símbolo
+    muerto en cada uno de esos refrescos."""
+    orq.ws = WsFalso()
+    orq.bootstrapper = BootstrapperLibroFino(orq.cfg.profile, {"FINOUSDT": 50.0})
+    update = UniverseUpdate(
+        symbols=frozenset({"FINOUSDT"}), added=frozenset({"FINOUSDT"}),
+        removed=frozenset(), ordered=["FINOUSDT"],
+    )
+    await orq.apply_universe(update, now_ms=14 * DIA)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert orq.bootstrapper.pedidos == ["FINOUSDT"]
+    assert "FINOUSDT" in orq._rejected_thin_book
+
+    # segundo refresco de universo, 15 min después: el selector no sabe
+    # nada del rechazo (solo aplicó su propio prefiltro), así que lo trae
+    # otra vez en `ordered`.
+    update2 = UniverseUpdate(
+        symbols=frozenset({"FINOUSDT"}), added=frozenset(),
+        removed=frozenset(), ordered=["FINOUSDT"],
+    )
+    await orq.apply_universe(update2, now_ms=14 * DIA + 15 * MINUTO)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert orq.bootstrapper.pedidos == ["FINOUSDT"]  # no se repitió el bootstrap
+
+
+async def test_un_simbolo_rechazado_vuelve_si_el_mantenimiento_diario_ve_que_su_libro_mejoro(orq):
+    """Regresión del filtro de libro fino (Método, caso 3): el rechazo no es
+    permanente. El mantenimiento diario es el único punto que pide
+    historial fresco por REST para un símbolo rechazado
+    (`Orchestrator._reevaluar_rechazados`) -- si su volumen típico ya
+    supera el umbral, vuelve al universo activo: perfil real, buffer
+    sembrado, y de nuevo suscrito al WS."""
+    orq.ws = WsFalso()
+    vol_por_simbolo = {"FINOUSDT": 50.0}
+    orq.bootstrapper = BootstrapperLibroFino(orq.cfg.profile, vol_por_simbolo)
+    update = UniverseUpdate(
+        symbols=frozenset({"FINOUSDT"}), added=frozenset({"FINOUSDT"}),
+        removed=frozenset(), ordered=["FINOUSDT"],
+    )
+    await orq.apply_universe(update, now_ms=14 * DIA)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert "FINOUSDT" in orq._rejected_thin_book
+    assert "FINOUSDT" not in orq.profiles
+
+    # el libro mejora antes del siguiente mantenimiento diario
+    vol_por_simbolo["FINOUSDT"] = 5000.0
+
+    await orq.run_maintenance(14 * DIA + DIA)
+
+    assert "FINOUSDT" not in orq._rejected_thin_book
+    assert orq.profiles["FINOUSDT"].confidence == "high"
+    assert "FINOUSDT" in orq.buffers
+    assert orq.ws.subscribed[-1] == ["FINOUSDT"]  # re-suscrito
+    assert orq.bootstrapper.pedidos.count("FINOUSDT") == 2  # rechazo inicial + reevaluación
+
+
+async def test_run_maintenance_excluye_un_simbolo_activo_cuyo_perfil_se_ha_vuelto_fino(orq):
+    """El filtro de libro fino es una propiedad del libro, no un evento de
+    una sola vez en el bootstrap: el mismo punto de reevaluación diaria que
+    revive a un símbolo rechazado también debe expulsar a uno activo cuyo
+    perfil recalculado se ha secado."""
+    orq.ws = WsFalso()
+    orq.bootstrapper = BootstrapperLibroFino(orq.cfg.profile, {"AAAUSDT": 10.0})
+    base = 14 * DIA
+    velas_liquidas = [vela(d * DIA + m * MINUTO, vol=5000.0)
+                       for d in range(14) for m in range(1440)]
+    perfil_liquido = build_profile("AAAUSDT", velas_liquidas, orq.cfg.profile)
+    orq.profile_repo.save(perfil_liquido, now_ms=base)
+
+    update = UniverseUpdate(
+        symbols=frozenset({"AAAUSDT"}), added=frozenset({"AAAUSDT"}),
+        removed=frozenset(), ordered=["AAAUSDT"],
+    )
+    await orq.apply_universe(update, now_ms=base)
+    assert orq.profiles["AAAUSDT"].confidence == "high"
+
+    # el libro se seca: al día siguiente, las únicas velas nuevas en
+    # candle_repo (lo único que el recálculo diario relee) son de volumen
+    # muy bajo.
+    ahora = base + DIA
+    velas_finas = [vela(base + m * MINUTO, vol=10.0) for m in range(1440)]
+    orq.candle_repo.save_many("AAAUSDT", velas_finas)
+
+    await orq.run_maintenance(ahora)
+
+    assert "AAAUSDT" not in orq.profiles
+    assert "AAAUSDT" not in orq.buffers
+    assert "AAAUSDT" in orq._rejected_thin_book
+    assert orq.ws.unsubscribed == [["AAAUSDT"]]

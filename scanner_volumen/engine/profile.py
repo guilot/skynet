@@ -17,6 +17,15 @@ from scanner_volumen.models import Candle
 MINUTO_MS = 60_000
 MINUTOS_POR_DIA = 1440
 
+# Umbral interno (no de negocio, por eso no vive en config.toml) de cuántos
+# slots del día deben tener datos para que la mediana de sus medianas sea
+# representativa del perfil entero: por debajo de esto la mediana quedaría
+# sesgada hacia las horas que sí tuvieron muestra, igual que `_percentil`
+# exige al menos un valor. Es la misma clase de garantía estadística que
+# `confidence`, pero sobre cobertura de slots dentro del día en vez de días
+# de histórico cubiertos.
+MIN_SLOTS_POBLADOS_PARA_TIPICO = MINUTOS_POR_DIA // 2
+
 
 def minute_of_day(ts_ms: int) -> int:
     return (ts_ms // MINUTO_MS) % MINUTOS_POR_DIA
@@ -70,6 +79,31 @@ class VolumeProfile:
         if vistos == 0 or total <= 0:
             return None
         return total
+
+    def typical_volume(self) -> float | None:
+        """Volumen típico por minuto de todo el perfil: la mediana de las
+        medianas de los slots poblados.
+
+        Es el número que decide si un libro tiene actividad suficiente para
+        que su mediana sea una referencia de fiar (ver
+        `UniverseConfig.min_profile_median_volume` y
+        `Orchestrator._admite_libro`): a diferencia de `baseline()`, que
+        resuelve un minuto concreto, este resume el perfil entero en un
+        único escalar -el mismo número que ya usa el RVOL como denominador,
+        solo que agregado para todo el día-. Medido en real: HUSDT reporta
+        $10M de volumen 24h pero una mediana de minuto de $57; este método
+        es el que expone ese $57, no el $10M.
+
+        Devuelve None si menos de la mitad de los 1440 slots tienen datos
+        (`MIN_SLOTS_POBLADOS_PARA_TIPICO`): con menos que eso la mediana
+        quedaría sesgada hacia las horas que sí tuvieron muestra, en vez de
+        representar el día completo. Es pura y no toca el reloj ni hace I/O:
+        opera solo sobre `self.slots`, ya calculados por `build_profile`.
+        """
+        medianas = [slot.median for slot in self.slots if slot is not None]
+        if len(medianas) < MIN_SLOTS_POBLADOS_PARA_TIPICO:
+            return None
+        return statistics.median(medianas)
 
 
 def _percentil(datos_ordenados: list[float], q: float) -> float:

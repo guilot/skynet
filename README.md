@@ -24,7 +24,8 @@ Todos los umbrales están en `config.toml`. Los más relevantes:
 
 | Parámetro | Efecto |
 |---|---|
-| `universe.min_volume_24h` | Volumen 24h mínimo para entrar en el universo |
+| `universe.min_volume_24h` | Prefiltro barato: volumen 24h mínimo para descargar el histórico de un símbolo |
+| `universe.min_profile_median_volume` | Puerta real: volumen típico de minuto (perfil) mínimo para quedarse en el universo activo |
 | `universe.max_symbols` | Tope de símbolos vigilados a la vez |
 | `states.signal` | Score a partir del cual se genera alerta |
 | `score.curves.*` | Cómo se traduce cada métrica a puntos |

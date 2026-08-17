@@ -55,7 +55,12 @@ class BootstrapperFalso:
         self._cfg = cfg
 
     async def bootstrap_symbol(self, symbol, now_ms):
-        velas = [vela(d * DIA + m * MINUTO) for d in range(14) for m in range(1440)]
+        # vol=3000.0 (por defecto de `vela`, 100.0): por debajo de
+        # min_profile_median_volume (config.toml) el filtro de libro fino
+        # excluiría el símbolo justo después de que apply_universe lo
+        # resolviera, y test_paso_tickers_refresca_el_universo_cuando_toca
+        # comprueba que sigue en orq.profiles -- no ejercita esa puerta.
+        velas = [vela(d * DIA + m * MINUTO, vol=3000.0) for d in range(14) for m in range(1440)]
         return build_profile(symbol, velas, self._cfg)
 
     def expect(self, symbols):

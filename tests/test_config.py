@@ -12,7 +12,8 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.toml"
 def test_carga_valores_del_toml():
     cfg = load_config(CONFIG_PATH)
     assert cfg.market.venue == "USDT-FUTURES"
-    assert cfg.universe.min_volume_24h == 1_000_000
+    assert cfg.universe.min_volume_24h == 5_000_000
+    assert cfg.universe.min_profile_median_volume == 2_000.0
     assert cfg.universe.max_symbols == 150
     assert cfg.engine.tick_seconds == 1.0
     assert cfg.states.signal == 80

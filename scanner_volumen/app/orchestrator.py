@@ -77,6 +77,17 @@ class Orchestrator:
         # guard de dedup de `apply_universe` lo confundiría con un símbolo ya
         # resuelto).
         self._placeholder_symbols: set[str] = set()
+        # símbolos excluidos del universo activo por libro fino: su
+        # volumen típico de perfil (`VolumeProfile.typical_volume()`) está
+        # por debajo de `cfg.universe.min_profile_median_volume` (ver
+        # `_admite_libro`). El selector sigue trayéndolos en `ordered`
+        # cada refresco de universo -no sabe nada de este rechazo, solo
+        # aplica el prefiltro barato de volumen 24h-, así que sin esta
+        # memoria `apply_universe` volvería a intentar resolver su perfil
+        # (y, si no había disco, a rebootstrapear 14 días por REST) en
+        # cada uno de esos refrescos. La única puerta de reingreso es
+        # `_reevaluar_rechazados`, desde el mantenimiento diario.
+        self._rejected_thin_book: set[str] = set()
 
         self._metrics = MetricsBuilder(cfg.engine, cfg.profile)
         self._states = StateMachine(cfg.states)
@@ -195,6 +206,97 @@ class Orchestrator:
             return wall_clock_ms
         return self._clock_ms
 
+    async def _admite_libro(self, symbol: str, perfil: VolumeProfile) -> bool:
+        """Puerta real del filtro de universo (dos etapas, ver
+        `UniverseConfig`): decide si un perfil recién resuelto tiene
+        actividad suficiente para que el símbolo se quede en el universo
+        activo.
+
+        Se llama justo después de resolver un perfil REAL (nunca sobre un
+        placeholder, que siempre tiene `typical_volume() is None` por no
+        tener slots) en los tres únicos puntos que producen uno:
+        `apply_universe` (camino cálido, disco), `_bootstrap_en_fondo`
+        (camino frío, REST) y el recálculo diario de `run_maintenance`. Si
+        el libro es demasiado fino, deja al símbolo tan limpio como
+        `apply_universe` deja a uno que el propio selector quitó del
+        universo -desuscrito, sin buffer, sin perfil, sin estado- y lo
+        recuerda en `_rejected_thin_book` para no reintentarlo en cada
+        refresco (ver el comentario de ese atributo). Devuelve True si el
+        símbolo puede seguir su camino normal (el llamador es quien asigna
+        `self.profiles[symbol]`); False si ya se ha limpiado y el llamador
+        debe saltárselo.
+
+        `None` (perfil sin slots suficientes para ser representativo, C.f.
+        `VolumeProfile.typical_volume`) NO se trata como fino: un símbolo
+        recién bootstrapeado con muy poco histórico real todavía no tiene
+        forma de demostrar que es líquido, y negarle la entrada por falta
+        de datos sería indistinguible de penalizar el arranque en frío que
+        el propio placeholder existe para no penalizar.
+        """
+        tipico = perfil.typical_volume()
+        if tipico is None or tipico >= self.cfg.universe.min_profile_median_volume:
+            return True
+
+        log.warning(
+            "%s excluido del universo activo: volumen típico del perfil "
+            "%.2f USDT/min por debajo del mínimo %.2f",
+            symbol, tipico, self.cfg.universe.min_profile_median_volume,
+        )
+        self._rejected_thin_book.add(symbol)
+        self.buffers.pop(symbol, None)
+        self.profiles.pop(symbol, None)
+        self.tickers.pop(symbol, None)
+        self._placeholder_symbols.discard(symbol)
+        self._reconnect_gap_from.pop(symbol, None)
+        self.state.drop(symbol)
+        self._metrics.forget(symbol)
+        self._states.forget(symbol)
+        if self.ws is not None:
+            await self.ws.unsubscribe([symbol])
+        return False
+
+    async def _reevaluar_rechazados(self, now_ms: int) -> None:
+        """Única puerta de reingreso para un símbolo rechazado por libro
+        fino (I: "la puerta no puede ser permanente").
+
+        Se llama desde `run_maintenance` (cadencia diaria,
+        `cfg.maintenance.interval_hours`): al estar desuscrito del WS desde
+        el rechazo, un símbolo en `_rejected_thin_book` no recibe ninguna
+        vela nueva, así que su registro en `candle_repo` solo encoge con
+        cada poda diaria (I2) y nunca podría reflejar una mejora real de
+        su libro -por eso este reingreso NO reutiliza
+        `_recalcular_perfil_de_mantenimiento` (que lee de `candle_repo`)
+        como hace el resto de `run_maintenance` con los símbolos activos,
+        sino que pide historial fresco de verdad vía
+        `self.bootstrapper.bootstrap_symbol`, igual que un símbolo
+        genuinamente nuevo. Se hace una vez al día, no en cada refresco de
+        universo (15 min): un libro que sigue muerto no cambia en 15
+        minutos, y comprobar cada símbolo rechazado a esa cadencia con
+        ~cientos de páginas REST cada uno saturaría la tasa de peticiones
+        para nada.
+        """
+        for symbol in list(self._rejected_thin_book):
+            try:
+                perfil = await self.bootstrapper.bootstrap_symbol(symbol, now_ms)
+            except Exception as exc:  # noqa: BLE001 - un reintento fallido no debe tumbar el mantenimiento
+                log.warning("reevaluación de rechazo fallida para %s: %s", symbol, exc)
+                continue
+
+            tipico = perfil.typical_volume()
+            if tipico is None or tipico < self.cfg.universe.min_profile_median_volume:
+                continue  # sigue fino (o sin datos suficientes): se queda fuera
+
+            self._rejected_thin_book.discard(symbol)
+            self.profiles[symbol] = perfil
+            await self.seed_buffer(symbol, now_ms)
+            self.dirty.add(symbol)
+            if self.ws is not None:
+                await self.ws.subscribe([symbol])
+            log.info(
+                "%s vuelve al universo activo: volumen típico del perfil %.2f USDT/min",
+                symbol, tipico,
+            )
+
     async def ensure_profile(self, symbol: str, now_ms: int) -> VolumeProfile:
         if symbol in self.profiles:
             return self.profiles[symbol]
@@ -285,6 +387,14 @@ class Orchestrator:
         """
         try:
             await self._rellenar_hueco_de_reinicio(symbol, now_ms)
+            if symbol in self._rejected_thin_book:
+                # el símbolo fue excluido por libro fino (`_admite_libro`)
+                # mientras este relleno corría en segundo plano -lanzado
+                # por `_resolver_perfil` antes de que `apply_universe`
+                # tuviera ocasión de rechazarlo (Finding libro fino, C1):
+                # sembrar el buffer aquí resucitaría un símbolo que ya se
+                # dejó sin buffer a propósito.
+                return
             await self.seed_buffer(symbol, now_ms)
             self.dirty.add(symbol)
         except Exception as exc:  # noqa: BLE001 - un relleno de fondo fallido no debe tumbar el bucle
@@ -639,6 +749,13 @@ class Orchestrator:
             # sea "nuevo" en todos los sentidos, igual que ya lo es sin
             # buffer, sin perfil y sin historial de RVOL.
             self._states.forget(simbolo)
+            # un símbolo que el propio selector saca del universo (volumen
+            # 24h por debajo del prefiltro, tras agotar la gracia) ya no
+            # tiene sentido seguir recordándolo como "rechazado por libro
+            # fino": ni siquiera va a volver a aparecer en `ordered`, así
+            # que dejarlo en `_rejected_thin_book` sería una fuga lenta
+            # (mismo espíritu que el resto de la limpieza de este bucle).
+            self._rejected_thin_book.discard(simbolo)
             tarea = self._bootstrap_tasks.pop(simbolo, None)
             if tarea is not None:
                 tarea.cancel()
@@ -653,6 +770,11 @@ class Orchestrator:
                 await self.ws.unsubscribe(sorted(update.removed))
 
         for simbolo in update.ordered:
+            if simbolo in self._rejected_thin_book:
+                # libro fino ya conocido (ver `_admite_libro`): no se
+                # reintenta en cada refresco de universo, solo en el
+                # mantenimiento diario (`_reevaluar_rechazados`).
+                continue
             if simbolo in self._bootstrap_tasks:
                 continue  # ya hay un bootstrap en vuelo para este símbolo
             # Nota: este guard NO mira `_gap_fill_tasks` -a propósito, pero es
@@ -680,6 +802,8 @@ class Orchestrator:
                 simbolo, now_ms, hueco_en_fondo=True
             )
             if perfil_de_disco is not None:
+                if not await self._admite_libro(simbolo, perfil_de_disco):
+                    continue  # libro fino: _admite_libro ya limpió el símbolo
                 self.profiles[simbolo] = perfil_de_disco
                 self._placeholder_symbols.discard(simbolo)
                 await self.seed_buffer(simbolo, now_ms)
@@ -701,6 +825,8 @@ class Orchestrator:
         """
         try:
             perfil = await self._load_or_bootstrap(symbol, now_ms)
+            if not await self._admite_libro(symbol, perfil):
+                return  # libro fino: _admite_libro ya limpió el símbolo
             self.profiles[symbol] = perfil
             self._placeholder_symbols.discard(symbol)
             await self.seed_buffer(symbol, now_ms)
@@ -718,8 +844,14 @@ class Orchestrator:
 
     async def run_maintenance(self, now_ms: int) -> None:
         """Tarea de mantenimiento diaria: poda velas fuera de la ventana
-        retenida (I2) y recalcula el perfil de volumen de cada símbolo con
-        perfil real (I4).
+        retenida (I2), recalcula el perfil de volumen de cada símbolo con
+        perfil real (I4), y es también el único punto de re-evaluación del
+        filtro de libro fino: expulsa del universo activo a un símbolo cuyo
+        perfil recalculado ha caído por debajo de
+        `cfg.universe.min_profile_median_volume`, y le da a un símbolo ya
+        expulsado la oportunidad de volver (`_reevaluar_rechazados`, ver su
+        docstring sobre por qué la cadencia diaria y no la de 15 min del
+        refresco de universo).
 
         Sin poda, `candles_1m` crece sin límite (~216k filas/día a 150
         símbolos, spec §9) y `latest_ts`/`load` se degradan con la tabla.
@@ -761,8 +893,16 @@ class Orchestrator:
             )
             if perfil is None:
                 continue
+            # el filtro de libro fino es una propiedad del libro, no un
+            # evento de una sola vez en el bootstrap: un símbolo activo
+            # cuyo perfil se ha ido secando debe salir aquí igual que uno
+            # nuevo lo hace en apply_universe (ver `_admite_libro`).
+            if not await self._admite_libro(simbolo, perfil):
+                continue
             self.profiles[simbolo] = perfil
             self.dirty.add(simbolo)
+
+        await self._reevaluar_rechazados(now_ms)
 
     def _recalcular_perfil_de_mantenimiento(
         self, symbol: str, desde: int, now_ms: int

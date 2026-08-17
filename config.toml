@@ -2,7 +2,19 @@
 venue = "USDT-FUTURES"
 
 [universe]
-min_volume_24h = 1_000_000
+# Prefiltro barato: solo acota cuántos símbolos llegan a pedir 14 días de
+# histórico por REST. No decide qué se queda en el universo activo -eso lo
+# hace min_profile_median_volume, una vez existe el perfil (ver
+# UniverseConfig y Orchestrator._admite_libro): medido en real, el volumen
+# 24h no distingue un libro sostenible de dos ráfagas y silencio.
+min_volume_24h = 5_000_000
+# Puerta real: volumen típico de minuto (mediana de las medianas del
+# perfil, VolumeProfile.typical_volume()) por debajo del cual un símbolo
+# sale del universo activo aunque su volumen 24h sea alto. Medido en real:
+# a $2_000/min el universo se reduce a 19 símbolos, el peor con $2_092/min;
+# ningún umbral de volumen 24h logra ese mismo filtrado (incluso a $50M
+# sigue colando un símbolo con mediana de minuto $0).
+min_profile_median_volume = 2_000.0
 max_symbols = 150
 exclude_rwa = true
 refresh_minutes = 15

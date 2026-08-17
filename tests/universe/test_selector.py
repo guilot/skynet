@@ -13,6 +13,7 @@ MINUTO = 60_000
 def cfg(**kwargs):
     base = dict(
         min_volume_24h=1_000_000,
+        min_profile_median_volume=2_000.0,  # UniverseSelector no lo usa; solo lo exige el dataclass
         max_symbols=150,
         exclude_rwa=True,
         refresh_minutes=15,

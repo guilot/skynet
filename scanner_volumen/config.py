@@ -15,7 +15,17 @@ class MarketConfig:
 
 @dataclass(frozen=True)
 class UniverseConfig:
+    """Filtro de universo en dos etapas (ver `Orchestrator._admite_libro`):
+    `min_volume_24h` es el prefiltro barato que acota cuántos símbolos
+    llegan a pedir 14 días de histórico; `min_profile_median_volume` es la
+    puerta real -el volumen 24h no distingue "libro sostenible" de "dos
+    ráfagas y silencio" (medido: HUSDT reporta $10M de 24h con una mediana
+    de minuto de $57), así que una vez existe el perfil de un símbolo, es
+    su `typical_volume()` -no su volumen 24h- quien decide si se queda en
+    el universo activo."""
+
     min_volume_24h: float
+    min_profile_median_volume: float
     max_symbols: int
     exclude_rwa: bool
     refresh_minutes: int

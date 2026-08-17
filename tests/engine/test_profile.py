@@ -1,3 +1,5 @@
+import pytest
+
 from scanner_volumen.config import ProfileConfig
 from scanner_volumen.engine.profile import (
     build_profile, minute_of_day, rolling_baseline,
@@ -150,3 +152,52 @@ def test_rolling_baseline_n_cero_devuelve_none():
 def test_rolling_baseline_n_negativo_devuelve_none():
     velas = [vela(m * MINUTO, float(m)) for m in range(1, 11)]
     assert rolling_baseline(velas, -3) is None
+
+
+# --- typical_volume: el número que decide el filtro de libro fino ---
+
+def test_typical_volume_de_un_perfil_uniforme_es_ese_valor():
+    velas = dias_sinteticos(14, lambda d, m: 250.0)
+    perfil = build_profile("AAAUSDT", velas, cfg(smoothing_window_minutes=0))
+    assert perfil.typical_volume() == pytest.approx(250.0)
+
+
+def test_typical_volume_resiste_un_grupo_minoritario_de_slots_atipicos():
+    """Igual que la mediana por slot resiste una vela extrema
+    (test_la_mediana_resiste_un_valor_extremo), la mediana agregada de
+    typical_volume no debe dejarse arrastrar por una minoria de slots con
+    un patron distinto (p. ej. una hora de actividad puntual)."""
+    def volumen(d, m):
+        return 50_000.0 if m < 60 else 200.0  # 60 de 1440 slots, minoria clara
+
+    velas = dias_sinteticos(14, volumen)
+    perfil = build_profile("AAAUSDT", velas, cfg(smoothing_window_minutes=0))
+    assert perfil.typical_volume() == pytest.approx(200.0)
+
+
+def test_typical_volume_none_si_hay_pocos_slots_poblados():
+    # una sola vela: un único slot poblado, muy por debajo de la mitad del
+    # día que exige MIN_SLOTS_POBLADOS_PARA_TIPICO.
+    velas = [vela(100 * MINUTO, 50.0)]
+    perfil = build_profile("AAAUSDT", velas, cfg(smoothing_window_minutes=0))
+    assert perfil.typical_volume() is None
+
+
+def test_typical_volume_none_justo_por_debajo_de_medio_dia_de_slots():
+    # 600 minutos consecutivos poblados: menos que MIN_SLOTS_POBLADOS_PARA_TIPICO
+    # (720, la mitad de 1440), así que sigue sin ser representativo del día.
+    velas = [vela(m * MINUTO, 500.0) for m in range(600)]
+    perfil = build_profile("AAAUSDT", velas, cfg(smoothing_window_minutes=0))
+    assert perfil.typical_volume() is None
+
+
+def test_typical_volume_no_toca_el_reloj_ni_hace_io():
+    """Pin de diseño (engine/ debe seguir siendo puro): typical_volume solo
+    lee self.slots, ya calculados por build_profile -- no acepta ningún
+    argumento de "ahora" ni de origen de datos."""
+    import inspect
+
+    from scanner_volumen.engine.profile import VolumeProfile
+
+    firma = inspect.signature(VolumeProfile.typical_volume)
+    assert list(firma.parameters) == ["self"]
