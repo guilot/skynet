@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 
 from scanner_volumen.app.bootstrap import plan_history_requests
 from scanner_volumen.app.state import ScannerState, SymbolSnapshot
@@ -19,7 +18,7 @@ from scanner_volumen.bitget.ws import WsEvent
 from scanner_volumen.config import Config
 from scanner_volumen.engine.candles import CandleBuffer
 from scanner_volumen.engine.metrics import MetricsBuilder
-from scanner_volumen.engine.profile import VolumeProfile, placeholder_profile
+from scanner_volumen.engine.profile import VolumeProfile, build_profile, placeholder_profile
 from scanner_volumen.models import State, Ticker
 from scanner_volumen.scoring.score import score_symbol
 from scanner_volumen.scoring.states import StateMachine, Transition
@@ -82,11 +81,44 @@ class Orchestrator:
 
         self._metrics = MetricsBuilder(cfg.engine, cfg.profile)
         self._states = StateMachine(cfg.states)
+        # ratchet del reloj del exchange (I6): último ts de ticker visto,
+        # nunca retrocede. Ver `now_ms`.
+        self._clock_ms: int | None = None
 
     # --- entrada de datos ---
 
     def set_ticker(self, ticker: Ticker) -> None:
         self.tickers[ticker.symbol] = ticker
+
+    def now_ms(self, wall_clock_ms: int) -> int:
+        """Fuente de "ahora" para todo el bucle principal (I6), salvo el
+        propio arranque: el reloj del exchange, nunca el de pared.
+
+        `models.Ticker.ts` es el timestamp que Bitget estampa en cada
+        respuesta de `/tickers`; `poll_tickers` lo refresca cada
+        `engine.ticker_poll_seconds`. Se toma el máximo entre todos los
+        símbolos conocidos -un solo ticker desfasado no debe tirar del
+        resto- y el resultado nunca retrocede (ratchet): `evaluate`,
+        `refill_gap`, el mantenimiento diario y el resto del motor asumen
+        `now_ms` monótono creciente (límite del día en curso, historial de
+        RVOL, cooldown de la máquina de estados, cómputo de huecos), así
+        que ni una corrección de reloj en el exchange ni un ticker puntual
+        desfasado pueden mover el tiempo hacia atrás.
+
+        `wall_clock_ms` solo se usa como respaldo mientras no ha llegado
+        ningún ticker todavía (arranque en frío, antes de la primera
+        respuesta de `/tickers`): es el único momento en que el reloj de
+        pared sigue siendo legítimo aquí, spec §13 ("nunca la hora local").
+        En cuanto hay al menos un ticker, `wall_clock_ms` se ignora por
+        completo, incluso si diverge mucho del reloj del exchange -ese es
+        justo el escenario de deriva que la spec identifica como riesgo.
+        """
+        candidato = max((t.ts for t in self.tickers.values()), default=None)
+        if candidato is not None and (self._clock_ms is None or candidato > self._clock_ms):
+            self._clock_ms = candidato
+        if self._clock_ms is None:
+            return wall_clock_ms
+        return self._clock_ms
 
     async def ensure_profile(self, symbol: str, now_ms: int) -> VolumeProfile:
         if symbol in self.profiles:
@@ -576,34 +608,41 @@ class Orchestrator:
         finally:
             self._bootstrap_tasks.pop(symbol, None)
 
-    async def run(self) -> None:
-        """Bucle principal del escáner en vivo.
+    # --- mantenimiento diario ---
 
-        Arranca el WebSocket en segundo plano y luego, a tick fijo, consume
-        reconexiones pendientes (relleno de huecos), refresca tickers por REST
-        cada `ticker_poll_seconds` y evalúa los símbolos sucios cada
-        `tick_seconds`. `time.time()` solo se lee aquí, en el borde exterior:
-        el resto del sistema (`evaluate`, `poll_tickers`, `refill_gap`) recibe
-        siempre `now_ms` como parámetro, nunca lee el reloj por su cuenta.
+    async def run_maintenance(self, now_ms: int) -> None:
+        """Tarea de mantenimiento diaria: poda velas fuera de la ventana
+        retenida (I2) y recalcula el perfil de volumen de cada símbolo con
+        perfil real (I4).
+
+        Sin poda, `candles_1m` crece sin límite (~216k filas/día a 150
+        símbolos, spec §9) y `latest_ts`/`load` se degradan con la tabla.
+        Sin recálculo diario, el perfil de un proceso de larga vida queda
+        anclado para siempre al que se descargó en su primer arranque
+        (spec §4.3/§6.1: `profile_builder | arranque + diario`), comparando
+        el volumen de hoy contra un baseline cada vez más viejo.
+
+        La ventana de poda y la de recálculo comparten el mismo límite
+        (`now_ms - history_days` días): podar primero y recalcular después
+        con esa misma frontera es consistente, no hace falta ningún ajuste
+        adicional entre ambos pasos.
+
+        Los símbolos aún en `_placeholder_symbols` (bootstrap real en
+        vuelo, ver `apply_universe`) se saltan: recalcular aquí con lo poco
+        que hubiera en SQLite pisaría el resultado del bootstrap de fondo
+        si terminara justo después, y ese símbolo ya se recalculará solo en
+        el próximo ciclo de mantenimiento una vez tenga perfil real.
         """
-        if self.ws is not None:
-            asyncio.create_task(self.ws.run(self.handle_ws_event))
-        self.state.connected = True
+        desde = now_ms - self.cfg.profile.history_days * DIA_MS
+        self.candle_repo.prune(desde)
 
-        tick_ms = int(self.cfg.engine.tick_seconds * 1000)
-        poll_ms = int(self.cfg.engine.ticker_poll_seconds * 1000)
-        ultimo_poll_ms = 0
-
-        while True:
-            ahora = int(time.time() * 1000)
-
-            for simbolo in list(self.reconnected):
-                self.reconnected.discard(simbolo)
-                await self.refill_gap(simbolo, ahora)
-
-            if ahora - ultimo_poll_ms >= poll_ms:
-                await self.poll_tickers(ahora)
-                ultimo_poll_ms = ahora
-
-            self.evaluate(ahora)
-            await asyncio.sleep(tick_ms / 1000)
+        for simbolo in list(self.profiles):
+            if simbolo in self._placeholder_symbols:
+                continue
+            velas = self.candle_repo.load(simbolo, desde)
+            if not velas:
+                continue
+            perfil = build_profile(simbolo, velas, self.cfg.profile)
+            self.profile_repo.save(perfil, now_ms)
+            self.profiles[simbolo] = perfil
+            self.dirty.add(simbolo)

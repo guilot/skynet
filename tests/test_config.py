@@ -26,3 +26,15 @@ def test_los_pesos_maximos_suman_cien():
     cfg = load_config(Path("config.toml"))
     total = sum(c.max_points for c in cfg.score.curves.values())
     assert total == 100
+
+def test_carga_la_cadencia_de_mantenimiento():
+    # I2/I4: la cadencia de poda + recálculo diario de perfil es un umbral
+    # de negocio y debe vivir en config.toml, no hardcodeada en __main__.
+    cfg = load_config(Path("config.toml"))
+    assert cfg.maintenance.interval_hours == 24
+
+def test_carga_el_umbral_de_obsolescencia_del_dashboard():
+    # I1: el umbral que marca una fila del dashboard como obsoleta también
+    # es un umbral de negocio configurable.
+    cfg = load_config(Path("config.toml"))
+    assert cfg.dashboard.stale_after_seconds == 30

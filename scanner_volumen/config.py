@@ -42,6 +42,23 @@ class RestConfig:
 
 
 @dataclass(frozen=True)
+class MaintenanceConfig:
+    """Cadencia de las tareas de mantenimiento diarias (I2 poda de velas, I4
+    recálculo del perfil de volumen)."""
+
+    interval_hours: float
+
+
+@dataclass(frozen=True)
+class DashboardConfig:
+    """Umbral de obsolescencia (I1): a partir de cuántos segundos sin
+    actualizarse una fila del dashboard se marca como potencialmente
+    desconectada, aunque el badge de conexión general siga en verde."""
+
+    stale_after_seconds: float
+
+
+@dataclass(frozen=True)
 class StatesConfig:
     watch: float
     hot: float
@@ -76,6 +93,8 @@ class Config:
     rest: RestConfig
     states: StatesConfig
     score: ScoreConfig
+    maintenance: MaintenanceConfig
+    dashboard: DashboardConfig
 
 
 def load_config(path: Path) -> Config:
@@ -101,4 +120,6 @@ def load_config(path: Path) -> Config:
             neutral_multiplier=float(raw["score"]["neutral_multiplier"]),
             curves=curves,
         ),
+        maintenance=MaintenanceConfig(**raw["maintenance"]),
+        dashboard=DashboardConfig(**raw["dashboard"]),
     )

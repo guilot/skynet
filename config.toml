@@ -23,6 +23,12 @@ zscore_window_minutes = 60
 [rest]
 rate_limit_per_second = 10
 
+[maintenance]
+interval_hours = 24
+
+[dashboard]
+stale_after_seconds = 30
+
 [states]
 watch = 50
 hot = 65

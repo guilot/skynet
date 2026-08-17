@@ -70,7 +70,7 @@ def test_guarda_y_recupera_un_perfil(conn):
         for m in range(1440)
     )
     perfil = VolumeProfile("AAAUSDT", slots, confidence="high", days_covered=14.0)
-    repo.save(perfil)
+    repo.save(perfil, now_ms=1_000)
 
     cargado = repo.load("AAAUSDT")
     assert cargado is not None
@@ -83,6 +83,30 @@ def test_guarda_y_recupera_un_perfil(conn):
 
 def test_load_de_un_perfil_inexistente_devuelve_none(conn):
     assert ProfileRepo(conn).load("NOEXISTE") is None
+
+
+def test_save_estampa_el_now_ms_real_y_lo_refresca_en_cada_guardado(conn):
+    """Regresión I4: antes, `save` escribía el literal 0 en `updated_ms` y el
+    `ON CONFLICT` no lo actualizaba, así que ni siquiera había un timestamp
+    del que detectar que un perfil calculado en el arranque llevaba semanas
+    sin recalcularse. Debe quedar el `now_ms` real, y debe seguir
+    refrescándose en guardados posteriores del mismo símbolo, no solo en el
+    primero."""
+    repo = ProfileRepo(conn)
+    slots = tuple(None for _ in range(1440))
+    perfil = VolumeProfile("AAAUSDT", slots, confidence="low", days_covered=0.0)
+
+    repo.save(perfil, now_ms=1_000)
+    fila = conn.execute(
+        "SELECT updated_ms FROM profile_meta WHERE symbol = ?", ("AAAUSDT",)
+    ).fetchone()
+    assert fila["updated_ms"] == 1_000
+
+    repo.save(perfil, now_ms=2_000)
+    fila = conn.execute(
+        "SELECT updated_ms FROM profile_meta WHERE symbol = ?", ("AAAUSDT",)
+    ).fetchone()
+    assert fila["updated_ms"] == 2_000  # el ON CONFLICT sí lo actualizó
 
 
 def metricas_de_prueba(**kwargs):

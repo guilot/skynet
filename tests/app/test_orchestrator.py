@@ -476,7 +476,7 @@ async def test_ensure_profile_rellena_el_hueco_en_un_reinicio_en_caliente(orq):
 
     velas_perfil = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(14) for m in range(1440)]
     perfil = build_profile("AAAUSDT", velas_perfil, orq.cfg.profile)
-    orq.profile_repo.save(perfil)  # perfil ya en disco: simula el reinicio en caliente
+    orq.profile_repo.save(perfil, now_ms=base)  # perfil ya en disco: simula el reinicio en caliente
 
     ahora = base + 300 * MINUTO  # hueco de 5h desde la última vela persistida
     await orq.ensure_profile("AAAUSDT", now_ms=ahora)
@@ -506,7 +506,7 @@ async def test_apply_universe_rellena_el_hueco_en_un_reinicio_en_caliente(orq):
 
     velas_perfil = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(14) for m in range(1440)]
     perfil = build_profile("AAAUSDT", velas_perfil, orq.cfg.profile)
-    orq.profile_repo.save(perfil)  # perfil ya en disco: simula el reinicio en caliente
+    orq.profile_repo.save(perfil, now_ms=base)  # perfil ya en disco: simula el reinicio en caliente
 
     ahora = base + 300 * MINUTO  # hueco de 5h desde la última vela persistida
     update = UniverseUpdate(
@@ -543,7 +543,7 @@ async def test_reconexion_tras_reinicio_en_caliente_mide_el_hueco_contra_lo_seed
 
     velas_perfil = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(14) for m in range(1440)]
     perfil = build_profile("AAAUSDT", velas_perfil, orq.cfg.profile)
-    orq.profile_repo.save(perfil)
+    orq.profile_repo.save(perfil, now_ms=base)
 
     update = UniverseUpdate(
         symbols=frozenset({"AAAUSDT"}), added=frozenset({"AAAUSDT"}),
@@ -601,7 +601,7 @@ async def test_apply_universe_no_espera_al_relleno_de_hueco_en_caliente(orq):
 
     velas_perfil = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(14) for m in range(1440)]
     perfil = build_profile("AAAUSDT", velas_perfil, orq.cfg.profile)
-    orq.profile_repo.save(perfil)
+    orq.profile_repo.save(perfil, now_ms=base)
 
     ahora = base + 300 * MINUTO
     update = UniverseUpdate(
@@ -665,7 +665,7 @@ async def test_relleno_de_hueco_en_fondo_fallido_no_escapa_y_se_reintenta(orq):
 
     velas_perfil = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(14) for m in range(1440)]
     perfil = build_profile("AAAUSDT", velas_perfil, orq.cfg.profile)
-    orq.profile_repo.save(perfil)  # perfil ya en disco: simula el reinicio en caliente
+    orq.profile_repo.save(perfil, now_ms=base)  # perfil ya en disco: simula el reinicio en caliente
 
     orq.candle_repo = CandleRepoFallaLaPrimeraVezAlGuardar(orq.candle_repo)
 
@@ -928,7 +928,7 @@ async def test_apply_universe_en_caliente_usa_el_perfil_de_disco_sin_placeholder
 
     velas = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(14) for m in range(1440)]
     perfil_real = build_profile("AAAUSDT", velas, orq.cfg.profile)
-    orq.profile_repo.save(perfil_real)
+    orq.profile_repo.save(perfil_real, now_ms=14 * DIA)
 
     update = UniverseUpdate(
         symbols=frozenset({"AAAUSDT"}), added=frozenset({"AAAUSDT"}),
@@ -961,3 +961,146 @@ async def test_mark_loaded_se_refleja_en_progress(orq):
     boot.mark_loaded("AAAUSDT")
 
     assert boot.progress() == (1, 2)
+
+
+# --- I6: now_ms viene del reloj del exchange, nunca del de pared ---
+
+async def test_now_ms_recurre_al_reloj_de_pared_hasta_el_primer_ticker(orq):
+    # sin ningún ticker todavía, el único momento legítimo de usar el reloj
+    # de pared es el arranque en frío.
+    assert orq.now_ms(wall_clock_ms=123_456) == 123_456
+
+
+async def test_now_ms_usa_el_ts_del_ticker_en_cuanto_llega_uno(orq):
+    orq.set_ticker(Ticker("AAAUSDT", 100.0, 1.0, 5e6, 100.0, 0.0001, ts=500_000))
+    # el reloj de pared "real" está deliberadamente muy lejos (deriva de
+    # horas) y aun así now_ms debe devolver el ts del ticker, nunca el
+    # argumento de respaldo: spec §13, "nunca la hora local".
+    assert orq.now_ms(wall_clock_ms=999_999_999) == 500_000
+
+
+async def test_now_ms_toma_el_maximo_entre_varios_tickers(orq):
+    orq.set_ticker(Ticker("AAAUSDT", 100.0, 1.0, 5e6, 100.0, 0.0001, ts=500_000))
+    orq.set_ticker(Ticker("BBBUSDT", 1.0, 1.0, 1e6, 1.0, 0.0001, ts=700_000))
+    assert orq.now_ms(wall_clock_ms=0) == 700_000
+
+
+async def test_now_ms_no_retrocede_si_el_reloj_del_exchange_salta_hacia_atras(orq):
+    """El resto del motor (día en curso, historial de RVOL, cooldown de la
+    máquina de estados, cómputo de huecos) asume `now_ms` monótono
+    creciente. Ni una corrección de reloj en el exchange ni un ticker
+    puntual desfasado de otro símbolo deben poder mover el tiempo hacia
+    atrás."""
+    orq.set_ticker(Ticker("AAAUSDT", 100.0, 1.0, 5e6, 100.0, 0.0001, ts=10_000))
+    assert orq.now_ms(wall_clock_ms=0) == 10_000
+
+    orq.set_ticker(Ticker("AAAUSDT", 100.0, 1.0, 5e6, 100.0, 0.0001, ts=5_000))
+    assert orq.now_ms(wall_clock_ms=0) == 10_000  # no retrocede a 5_000
+
+
+async def test_una_senal_persistida_usa_el_reloj_del_exchange_no_el_de_pared(orq):
+    """I6, test de anclaje: `signals.ts` -el valor que `outcomes.run_once`
+    compara después contra velas estampadas por el exchange (spec §13,
+    "se usan siempre los timestamps del exchange, nunca la hora local")-
+    debe salir de `Ticker.ts` vía `Orchestrator.now_ms`, nunca del reloj de
+    pared que solo actúa de respaldo.
+
+    Se reproduce aquí el mismo patrón que usa `__main__.bucle_evaluador`
+    tras el fix (`orq.evaluate(orq.now_ms(ahora_ms()))`), con un reloj de
+    pared simulado que se queda PARADO en `base` mientras el ticker sí
+    avanza minuto a minuto, como en producción. Antes del fix, `__main__`
+    pasaba `ahora_ms()` (el reloj de pared) directo a `evaluate`: con este
+    mismo patrón, el ts persistido habría quedado clavado en
+    `reloj_de_pared_parado` para siempre en vez de seguir al ticker."""
+    base = 14 * DIA
+    await orq.ensure_profile("AAAUSDT", now_ms=base)
+    reloj_de_pared_parado = base
+
+    for m in range(0, 120):
+        orq.set_ticker(Ticker("AAAUSDT", 100.0, 14.0, 5e6, 100.0, 0.0001,
+                               ts=base + m * MINUTO))
+        await orq.handle_ws_event(
+            WsEvent(kind="update", symbol="AAAUSDT",
+                    candles=[vela(base + m * MINUTO, close=100.0, vol=100.0)])
+        )
+        orq.evaluate(now_ms=orq.now_ms(reloj_de_pared_parado))
+
+    assert orq.signal_repo.recent(since_ms=0) == []  # calentamiento plano: nada persistido
+
+    for i, m in enumerate(range(120, 128)):
+        orq.set_ticker(Ticker("AAAUSDT", 130.0, 14.0, 5e6, 100.0, 0.0001,
+                               ts=base + m * MINUTO))
+        await orq.handle_ws_event(
+            WsEvent(kind="update", symbol="AAAUSDT",
+                    candles=[vela(base + m * MINUTO, close=100.0 + i * 3, vol=1200.0)])
+        )
+        orq.evaluate(now_ms=orq.now_ms(reloj_de_pared_parado))
+
+    filas = orq.signal_repo.recent(since_ms=0)
+    assert filas != []  # el pump sí escaló y persistió al menos una señal
+    for f in filas:
+        assert f["ts"] != reloj_de_pared_parado  # no vino del reloj de pared
+        assert f["ts"] >= base + 120 * MINUTO      # siguió al ticker (reloj del exchange)
+
+
+# --- I2 + I4: mantenimiento diario (poda de velas + recálculo de perfil) ---
+
+async def test_run_maintenance_poda_las_velas_fuera_de_la_ventana_retenida(orq):
+    """I2: sin esto, `candles_1m` crece sin límite (spec §9 pide podado más
+    allá de `history_days`); nada más en el sistema llama a `prune`."""
+    # 20 velas, una por día (0..19): con history_days=14 (config.toml) y
+    # ahora = día 19, el límite de retención cae en el día 5, así que las
+    # de los días 0-4 deben desaparecer y las de los días 5-19 sobrevivir.
+    orq.candle_repo.save_many("AAAUSDT", [vela(d * DIA) for d in range(20)])
+    assert len(orq.candle_repo.load("AAAUSDT", since_ms=0)) == 20
+    assert orq.cfg.profile.history_days == 14
+
+    ahora = 19 * DIA
+    await orq.run_maintenance(ahora)
+
+    restantes = {c.ts for c in orq.candle_repo.load("AAAUSDT", since_ms=0)}
+    assert restantes == {d * DIA for d in range(5, 20)}
+
+
+async def test_run_maintenance_recalcula_el_perfil_de_volumen(orq):
+    """I4: sin recálculo diario, el perfil de un proceso de larga vida queda
+    anclado para siempre al que se descargó en el primer arranque (spec
+    §4.3/§6.1: "profile_builder | arranque + diario"). Se compara hoy contra
+    un día distinto con un patrón de volumen distinto para comprobar que el
+    perfil realmente cambia, no solo que se vuelve a guardar el mismo."""
+    base = 14 * DIA
+    await orq.ensure_profile("AAAUSDT", now_ms=base)
+    perfil_inicial = orq.profiles["AAAUSDT"]
+    assert perfil_inicial.slots[0].median == pytest.approx(100.0)
+
+    ahora = base + DIA
+    velas_nuevo_dia = [vela(base + m * MINUTO, vol=500.0) for m in range(1440)]
+    orq.candle_repo.save_many("AAAUSDT", velas_nuevo_dia)
+
+    await orq.run_maintenance(ahora)
+
+    assert orq.profiles["AAAUSDT"].slots[0].median == pytest.approx(500.0)
+    assert orq.profiles["AAAUSDT"] is not perfil_inicial
+    fila = orq.profile_repo._conn.execute(
+        "SELECT updated_ms FROM profile_meta WHERE symbol = ?", ("AAAUSDT",)
+    ).fetchone()
+    assert fila["updated_ms"] == ahora
+    assert "AAAUSDT" in orq.dirty  # el dashboard debe reevaluar con el perfil nuevo
+
+
+async def test_run_maintenance_no_recalcula_placeholders_en_bootstrap(orq):
+    """Un símbolo con bootstrap real todavía en vuelo (placeholder) no debe
+    recalcularse con lo poco que hubiera en SQLite: pisaría el resultado del
+    bootstrap de fondo si terminara justo después."""
+    orq.ws = WsFalso()
+    orq.bootstrapper = BootstrapperLento(orq.cfg.profile)
+    update = UniverseUpdate(
+        symbols=frozenset({"AAAUSDT"}), added=frozenset({"AAAUSDT"}),
+        removed=frozenset(), ordered=["AAAUSDT"],
+    )
+    await orq.apply_universe(update, now_ms=14 * DIA)
+    assert "AAAUSDT" in orq._placeholder_symbols
+
+    await orq.run_maintenance(14 * DIA + DIA)
+
+    assert orq.profile_repo.load("AAAUSDT") is None  # no se guardó nada de fondo

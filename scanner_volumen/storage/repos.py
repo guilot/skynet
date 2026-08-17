@@ -62,10 +62,17 @@ class ProfileRepo:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
-    def save(self, profile: VolumeProfile) -> None:
+    def save(self, profile: VolumeProfile, now_ms: int) -> None:
         """Guarda el perfil completo. Los slots ausentes (None) simplemente no
         se insertan, de modo que `load` los reconstruye como None y el
-        round-trip es lossless para los huecos."""
+        round-trip es lossless para los huecos.
+
+        `now_ms` (I4) queda estampado en `profile_meta.updated_ms`, y el
+        `ON CONFLICT` lo actualiza en cada guardado -no solo en el
+        primero-: sin esto no había ni siquiera un timestamp del que
+        detectar que un perfil calculado en el arranque llevaba semanas sin
+        recalcularse. `now_ms` debe venir siempre del reloj del exchange
+        (nunca de `time.time()`), igual que el resto del motor."""
         filas = [
             (profile.symbol, m, s.median, s.p75, s.p90, s.p95, s.samples)
             for m, s in enumerate(profile.slots)
@@ -80,10 +87,11 @@ class ProfileRepo:
         )
         self._conn.execute(
             """INSERT INTO profile_meta (symbol, confidence, days_covered, updated_ms)
-               VALUES (?, ?, ?, 0)
+               VALUES (?, ?, ?, ?)
                ON CONFLICT(symbol) DO UPDATE SET
-                 confidence=excluded.confidence, days_covered=excluded.days_covered""",
-            (profile.symbol, profile.confidence, profile.days_covered),
+                 confidence=excluded.confidence, days_covered=excluded.days_covered,
+                 updated_ms=excluded.updated_ms""",
+            (profile.symbol, profile.confidence, profile.days_covered, now_ms),
         )
         self._conn.commit()
 

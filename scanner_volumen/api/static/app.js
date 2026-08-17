@@ -26,6 +26,13 @@ function pintar(datos) {
   conexion.textContent = datos.connected ? "conectado" : "sin conexión";
   conexion.className = "pastilla " + (datos.connected ? "ok" : "mal");
 
+  // I1: badge independiente para el WebSocket -única fuente de velas-, que
+  // antes no tenía ninguna representación en el estado: un WS muerto con el
+  // refresco de universo aún sano dejaba el badge de arriba en verde.
+  const wsConexion = document.getElementById("ws-conexion");
+  wsConexion.textContent = datos.ws_connected ? "velas: conectado" : "velas: caído";
+  wsConexion.className = "pastilla " + (datos.ws_connected ? "ok" : "mal");
+
   const b = datos.bootstrap;
   document.getElementById("bootstrap").textContent =
     `perfil: ${b.done}/${b.total || "—"}`;
@@ -46,7 +53,11 @@ function pintar(datos) {
       }
       estadosPrevios.set(f.symbol, ORDEN_ESTADOS[f.state]);
       const dudoso = f.profile_confidence === "low" ? "baja-confianza" : "";
-      return `<tr class="${f.state}" data-symbol="${f.symbol}">
+      // I1: fila marcada como obsoleta si no se actualiza desde hace más del
+      // umbral configurado (`dashboard.stale_after_seconds`), señal de que
+      // ese símbolo dejó de recibir datos aunque el badge general siga verde.
+      const obsoleta = Date.now() - f.updated_ms > datos.stale_after_ms ? "obsoleta" : "";
+      return `<tr class="${f.state} ${obsoleta}" data-symbol="${f.symbol}">
         <td>${i + 1}</td>
         <td class="${dudoso}">${f.symbol}</td>
         <td>${f.direction}</td>

@@ -97,6 +97,6 @@ class Bootstrapper:
 
         desde = now_ms - self._cfg.history_days * DIA_MS
         perfil = build_profile(symbol, self._candles.load(symbol, desde), self._cfg)
-        self._profiles.save(perfil)
+        self._profiles.save(perfil, now_ms)
         self._completados.add(symbol)
         return perfil

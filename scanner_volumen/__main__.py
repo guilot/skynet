@@ -1,10 +1,15 @@
 # scanner_volumen/__main__.py
 """Punto de entrada: arranca todas las tareas del scanner.
 
-Es el único sitio donde `time.time()` es legítimo (ver CLAUDE.md/constraints
-del proyecto): el resto del sistema recibe siempre `now_ms` como parámetro,
-nunca lee el reloj por su cuenta, para que el comportamiento sea
-reproducible en tests.
+Es el único sitio donde el reloj de pared (`time.time_ns`, vía `ahora_ms`) se
+lee directamente. Pero I6 lo acota más: en cuanto llega el primer ticker,
+`Orchestrator.now_ms` empieza a devolver el reloj del exchange (el ts que
+Bitget estampa en cada respuesta de `/tickers`) y `ahora_ms()` deja de
+influir en nada -queda solo como respaldo para el arranque en frío, antes de
+que exista ningún ticker-. Todos los bucles de abajo llaman a
+`orq.now_ms(ahora_ms())`, nunca a `ahora_ms()` a secas, para que "ahora"
+signifique lo mismo en todo el proceso y esa sea la única frontera legítima
+con el reloj de pared (spec §13: "nunca la hora local").
 
 El orquestador ya expone `poll_tickers` y `evaluate`, ambos probados, pero no
 un bucle que también refresque el universo: `poll_tickers` solo actualiza los
@@ -66,6 +71,7 @@ async def main() -> None:
         selector = UniverseSelector(cfg.universe)
         orq = Orchestrator(cfg, rest, ws, candle_repo, profile_repo,
                             signal_repo, supply, bootstrapper)
+        orq.state.stale_after_ms = int(cfg.dashboard.stale_after_seconds * 1000)
         tracker = OutcomeTracker(signal_repo, candle_repo)
 
         app = create_app(orq.state, signal_repo)
@@ -85,7 +91,7 @@ async def main() -> None:
             """
             ultimo_universo = 0
             while True:
-                ahora = ahora_ms()
+                ahora = orq.now_ms(ahora_ms())
                 try:
                     await orq.poll_tickers(ahora)
                     if ahora - ultimo_universo >= cfg.universe.refresh_minutes * 60_000:
@@ -104,7 +110,7 @@ async def main() -> None:
 
         async def bucle_evaluador() -> None:
             while True:
-                ahora = ahora_ms()
+                ahora = orq.now_ms(ahora_ms())
                 for simbolo in list(orq.reconnected):
                     orq.reconnected.discard(simbolo)
                     await orq.refill_gap(simbolo, ahora)
@@ -120,16 +126,33 @@ async def main() -> None:
             while True:
                 await asyncio.sleep(60)
                 try:
-                    tracker.run_once(ahora_ms())
+                    tracker.run_once(orq.now_ms(ahora_ms()))
                 except Exception as exc:  # noqa: BLE001
                     log.warning("seguimiento de resultados fallido: %s", exc)
 
+        async def bucle_mantenimiento() -> None:
+            """Poda diaria (I2) y recálculo diario del perfil de volumen (I4).
+
+            `interval_hours` viene de `config.toml` (`[maintenance]`): todo
+            umbral/cadencia de negocio vive ahí, no hardcodeado aquí.
+            """
+            while True:
+                await asyncio.sleep(cfg.maintenance.interval_hours * 3600)
+                try:
+                    await orq.run_maintenance(orq.now_ms(ahora_ms()))
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("mantenimiento diario fallido: %s", exc)
+
+        def _marcar_ws_conectado(conectado: bool) -> None:
+            orq.state.ws_connected = conectado
+
         log.info("dashboard en http://127.0.0.1:8000")
         await asyncio.gather(
-            ws.run(orq.handle_ws_event),
+            ws.run(orq.handle_ws_event, on_connection_change=_marcar_ws_conectado),
             bucle_tickers(),
             bucle_evaluador(),
             bucle_outcomes(),
+            bucle_mantenimiento(),
             servidor.serve(),
         )
 

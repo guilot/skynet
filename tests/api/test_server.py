@@ -66,6 +66,16 @@ def test_state_devuelve_las_filas_ordenadas_por_score(cliente):
     assert cuerpo["rows"][0]["score"] == 89.0
 
 
+def test_state_incluye_ws_connected_y_el_umbral_de_obsolescencia(entorno):
+    """I1: `ws_connected` (movido desde BitgetWebsocket.run) y
+    `stale_after_ms` (para que el dashboard marque filas obsoletas) deben
+    viajar en el mismo payload que el resto del estado."""
+    cliente, _ = entorno
+    cuerpo = cliente.get("/api/state").json()
+    assert cuerpo["ws_connected"] is False  # nada lo puso a True en este test
+    assert cuerpo["stale_after_ms"] == 30_000  # valor por defecto de ScannerState
+
+
 def test_state_incluye_el_progreso_del_bootstrap(cliente):
     cuerpo = cliente.get("/api/state").json()
     assert cuerpo["bootstrap"] == {"done": 3, "total": 12}

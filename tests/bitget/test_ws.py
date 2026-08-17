@@ -205,3 +205,77 @@ async def test_run_vuelve_a_suscribir_todo_tras_reconectar(monkeypatch):
         enviado = json.loads(conexion.enviados[0])
         assert enviado["op"] == "subscribe"
         assert enviado["args"][0]["instId"] == "BTCUSDT"
+
+
+async def test_run_notifica_conectado_tras_resuscribir_y_desconectado_al_caer(monkeypatch):
+    """Regresión I1: `BitgetWebsocket` -única fuente de velas- no tenía
+    ninguna forma de reportar su propia salud; `ScannerState.connected`
+    solo reflejaba el refresco de universo/tickers por REST, así que un WS
+    muerto con REST sano dejaba el badge en verde para siempre. Se
+    simula una conexión que se cae tras el primer mensaje y se reconecta:
+    la secuencia observada debe ser conectado -> desconectado ->
+    conectado, nunca quedarse en `True` tras la caída."""
+    monkeypatch.setattr(ws_mod, "BACKOFF_INICIAL", 0.01)
+    monkeypatch.setattr(ws_mod, "BACKOFF_MAXIMO", 0.01)
+
+    conexiones = [_ConexionFalsa([]), _ConexionFalsa([])]
+    creadas: list[_ConexionFalsa] = []
+
+    def fabrica(url: str) -> _ConexionFalsa:
+        creadas.append(conexiones.pop(0))
+        return creadas[-1]
+
+    cliente = BitgetWebsocket(venue="USDT-FUTURES", url="wss://fake", connect_factory=fabrica)
+    await cliente.subscribe(["BTCUSDT"])
+    estados: list[bool] = []
+
+    async def on_event(_ev):
+        pass
+
+    tarea = asyncio.create_task(cliente.run(on_event, on_connection_change=estados.append))
+    try:
+        for _ in range(300):
+            if len(creadas) >= 2:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        tarea.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tarea
+
+    # primera conexión: True (tras (re)suscribir), luego False (al caer, agotó su
+    # lista de mensajes); segunda conexión: True de nuevo tras reconectar, y
+    # False final al cancelar la tarea desde el test.
+    assert estados == [True, False, True, False]
+
+
+async def test_run_notifica_conectado_aunque_no_haya_simbolos_suscritos(monkeypatch):
+    """Una conexión nueva está viva en cuanto se abre, aunque todavía no haya
+    ningún símbolo que suscribir (arranque en frío, antes del primer
+    refresco de universo): no debe hacer falta esperar a `subscribe` para
+    reportar `True`."""
+    monkeypatch.setattr(ws_mod, "BACKOFF_INICIAL", 0.01)
+    monkeypatch.setattr(ws_mod, "BACKOFF_MAXIMO", 0.01)
+
+    conexion = _ConexionFalsa([])
+    cliente = BitgetWebsocket(
+        venue="USDT-FUTURES", url="wss://fake", connect_factory=lambda u: conexion
+    )
+    estados: list[bool] = []
+
+    async def on_event(_ev):
+        pass
+
+    tarea = asyncio.create_task(cliente.run(on_event, on_connection_change=estados.append))
+    try:
+        for _ in range(300):
+            if len(estados) >= 2:  # True al conectar, False al agotarse los mensajes
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        tarea.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tarea
+
+    assert estados[:2] == [True, False]
+    assert conexion.enviados == []  # sin símbolos, no se envió ninguna suscripción

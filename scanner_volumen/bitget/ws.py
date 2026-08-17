@@ -140,7 +140,28 @@ class BitgetWebsocket:
             if self._ws is not None:
                 await self._ws.send(json.dumps(mensaje))
 
-    async def run(self, on_event: Callable[[WsEvent], Awaitable[None]]) -> None:
+    async def run(
+        self,
+        on_event: Callable[[WsEvent], Awaitable[None]],
+        on_connection_change: Callable[[bool], None] | None = None,
+    ) -> None:
+        """Mantiene la conexión viva y notifica su salud (I1).
+
+        El WS es la única fuente de velas; sin `on_connection_change` no
+        había forma de distinguir "feed muerto" de "mercado tranquilo" desde
+        fuera de esta clase. Se llama con `True` justo después de
+        (re)suscribir en cada conexión nueva -incluso si `self._symbols`
+        está vacío, la conexión en sí ya está viva- y con `False` en el
+        `finally` que cubre cualquier salida de la conexión: fallo de red,
+        cierre del servidor o cancelación de la tarea. `on_connection_change`
+        es síncrono a propósito (solo marca un flag en `ScannerState`, ver
+        __main__): no hace falta un callback async para eso.
+        """
+
+        def _marcar(conectado: bool) -> None:
+            if on_connection_change is not None:
+                on_connection_change(conectado)
+
         backoff = BACKOFF_INICIAL
         while True:
             try:
@@ -151,6 +172,7 @@ class BitgetWebsocket:
                         await self._enviar(
                             build_subscribe(sorted(self._symbols), self._venue)
                         )
+                    _marcar(True)
                     ping = asyncio.create_task(self._latido(ws))
                     try:
                         async for raw in ws:
@@ -165,6 +187,7 @@ class BitgetWebsocket:
                 log.warning("WebSocket caído (%s), reintento en %.0fs", exc, backoff)
             finally:
                 self._ws = None
+                _marcar(False)
             await asyncio.sleep(backoff)
             backoff = min(BACKOFF_MAXIMO, backoff * 2)
 

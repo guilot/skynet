@@ -46,6 +46,15 @@ class SymbolSnapshot:
 class ScannerState:
     snapshots: dict[str, SymbolSnapshot] = field(default_factory=dict)
     connected: bool = False
+    # I1: el WebSocket es la única fuente de velas; `connected` arriba solo
+    # refleja la salud del refresco de universo/tickers por REST y nunca se
+    # apagaba si el WS moría. Este flag lo mueve `BitgetWebsocket.run` (ver
+    # __main__), independiente del anterior.
+    ws_connected: bool = False
+    # umbral (ms) que el dashboard usa para marcar una fila como
+    # potencialmente obsoleta si `updated_ms` no avanza; configurable via
+    # `dashboard.stale_after_seconds`, lo fija __main__ al arrancar.
+    stale_after_ms: int = 30_000
     bootstrap_done: int = 0
     bootstrap_total: int = 0
 
@@ -66,6 +75,8 @@ class ScannerState:
     def to_dict(self) -> dict:
         return {
             "connected": self.connected,
+            "ws_connected": self.ws_connected,
+            "stale_after_ms": self.stale_after_ms,
             "bootstrap": {"done": self.bootstrap_done, "total": self.bootstrap_total},
             "rows": [s.to_dict() for s in self.ranked()],
         }
