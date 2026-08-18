@@ -1483,7 +1483,7 @@ async def _calentar_y_pumpear(orq, symbol, base, vol_base, vol_pump):
     for i, m in enumerate(range(120, 128)):
         await orq.handle_ws_event(
             WsEvent(kind="update", symbol=symbol,
-                    candles=[vela(base + m * MINUTO, close=100.0 + i * 3, vol=vol_pump)])
+                    candles=[vela(base + m * MINUTO, close=100.0 + i * 0.8, vol=vol_pump)])
         )
         transiciones = orq.evaluate(now_ms=base + m * MINUTO + 59_000)
         escaladas_a_hot_o_mas += sum(
