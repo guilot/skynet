@@ -134,6 +134,15 @@ def test_curvas_esperadas_se_deriva_de_los_bloques_del_score_no_se_duplica():
     )
 
 
+def test_carga_los_umbrales_del_backtest():
+    # Requisitos 2/3 del backtest: hueco de episodio, umbral mínimo de
+    # episodios para significancia, y corte de cambio de scoring.
+    cfg = load_config(CONFIG_PATH)
+    assert cfg.backtest.episode_gap_minutes == 30
+    assert cfg.backtest.min_episodes_for_significance == 30
+    assert cfg.backtest.score_change_cutoff_ts == 1787004306142
+
+
 def test_falla_si_falta_una_curva_de_score(tmp_path):
     """score_symbol filtra con `if clave in cfg.curves`: una curva ausente
     anularía en silencio hasta 15 puntos de un bloque entero sin que nada lo

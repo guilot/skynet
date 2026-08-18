@@ -165,6 +165,24 @@ class SignalRepo:
         ).fetchall()
         return [dict(f) for f in filas]
 
+    def all_signals(self) -> list[dict]:
+        """Todas las señales, ordenadas por símbolo y luego por ts. Usado por
+        la herramienta de backtest (`scanner_volumen/backtest`), que necesita
+        el histórico completo -no una ventana reciente como `recent`- y el
+        orden por símbolo para agrupar episodios sin tener que reordenar."""
+        filas = self._conn.execute(
+            "SELECT * FROM signals ORDER BY symbol, ts"
+        ).fetchall()
+        return [dict(f) for f in filas]
+
+    def all_outcomes(self) -> list[dict]:
+        """Todos los resultados registrados en `signal_outcomes`. Usado por
+        la herramienta de backtest para cruzar cada señal con su resultado en
+        cada horizonte, sin pasar por `pending_outcomes` (que solo mira lo
+        que falta, no lo que ya existe)."""
+        filas = self._conn.execute("SELECT * FROM signal_outcomes").fetchall()
+        return [dict(f) for f in filas]
+
     def pending_outcomes(
         self, now_ms: int, horizons: tuple[int, ...]
     ) -> list[tuple[int, str, float, int, int]]:

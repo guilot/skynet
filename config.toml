@@ -70,6 +70,20 @@ host = "127.0.0.1"
 port = 8000
 db_path = "data/scanner.db"
 
+[backtest]
+# Umbrales de negocio de la herramienta de backtest (scanner_volumen/backtest).
+# Ventana para colapsar señales consecutivas del mismo símbolo en un único
+# episodio (requisito 2): por debajo de este hueco entre dos señales
+# seguidas se consideran la misma racha, no dos observaciones independientes.
+episode_gap_minutes = 30
+# Por debajo de este número de episodios, todo resultado se marca como no
+# significativo y la herramienta nunca emite una recomendación (requisito 3).
+min_episodes_for_significance = 30
+# Señales anteriores a este ts (ms) se puntuaron con una penalización de
+# extensión sobre VWAP más débil; no son estrictamente comparables con las
+# posteriores. Ver `scanner_volumen/backtest/segmentation.py`.
+score_change_cutoff_ts = 1787004306142
+
 [score]
 neutral_multiplier = 0.5
 

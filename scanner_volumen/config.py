@@ -137,6 +137,19 @@ class ServerConfig:
 
 
 @dataclass(frozen=True)
+class BacktestConfig:
+    """Umbrales de negocio de la herramienta de backtest (requisitos 2 y 3):
+    el hueco que colapsa señales consecutivas del mismo símbolo en un
+    episodio, el número mínimo de episodios por debajo del cual un
+    resultado se marca como no significativo, y el corte de timestamp que
+    separa las señales puntuadas con la penalización de VWAP anterior."""
+
+    episode_gap_minutes: float
+    min_episodes_for_significance: int
+    score_change_cutoff_ts: int
+
+
+@dataclass(frozen=True)
 class Config:
     market: MarketConfig
     universe: UniverseConfig
@@ -151,6 +164,7 @@ class Config:
     supply: SupplyConfig
     outcomes: OutcomesConfig
     server: ServerConfig
+    backtest: BacktestConfig
 
 
 # Los tres bloques del score (MOMENTUM 6 + DEMAND 4 + STRUCTURE 3, ver
@@ -233,4 +247,5 @@ def load_config(path: Path) -> Config:
             poll_seconds=float(raw["outcomes"]["poll_seconds"]),
         ),
         server=ServerConfig(**raw["server"]),
+        backtest=BacktestConfig(**raw["backtest"]),
     )

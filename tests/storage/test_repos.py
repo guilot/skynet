@@ -293,6 +293,31 @@ def test_save_outcome_persiste_la_completitud_de_la_ventana(conn):
     assert fila["candles_expected"] == 6
 
 
+def test_all_signals_devuelve_todo_ordenado_por_simbolo_y_ts(conn):
+    repo = SignalRepo(conn)
+    repo.insert(metricas_de_prueba(symbol="BBB", ts=2000), desglose(), State.HOT)
+    repo.insert(metricas_de_prueba(symbol="AAA", ts=1000), desglose(), State.HOT)
+    repo.insert(metricas_de_prueba(symbol="AAA", ts=500), desglose(), State.HOT)
+    filas = repo.all_signals()
+    assert [(f["symbol"], f["ts"]) for f in filas] == [
+        ("AAA", 500), ("AAA", 1000), ("BBB", 2000),
+    ]
+
+
+def test_all_outcomes_devuelve_todos_los_horizontes_de_todas_las_senales(conn):
+    repo = SignalRepo(conn)
+    sid1 = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL)
+    sid2 = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL)
+    repo.save_outcome(sid1, horizon_min=1, price=7.0, return_pct=4.2,
+                      mfe_pct=5.0, mae_pct=-0.5, candles_seen=2, candles_expected=2)
+    repo.save_outcome(sid2, horizon_min=5, price=7.0, return_pct=-2.0,
+                      mfe_pct=1.0, mae_pct=-3.0, candles_seen=6, candles_expected=6)
+    filas = repo.all_outcomes()
+    assert len(filas) == 2
+    claves = {(f["signal_id"], f["horizon_min"]) for f in filas}
+    assert claves == {(sid1, 1), (sid2, 5)}
+
+
 def test_supply_repo_hace_upsert(conn):
     repo = SupplyRepo(conn)
     repo.upsert("BTCUSDT", "bitcoin", 19_800_000, 1.2e12, 1.3e12, updated_ms=0)
