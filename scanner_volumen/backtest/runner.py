@@ -16,18 +16,31 @@ from scanner_volumen.storage.repos import SignalRepo
 class BacktestData:
     """Datos crudos ya cargados: señales + resultados indexados por
     signal_id -> horizonte. Separado de `run` para poder probar la
-    agregación sin tocar disco."""
+    agregación sin tocar disco.
+
+    `incomplete_outcomes` (hallazgo 4): número de filas de
+    `signal_outcomes` donde `candles_seen < candles_expected`, es decir,
+    calculadas sobre una ventana con un hueco de datos. No se excluyen de
+    ningún cálculo -este módulo solo mide-, pero el conteo se expone para
+    que el informe lo muestre y el lector sepa si le importa."""
 
     signals: list[dict]
     outcomes_by_signal: dict[int, dict[int, dict]]
+    incomplete_outcomes: int
 
 
 def load_backtest_data(signal_repo: SignalRepo) -> BacktestData:
     señales = signal_repo.all_signals()
     outcomes_by_signal: dict[int, dict[int, dict]] = {}
+    incompletos = 0
     for fila in signal_repo.all_outcomes():
         outcomes_by_signal.setdefault(fila["signal_id"], {})[fila["horizon_min"]] = fila
-    return BacktestData(signals=señales, outcomes_by_signal=outcomes_by_signal)
+        if fila["candles_seen"] < fila["candles_expected"]:
+            incompletos += 1
+    return BacktestData(
+        signals=señales, outcomes_by_signal=outcomes_by_signal,
+        incomplete_outcomes=incompletos,
+    )
 
 
 @dataclass(frozen=True)
@@ -44,6 +57,13 @@ def compute_all(
     entry_rules: tuple[EntryRule, ...],
     gap_minutes: float,
 ) -> list[ComboResult]:
+    """Hallazgo 1: los episodios se agrupan UNA sola vez aquí, sobre TODAS
+    las señales del periodo -no por regla-, y cada combinación (regla,
+    horizonte) interseca esos episodios con sus señales calificadas dentro
+    de `compute_combo_stats`. Agruparlos por separado dentro de cada regla
+    hacía que el recuento de episodios dependiera de qué señales excluía esa
+    regla en concreto, inflando el número de episodios "independientes"."""
+    episodios_totales = group_episodes(data.signals, gap_minutes) if data.signals else []
     resultados: list[ComboResult] = []
     for regla in entry_rules:
         calificados = [
@@ -55,7 +75,7 @@ def compute_all(
         ]
         for horizonte in horizons:
             stats_señal, stats_episodio = compute_combo_stats(
-                calificados, data.outcomes_by_signal, horizonte, gap_minutes
+                calificados, episodios_totales, data.outcomes_by_signal, horizonte
             )
             resultados.append(ComboResult(regla, horizonte, stats_señal, stats_episodio))
     return resultados
@@ -73,6 +93,7 @@ class BacktestRun:
     ts_max: int | None
     gap_minutes: float
     min_episodes_for_significance: int
+    incomplete_outcomes: int
 
 
 def run(
@@ -97,4 +118,5 @@ def run(
         ts_max=max((s["ts"] for s in data.signals), default=None),
         gap_minutes=gap_minutes,
         min_episodes_for_significance=min_episodes_for_significance,
+        incomplete_outcomes=data.incomplete_outcomes,
     )

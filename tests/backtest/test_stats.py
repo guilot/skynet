@@ -1,5 +1,6 @@
 import pytest
 
+from scanner_volumen.backtest.episodes import group_episodes
 from scanner_volumen.backtest.stats import (
     HorizonStats, adjusted_favourable, adjusted_adverse, adjusted_return,
     compute_combo_stats,
@@ -45,7 +46,7 @@ def test_neutral_se_trata_como_long_no_se_invierte():
 
 def test_compute_combo_stats_con_grupo_vacio_no_lanza_y_devuelve_none():
     stats_señal, stats_episodio = compute_combo_stats(
-        qualifying_signals=[], outcomes_by_signal={}, horizon=5, gap_minutes=30,
+        qualifying_signals=[], all_episodes=[], outcomes_by_signal={}, horizon=5,
     )
     assert stats_señal.n == 0
     assert stats_señal.mean_pnl is None
@@ -68,7 +69,8 @@ def _outcome(return_pct, mfe_pct, mae_pct):
 def test_compute_combo_stats_ignora_senales_sin_outcome_para_ese_horizonte():
     señales = [_senal(1, "AAA", 0), _senal(2, "AAA", 60_000)]
     outcomes = {1: {5: _outcome(2.0, 3.0, -1.0)}}  # la señal 2 no tiene horizonte 5
-    stats_señal, _ = compute_combo_stats(señales, outcomes, horizon=5, gap_minutes=30)
+    episodios = group_episodes(señales, gap_minutes=30)
+    stats_señal, _ = compute_combo_stats(señales, episodios, outcomes, horizon=5)
     assert stats_señal.n == 1
     assert stats_señal.mean_pnl == 2.0
 
@@ -90,8 +92,9 @@ def test_compute_combo_stats_por_senal_es_una_media_plana_dominada_por_repeticio
         3: {5: _outcome(-1.0, 0.5, -1.5)},
         4: {5: _outcome(-1.0, 0.5, -1.5)},
     }
+    episodios = group_episodes(señales, gap_minutes=30)
     stats_señal, stats_episodio = compute_combo_stats(
-        señales, outcomes, horizon=5, gap_minutes=30
+        señales, episodios, outcomes, horizon=5
     )
     assert stats_señal.n == 4
     assert stats_señal.mean_pnl == pytest.approx((10.0 - 1.0 - 1.0 - 1.0) / 4)
@@ -105,8 +108,9 @@ def test_compute_combo_stats_por_senal_es_una_media_plana_dominada_por_repeticio
 def test_compute_combo_stats_aplica_el_ajuste_de_direccion_antes_de_agregar():
     señales = [_senal(1, "AAA", 0, direction="SHORT")]
     outcomes = {1: {5: _outcome(return_pct=-4.0, mfe_pct=1.0, mae_pct=-4.0)}}
+    episodios = group_episodes(señales, gap_minutes=30)
     stats_señal, stats_episodio = compute_combo_stats(
-        señales, outcomes, horizon=5, gap_minutes=30
+        señales, episodios, outcomes, horizon=5
     )
     assert stats_señal.mean_pnl == 4.0  # -(-4.0)
     assert stats_señal.mean_favourable == 4.0  # -mae_pct
@@ -120,5 +124,98 @@ def test_win_rate_cuenta_estrictamente_positivos():
         1: {5: _outcome(0.0, 0.0, 0.0)},   # cero no es una victoria
         2: {5: _outcome(1.0, 1.0, 0.0)},
     }
-    stats_señal, _ = compute_combo_stats(señales, outcomes, horizon=5, gap_minutes=30)
+    episodios = group_episodes(señales, gap_minutes=30)
+    stats_señal, _ = compute_combo_stats(señales, episodios, outcomes, horizon=5)
     assert stats_señal.win_rate == pytest.approx(0.5)
+
+
+# --- Hallazgo 1: episodios agrupados sobre TODAS las señales, no solo las
+# que califican para la regla -----------------------------------------
+
+def test_episodio_no_se_divide_por_senales_intermedias_que_la_regla_excluye():
+    """Reproduce la forma real del caso (TUTUSDT ids 3-19: un tramo SHORT en
+    medio de un tramo LONG bajo una regla */LONG). La racha física completa
+    del símbolo nunca tiene un hueco por encima de 30 min (10, 10 y 15 min
+    entre señales consecutivas); pero si los episodios se agrupasen solo
+    sobre las señales que califican (LONG), las señales SHORT intermedias
+    desaparecerían y las dos LONG supervivientes quedarían a 35 min -por
+    encima del hueco configurado- partiendo un único episodio en dos."""
+    todas = [
+        _senal(1, "TUTUSDT", 0),
+        _senal(2, "TUTUSDT", 10 * 60_000, direction="SHORT"),
+        _senal(3, "TUTUSDT", 20 * 60_000, direction="SHORT"),
+        _senal(4, "TUTUSDT", 35 * 60_000),
+    ]
+    calificadas = [s for s in todas if s["direction"] == "LONG"]  # ids 1 y 4
+    outcomes = {
+        1: {5: _outcome(2.0, 2.0, 0.0)},
+        4: {5: _outcome(4.0, 4.0, 0.0)},
+    }
+    episodios_totales = group_episodes(todas, gap_minutes=30)
+
+    _, stats_episodio = compute_combo_stats(
+        calificadas, episodios_totales, outcomes, horizon=5
+    )
+
+    assert stats_episodio.n == 1  # NO 2: es la misma racha física
+    assert stats_episodio.mean_pnl == pytest.approx((2.0 + 4.0) / 2)
+
+
+def test_agrupar_sobre_solo_las_calificadas_habria_partido_el_episodio():
+    """Control negativo del test anterior: demuestra que el bug era real -
+    agrupando episodios sobre el subconjunto filtrado (el comportamiento
+    previo al fix), el mismo escenario sí se parte en dos episodios."""
+    todas = [
+        _senal(1, "TUTUSDT", 0),
+        _senal(2, "TUTUSDT", 10 * 60_000, direction="SHORT"),
+        _senal(3, "TUTUSDT", 20 * 60_000, direction="SHORT"),
+        _senal(4, "TUTUSDT", 35 * 60_000),
+    ]
+    calificadas = [s for s in todas if s["direction"] == "LONG"]
+    episodios_sobre_calificadas = group_episodes(calificadas, gap_minutes=30)
+    assert len(episodios_sobre_calificadas) == 2  # el bug que el fix corrige
+
+
+# --- Hallazgo 3: episodios que mezclan LONG y SHORT bajo una regla /ALL -
+
+def test_compute_combo_stats_cuenta_episodios_de_direccion_mixta():
+    """Bajo una regla /ALL, un LONG y un SHORT casi simultáneos del mismo
+    símbolo caen en el mismo episodio y su P&L (ya ajustado por dirección)
+    se promedia sin más -tienden a cancelarse por construcción-. El conteo
+    de episodios mixtos debe reflejarlo."""
+    señales = [
+        _senal(1, "TUTUSDT", 0, direction="LONG"),
+        _senal(2, "TUTUSDT", 5 * 60_000, direction="SHORT"),
+        _senal(3, "CYSUSDT", 0, direction="LONG"),  # episodio de una sola dirección
+    ]
+    outcomes = {
+        1: {5: _outcome(return_pct=3.0, mfe_pct=3.0, mae_pct=0.0)},
+        2: {5: _outcome(return_pct=-2.5, mfe_pct=0.0, mae_pct=-2.5)},
+        3: {5: _outcome(return_pct=1.0, mfe_pct=1.0, mae_pct=0.0)},
+    }
+    episodios = group_episodes(señales, gap_minutes=30)
+
+    _, stats_episodio = compute_combo_stats(señales, episodios, outcomes, horizon=5)
+
+    assert stats_episodio.n == 2  # TUTUSDT (mixto) + CYSUSDT (LONG puro)
+    assert stats_episodio.mixed_direction_episodes == 1
+    # TUTUSDT: pnl LONG=3.0, pnl SHORT ajustado=-(-2.5)=2.5 -> media 2.75
+    assert stats_episodio.mean_pnl == pytest.approx((2.75 + 1.0) / 2)
+
+
+def test_regla_de_direccion_unica_nunca_produce_episodios_mixtos():
+    """Por diseño, una regla /LONG o /SHORT solo deja pasar señales de esa
+    dirección, así que ningún episodio calificado puede mezclar direcciones
+    -mixed_direction_episodes debe quedarse en 0-."""
+    señales = [
+        _senal(1, "TUTUSDT", 0, direction="LONG"),
+        _senal(2, "TUTUSDT", 5 * 60_000, direction="SHORT"),
+    ]
+    calificadas = [s for s in señales if s["direction"] == "LONG"]
+    outcomes = {1: {5: _outcome(return_pct=3.0, mfe_pct=3.0, mae_pct=0.0)}}
+    episodios = group_episodes(señales, gap_minutes=30)
+
+    _, stats_episodio = compute_combo_stats(calificadas, episodios, outcomes, horizon=5)
+
+    assert stats_episodio.n == 1
+    assert stats_episodio.mixed_direction_episodes == 0

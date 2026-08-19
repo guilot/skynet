@@ -190,6 +190,25 @@ CURVAS_ESPERADAS = frozenset((*CLAVES_MOMENTUM, *CLAVES_DEMAND, *CLAVES_STRUCTUR
 _ESTADOS_VALIDOS = {s.value for s in State}
 
 
+def _validar_backtest(raw_backtest: dict) -> None:
+    """Valida los umbrales de `[backtest]` al cargar, igual que ya hacen las
+    curvas y los estados (Minor): sin esto, un `episode_gap_minutes = 0` en
+    el TOML no fallaba hasta `episodes.group_episodes`, en tiempo de
+    ejecución del backtest y sin contexto sobre qué campo del TOML lo causó,
+    en vez de fallar aquí, en un único punto al arrancar."""
+    gap = raw_backtest["episode_gap_minutes"]
+    if gap <= 0:
+        raise ValueError(
+            f"backtest.episode_gap_minutes debe ser positivo, llegó {gap!r}"
+        )
+    minimo = raw_backtest["min_episodes_for_significance"]
+    if minimo < 0:
+        raise ValueError(
+            "backtest.min_episodes_for_significance no puede ser negativo, "
+            f"llegó {minimo!r}"
+        )
+
+
 def _validar_estado(campo: str, valor: str) -> None:
     """Valida que `valor` sea un `State` real, en un único punto de fallo
     al cargar la config (Minor). Sin esto, un typo en `alert_min_state` o
@@ -226,6 +245,7 @@ def load_config(path: Path) -> Config:
     _validar_estado(
         "orchestrator.persisted_min_state", raw["orchestrator"]["persisted_min_state"]
     )
+    _validar_backtest(raw["backtest"])
 
     return Config(
         market=MarketConfig(**raw["market"]),

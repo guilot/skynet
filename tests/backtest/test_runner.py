@@ -57,6 +57,23 @@ def test_load_backtest_data_indexa_outcomes_por_senal_y_horizonte(conn):
     assert len(data.signals) == 1
     assert data.outcomes_by_signal[sid][5]["return_pct"] == 2.0
     assert data.outcomes_by_signal[sid][15]["return_pct"] == 4.0
+    assert data.incomplete_outcomes == 0
+
+
+def test_load_backtest_data_cuenta_outcomes_con_ventana_incompleta(conn):
+    """Hallazgo 4: `candles_seen < candles_expected` marca un resultado
+    calculado sobre un hueco de datos. `load_backtest_data` no debe filtrar
+    esas filas -esta herramienta mide, no depura- pero sí contarlas."""
+    repo = SignalRepo(conn)
+    sid = insertar_senal(repo, "AAAUSDT", 0, State.HOT, Direction.LONG)
+    repo.save_outcome(sid, 5, price=10.2, return_pct=2.0, mfe_pct=2.0, mae_pct=0.0,
+                       candles_seen=3, candles_expected=5)  # hueco de datos
+    repo.save_outcome(sid, 15, price=10.4, return_pct=4.0, mfe_pct=4.0, mae_pct=0.0,
+                       candles_seen=15, candles_expected=15)  # ventana completa
+
+    data = load_backtest_data(repo)
+    assert len(data.signals) == 1  # no se excluye nada
+    assert data.incomplete_outcomes == 1
 
 
 def test_run_de_extremo_a_extremo_agrega_por_episodio_correctamente(conn):
@@ -110,6 +127,34 @@ def test_run_filtra_por_regla_de_entrada(conn):
     combo = resultado.results[0]
     assert combo.per_signal.n == 1
     assert combo.per_signal.mean_pnl == pytest.approx(9.0)
+
+
+def test_run_no_divide_episodio_por_senales_de_otra_direccion_filtradas(conn):
+    """Hallazgo 1, de extremo a extremo: reproduce la forma real del caso
+    (TUTUSDT ids 3-19, un tramo SHORT en medio de un tramo LONG). La racha
+    física completa nunca tiene un hueco por encima de 30 min, pero bajo una
+    regla */LONG las señales SHORT intermedias quedan filtradas y las LONG
+    supervivientes quedan a 35 min entre sí -por encima del hueco
+    configurado-. Antes del fix esto se contaba como DOS episodios; debe
+    seguir siendo UNO, porque `total_episodes` (agrupado sobre TODAS las
+    señales) y el episodio de la regla LONG deben coincidir en este caso."""
+    repo = SignalRepo(conn)
+    id_primera = insertar_senal(repo, "TUTUSDT", 0, State.HOT, Direction.LONG)
+    insertar_senal(repo, "TUTUSDT", 10 * MINUTO, State.SIGNAL, Direction.SHORT)
+    insertar_senal(repo, "TUTUSDT", 20 * MINUTO, State.SIGNAL, Direction.SHORT)
+    id_ultima = insertar_senal(repo, "TUTUSDT", 35 * MINUTO, State.HOT, Direction.LONG)
+    for sid in (id_primera, id_ultima):
+        insertar_outcome(repo, sid, 5, return_pct=2.0)
+
+    regla_long = EntryRule(label="HOT+ / LONG", min_state=State.HOT, direction="LONG")
+    resultado = run(
+        repo, horizons=(5,), gap_minutes=30, cutoff_ts=10**15,
+        min_episodes_for_significance=30, entry_rules=(regla_long,),
+    )
+
+    assert resultado.total_episodes == 1  # la racha física completa
+    combo = resultado.results[0]
+    assert combo.per_episode.n == 1  # NO 2: mismo episodio bajo la regla LONG
 
 
 def test_run_con_base_vacia_no_lanza(conn):

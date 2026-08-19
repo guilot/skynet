@@ -6,7 +6,7 @@ from __future__ import annotations
 import statistics
 from dataclasses import dataclass
 
-from scanner_volumen.backtest.episodes import group_episodes
+from scanner_volumen.backtest.episodes import Episode
 
 
 def adjusted_return(direction: str, return_pct: float) -> float:
@@ -38,7 +38,14 @@ class HorizonStats:
     """Resumen de una combinación (regla de entrada, horizonte), ya sea
     calculado sobre señales individuales o sobre episodios. Todos los campos
     salvo `n` son `None` cuando `n == 0`: ningún cociente se calcula sobre un
-    denominador vacío."""
+    denominador vacío.
+
+    `mixed_direction_episodes` (hallazgo 3) solo tiene sentido en la versión
+    por-episodio: cuenta cuántos de los episodios que aportan valor mezclan
+    más de una dirección entre sus miembros calificados (p. ej. un LONG y un
+    SHORT casi simultáneos del mismo símbolo bajo una regla /ALL). En la
+    versión por-señal se queda en su valor por defecto (0): ahí no existe el
+    concepto de episodio."""
 
     n: int
     mean_pnl: float | None
@@ -46,14 +53,17 @@ class HorizonStats:
     win_rate: float | None
     mean_favourable: float | None
     mean_adverse: float | None
+    mixed_direction_episodes: int = 0
 
 
-def _resumen(valores: list[tuple[float, float, float]]) -> HorizonStats:
+def _resumen(
+    valores: list[tuple[float, float, float]], mixed_direction_episodes: int = 0
+) -> HorizonStats:
     n = len(valores)
     if n == 0:
         return HorizonStats(
             n=0, mean_pnl=None, median_pnl=None, win_rate=None,
-            mean_favourable=None, mean_adverse=None,
+            mean_favourable=None, mean_adverse=None, mixed_direction_episodes=0,
         )
     pnls = [v[0] for v in valores]
     favs = [v[1] for v in valores]
@@ -66,30 +76,46 @@ def _resumen(valores: list[tuple[float, float, float]]) -> HorizonStats:
         win_rate=ganadoras / n,
         mean_favourable=statistics.mean(favs),
         mean_adverse=statistics.mean(advs),
+        mixed_direction_episodes=mixed_direction_episodes,
     )
 
 
 def compute_combo_stats(
     qualifying_signals: list[dict],
+    all_episodes: list[Episode],
     outcomes_by_signal: dict[int, dict[int, dict]],
     horizon: int,
-    gap_minutes: float,
 ) -> tuple[HorizonStats, HorizonStats]:
     """Calcula las estadísticas por-señal y por-episodio para una
     combinación (regla de entrada ya aplicada -> `qualifying_signals`,
     horizonte de salida). `outcomes_by_signal` mapea signal_id -> horizonte
     -> fila de `signal_outcomes` (con return_pct/mfe_pct/mae_pct).
 
-    Por-episodio (requisito 2, la cifra titular): se agrupan las señales
-    calificadas en episodios (independiente del horizonte -el hueco entre
-    señales no depende de qué resultado exista-); cada episodio aporta UN
-    valor, la media de sus señales miembro que sí tienen resultado en este
-    horizonte, así que una racha de 36 señales pesa lo mismo que una señal
-    aislada. Un episodio sin ningún miembro con resultado en este horizonte
-    se descarta para este horizonte (no aporta un cero falso).
+    `all_episodes` (hallazgo 1) viene YA agrupado sobre TODAS las señales del
+    periodo, no solo sobre `qualifying_signals`. Agrupar sobre el subconjunto
+    filtrado por la regla estaba mal: una racha física continua de un
+    símbolo (huecos reales por debajo de `episode_gap_minutes`) con señales
+    intermedias que la regla excluye (p. ej. un tramo SHORT en medio de un
+    tramo LONG bajo una regla */LONG) podía dejar a las señales
+    supervivientes separadas por más del hueco configurado y partirse en
+    varios "episodios independientes" que en realidad son la misma racha
+    -justo la correlación que el episodio existe para eliminar-. Agrupando
+    sobre la población completa una sola vez (ver `runner.compute_all`) y
+    después intersecando cada episodio con las señales que sí califican, el
+    recuento de episodios deja de depender de qué regla se esté evaluando.
+
+    Por-episodio (requisito 2, la cifra titular): cada episodio aporta UN
+    valor si al menos una de sus señales califica para la regla Y tiene
+    resultado en este horizonte -la media de esas señales miembro
+    calificadas-, así que una racha de 36 señales pesa lo mismo que una
+    señal aislada. Un episodio sin ningún miembro calificado con resultado
+    en este horizonte se descarta para este horizonte (no aporta un cero
+    falso).
     """
     puntos: dict[int, tuple[float, float, float]] = {}
+    direcciones: dict[int, str] = {}
     for s in qualifying_signals:
+        direcciones[s["id"]] = s["direction"]
         outcome = outcomes_by_signal.get(s["id"], {}).get(horizon)
         if outcome is None:
             continue
@@ -101,16 +127,19 @@ def compute_combo_stats(
 
     stats_señal = _resumen(list(puntos.values()))
 
-    episodios = group_episodes(qualifying_signals, gap_minutes)
     valores_episodio: list[tuple[float, float, float]] = []
-    for ep in episodios:
-        miembros = [puntos[sid] for sid in ep.signal_ids if sid in puntos]
-        if not miembros:
+    episodios_mixtos = 0
+    for ep in all_episodes:
+        miembros_ids = [sid for sid in ep.signal_ids if sid in puntos]
+        if not miembros_ids:
             continue
+        miembros = [puntos[sid] for sid in miembros_ids]
         pnl_medio = statistics.mean(m[0] for m in miembros)
         fav_medio = statistics.mean(m[1] for m in miembros)
         adv_medio = statistics.mean(m[2] for m in miembros)
         valores_episodio.append((pnl_medio, fav_medio, adv_medio))
-    stats_episodio = _resumen(valores_episodio)
+        if len({direcciones[sid] for sid in miembros_ids}) > 1:
+            episodios_mixtos += 1
+    stats_episodio = _resumen(valores_episodio, mixed_direction_episodes=episodios_mixtos)
 
     return stats_señal, stats_episodio

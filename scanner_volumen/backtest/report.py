@@ -37,6 +37,15 @@ def _cabecera(run: BacktestRun) -> list[str]:
         f" Ventana de señales : {_fmt_ts(run.ts_min)} .. {_fmt_ts(run.ts_max)}",
         f" Total              : {run.total_signals} señales, {run.total_episodes} episodios"
         f" (hueco de episodio: {run.gap_minutes:g} min)",
+        # Hallazgo 4: candles_seen/candles_expected existen justo para poder
+        # distinguir un resultado calculado sobre una ventana completa de
+        # uno calculado sobre un hueco de datos. No se excluyen de ningún
+        # cálculo -esta herramienta mide, no depura-, pero el conteo se
+        # imprime aquí, en la cabecera, para que sea imposible de pasar por
+        # alto si algún día deja de ser cero.
+        f" Resultados incompletos: {run.incomplete_outcomes} fila(s) de"
+        " signal_outcomes con candles_seen < candles_expected (ventana con"
+        " hueco de datos; no se excluyen de los cálculos de abajo)",
         "",
     ]
 
@@ -56,7 +65,25 @@ def _aviso_metodologico(run: BacktestRun) -> list[str]:
         "  se agrupan en un único episodio antes de promediar, para que una",
         "  racha larga en un solo símbolo no domine el resultado. La columna",
         "  N_EP (episodios) es la cifra titular; N_SEÑ se muestra solo como",
-        "  referencia.",
+        "  referencia. El agrupado se hace UNA vez sobre todas las señales",
+        "  del periodo, no por regla: una racha física continua con señales",
+        "  intermedias que una regla concreta excluye (p. ej. un tramo SHORT",
+        "  en medio de un tramo LONG bajo una regla */LONG) sigue siendo un",
+        "  único episodio, no se parte en varios solo porque los IDs que",
+        "  sobreviven al filtro queden más separados entre sí que el hueco",
+        "  configurado.",
+        "- En las reglas /ALL, un episodio puede mezclar señales LONG y",
+        "  SHORT casi simultáneas del mismo símbolo (p. ej. un giro de",
+        "  tendencia). Su valor de episodio es la media aritmética de esas",
+        "  señales YA ajustadas por dirección, que por construcción tienden",
+        "  a cancelarse entre sí -no se excluyen, se promedian tal cual-.",
+        "  La columna MIXTOS_EP cuenta cuántos episodios de cada fila caen",
+        "  en este caso; por diseño siempre es 0 en las reglas /LONG y",
+        "  /SHORT, que nunca mezclan dirección.",
+        "- WIN%_EP es la fracción de EPISODIOS cuya media de P&L salió",
+        "  positiva, no la fracción de señales u operaciones ganadoras: un",
+        "  episodio de 10 señales con nueve pequeñas pérdidas y una gran",
+        "  ganancia cuenta como \"ganador\" si la media sale positiva.",
         "- Combinaciones con menos de "
         f"{run.min_episodes_for_significance} episodios están marcadas",
         "  [MUESTRA INSUFICIENTE]: no son estadísticamente significativas y no",
@@ -85,6 +112,10 @@ def _segmentacion(run: BacktestRun) -> list[str]:
         "  ambos periodos.",
         f" Antes del corte : {s.n_before} señales, {s.episodes_before} episodios",
         f" Desde el corte  : {s.n_after} señales, {s.episodes_after} episodios",
+        " Nota: episodes_before + episodes_after puede superar el total de",
+        "  episodios de la cabecera -un mismo episodio físico que cruza el",
+        "  corte se cuenta una vez en cada lado, porque cada lado se agrupa",
+        "  por separado (ver `segmentation.compute_segmentation`).",
         "",
     ]
 
@@ -94,6 +125,7 @@ _COLS = (
     ("HZ_MIN", 6, "r"),
     ("N_SEÑ", 6, "r"),
     ("N_EP", 5, "r"),
+    ("MIXTOS_EP", 9, "r"),
     ("PNL%_EP_MEDIA", 14, "r"),
     ("PNL%_EP_MED", 12, "r"),
     ("WIN%_EP", 8, "r"),
@@ -134,6 +166,7 @@ def _fila_de_combo(combo: ComboResult, min_episodios: int) -> str:
         str(combo.horizon),
         str(señ.n),
         str(ep.n),
+        str(ep.mixed_direction_episodes),
         _pct(ep.mean_pnl),
         _pct(ep.median_pnl),
         _win(ep.win_rate),

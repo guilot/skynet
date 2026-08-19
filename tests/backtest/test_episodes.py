@@ -14,7 +14,12 @@ def test_36_senales_del_mismo_simbolo_en_cinco_horas_colapsan_en_un_episodio():
     consecutivas, deben colapsar en un único episodio -no 36 observaciones
     independientes-."""
     inicio = 0
-    paso = 5 * 60_000 // 36  # ~8.3 min, reparte 36 señales en 5 horas
+    # 5 horas = 5 * 60 * 60_000 ms. Repartido entre 36 señales da ~8.3 min
+    # de separación entre señales consecutivas -el bug original omitía el
+    # "* 60" de horas a minutos y comprimía las 36 señales en 4.86 MINUTOS
+    # (8.3 SEGUNDOS de paso), muy por debajo del hueco de 30 min y sin
+    # ejercer nunca la frontera que este test dice reproducir.
+    paso = 5 * 60 * 60_000 // 36  # ~8.3 min, reparte 36 señales en 5 horas
     señales = [señal(i, "TUTUSDT", inicio + i * paso) for i in range(36)]
 
     episodios = group_episodes(señales, gap_minutes=30)

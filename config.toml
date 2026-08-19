@@ -82,7 +82,24 @@ min_episodes_for_significance = 30
 # Señales anteriores a este ts (ms) se puntuaron con una penalización de
 # extensión sobre VWAP más débil; no son estrictamente comparables con las
 # posteriores. Ver `scanner_volumen/backtest/segmentation.py`.
-score_change_cutoff_ts = 1787004306142
+#
+# Este valor es la primera señal puntuada con la curva de VWAP endurecida
+# (commit e1937d8), NO el ts de ese commit: el proceso del scanner que
+# corría en ese momento ya tenía la config antigua cargada en memoria, así
+# que el cambio no surtió efecto hasta el siguiente arranque. e1937d8 se
+# hizo a las 2026-08-18 15:23:43 UTC (ts=1787066623000), en medio de un
+# hueco de ~18.5 h sin ninguna señal (id 43 a las 22:05:06 del día
+# anterior, id 44 a las 2026-08-18 16:33:18 UTC): consistente con un
+# reinicio del proceso alrededor del commit. id 44 es la primera señal tras
+# ese hueco, y para id 53 (vwap_distance=11.81%, fuera del tramo 0-10% que
+# es idéntico en ambas curvas) su score_structure coincide exactamente con
+# la curva NUEVA (-4.5186... vs -2.8919... que daría la curva vieja),
+# confirmando que el reinicio ya había ocurrido para entonces. El valor
+# anterior (1787004306142) era el ts de la señal id 43 -la más reciente en
+# el momento en que alguien miró la base de datos, no el momento en que el
+# cambio de curva entró en vigor- y dejaba 17 h de señales ya reprocesadas
+# con la curva nueva marcadas como "antes del corte".
+score_change_cutoff_ts = 1787070798483
 
 [score]
 neutral_multiplier = 0.5

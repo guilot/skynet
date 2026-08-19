@@ -140,7 +140,37 @@ def test_carga_los_umbrales_del_backtest():
     cfg = load_config(CONFIG_PATH)
     assert cfg.backtest.episode_gap_minutes == 30
     assert cfg.backtest.min_episodes_for_significance == 30
-    assert cfg.backtest.score_change_cutoff_ts == 1787004306142
+    # 1787070798483 = ts de la señal id 44, la primera puntuada con la curva
+    # de VWAP endurecida (commit e1937d8); ver el comentario junto al valor
+    # en config.toml para la evidencia completa. El valor antiguo
+    # (1787004306142, ts de la señal id 43) era el ts de la señal más
+    # reciente en el momento en que se miró la base de datos -no el momento
+    # en que el cambio de curva entró en vigor- y quedaba 17 h por delante
+    # del corte real.
+    assert cfg.backtest.score_change_cutoff_ts == 1787070798483
+
+
+def test_falla_si_episode_gap_minutes_no_es_positivo(tmp_path):
+    """Minor: sin esto, `episode_gap_minutes = 0` no fallaba hasta
+    `episodes.group_episodes`, en tiempo de ejecución del backtest y sin
+    contexto sobre qué campo del TOML lo causó."""
+    toml_roto = CONFIG_PATH.read_text().replace(
+        "episode_gap_minutes = 30", "episode_gap_minutes = 0",
+    )
+    destino = tmp_path / "config_roto.toml"
+    destino.write_text(toml_roto)
+    with pytest.raises(ValueError, match="episode_gap_minutes"):
+        load_config(destino)
+
+
+def test_falla_si_min_episodes_for_significance_es_negativo(tmp_path):
+    toml_roto = CONFIG_PATH.read_text().replace(
+        "min_episodes_for_significance = 30", "min_episodes_for_significance = -1",
+    )
+    destino = tmp_path / "config_roto.toml"
+    destino.write_text(toml_roto)
+    with pytest.raises(ValueError, match="min_episodes_for_significance"):
+        load_config(destino)
 
 
 def test_falla_si_falta_una_curva_de_score(tmp_path):
