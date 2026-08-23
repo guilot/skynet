@@ -34,8 +34,14 @@ def desglose(direction):
                           structure=15.0, direction=direction, components={})
 
 
-def insertar_senal(repo, symbol, ts, state, direction, vwap_distance=0.0):
-    return repo.insert(metricas(symbol, ts, vwap_distance), desglose(direction), state)
+def insertar_senal(
+    repo, symbol, ts, state, direction, vwap_distance=0.0,
+    config_fingerprint="c" * 64, code_revision="test-rev",
+):
+    return repo.insert(
+        metricas(symbol, ts, vwap_distance), desglose(direction), state,
+        config_fingerprint=config_fingerprint, code_revision=code_revision,
+    )
 
 
 def insertar_outcome(repo, signal_id, horizon, return_pct, mfe_pct=None, mae_pct=None):
@@ -98,7 +104,7 @@ def test_run_de_extremo_a_extremo_agrega_por_episodio_correctamente(conn):
 
     regla = EntryRule(label="HOT+ / ALL", min_state=State.HOT, direction="ALL")
     resultado = run(
-        repo, horizons=(5,), gap_minutes=30, cutoff_ts=10**15,
+        repo, horizons=(5,), gap_minutes=30, legacy_cutoff_ts=10**15,
         min_episodes_for_significance=30, entry_rules=(regla,),
     )
 
@@ -121,7 +127,7 @@ def test_run_filtra_por_regla_de_entrada(conn):
 
     regla_signal = EntryRule(label="SIGNAL+ / ALL", min_state=State.SIGNAL, direction="ALL")
     resultado = run(
-        repo, horizons=(5,), gap_minutes=30, cutoff_ts=10**15,
+        repo, horizons=(5,), gap_minutes=30, legacy_cutoff_ts=10**15,
         min_episodes_for_significance=30, entry_rules=(regla_signal,),
     )
     combo = resultado.results[0]
@@ -148,7 +154,7 @@ def test_run_no_divide_episodio_por_senales_de_otra_direccion_filtradas(conn):
 
     regla_long = EntryRule(label="HOT+ / LONG", min_state=State.HOT, direction="LONG")
     resultado = run(
-        repo, horizons=(5,), gap_minutes=30, cutoff_ts=10**15,
+        repo, horizons=(5,), gap_minutes=30, legacy_cutoff_ts=10**15,
         min_episodes_for_significance=30, entry_rules=(regla_long,),
     )
 
@@ -161,7 +167,7 @@ def test_run_con_base_vacia_no_lanza(conn):
     repo = SignalRepo(conn)
     regla = EntryRule(label="HOT+ / ALL", min_state=State.HOT, direction="ALL")
     resultado = run(
-        repo, horizons=(5,), gap_minutes=30, cutoff_ts=1000,
+        repo, horizons=(5,), gap_minutes=30, legacy_cutoff_ts=1000,
         min_episodes_for_significance=30, entry_rules=(regla,),
     )
     assert resultado.total_signals == 0

@@ -22,6 +22,7 @@ un hueco silencioso en el histórico.
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import time
@@ -37,9 +38,10 @@ from scanner_volumen.app.outcomes import OutcomeTracker
 from scanner_volumen.bitget.rest import BASE_URL, BitgetRest
 from scanner_volumen.bitget.ws import BitgetWebsocket
 from scanner_volumen.config import load_config
+from scanner_volumen.provenance import get_code_revision
 from scanner_volumen.storage.db import open_db
 from scanner_volumen.storage.repos import (
-    CandleRepo, ProfileRepo, SignalRepo, SupplyRepo,
+    CandleRepo, MaintenanceRepo, ProfileRepo, SignalRepo, SupplyRepo,
 )
 from scanner_volumen.universe.selector import UniverseSelector
 from scanner_volumen.universe.supply import SupplyCache
@@ -130,13 +132,59 @@ async def paso_outcomes(tracker: OutcomeTracker, ahora: int) -> None:
         log.warning("seguimiento de resultados fallido: %s", exc)
 
 
-async def paso_mantenimiento(orq: Orchestrator, ahora: int) -> None:
+# Ms de reintento cuando el mantenimiento está vencido pero no logró hacer
+# trabajo real (ver Orchestrator.run_maintenance: típicamente un arranque
+# en frío en el que el universo todavía se está poblando, `self.profiles`
+# vacío o solo con placeholders). Sin este respiro, `bucle_mantenimiento`
+# reintentaría en cada vuelta sin dormir -un busy-loop- en vez de esperar
+# un tramo razonable a que el bootstrap de fondo avance.
+MANTENIMIENTO_REINTENTO_MS = 60_000
+
+
+async def paso_mantenimiento(
+    orq: Orchestrator, maintenance_repo: MaintenanceRepo, ahora: int, interval_hours: float,
+) -> int:
     """Un paso de `bucle_mantenimiento` (I2 poda + I4 recálculo). Ver
-    `paso_tickers` (I-5)."""
+    `paso_tickers` (I-5) sobre por qué está extraído como función con
+    nombre a nivel de módulo.
+
+    A diferencia de los demás `paso_*`, este no solo ejecuta el trabajo:
+    también decide SI toca ejecutarlo y devuelve cuántos ms debe dormir el
+    llamador antes de volver a invocarlo. Antes, `bucle_mantenimiento`
+    dormía `interval_hours` ANTES de hacer nada; bajo systemd con
+    `Restart=always`, un proceso que se reinicia antes de acumular esas
+    horas seguidas de vida nunca llegaba a correr mantenimiento -medido en
+    real: los perfiles de volumen más viejos llevaban seis días sin
+    recalcularse (el propio denominador del RVOL), y la poda de
+    `candles_1m` nunca corrió-.
+
+    La decisión de "toca o no" se lee de `maintenance_repo`
+    (`MaintenanceRepo`, tabla `maintenance_meta`), que sobrevive a un
+    reinicio del proceso -no de cuánto lleva vivo el proceso actual, que es
+    justo lo que systemd resetea en cada reinicio-. Un mantenimiento que no
+    completó ningún trabajo real (`run_maintenance` devuelve `False`; ver
+    su docstring sobre el no-op de arranque en frío) NO estampa la marca:
+    seguiría vencido, así que este método devuelve
+    `MANTENIMIENTO_REINTENTO_MS` en vez de las `interval_hours` completas,
+    para que el llamador reintente pronto sin caer en un busy-loop.
+    """
+    intervalo_ms = int(interval_hours * 3600_000)
+    ultimo = maintenance_repo.get_last_completed_ms()
+    vencido = ultimo is None or ahora - ultimo >= intervalo_ms
+    if not vencido:
+        return ultimo + intervalo_ms - ahora
+
     try:
-        await orq.run_maintenance(ahora)
+        hizo_trabajo = await orq.run_maintenance(ahora)
     except Exception as exc:  # noqa: BLE001
         log.warning("mantenimiento diario fallido: %s", exc)
+        hizo_trabajo = False
+
+    if hizo_trabajo:
+        maintenance_repo.set_last_completed_ms(ahora)
+        return intervalo_ms
+
+    return MANTENIMIENTO_REINTENTO_MS
 
 
 def marcar_ws_conectado(state, conectado: bool) -> None:
@@ -148,17 +196,55 @@ def marcar_ws_conectado(state, conectado: bool) -> None:
     state.ws_connected = conectado
 
 
-async def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parsea los argumentos de línea de comandos de `python -m scanner_volumen`.
+
+    Función independiente (igual que `marcar_ws_conectado` y los `paso_*` de
+    arriba, I-5) para poder probarla sin arrancar `main()` -que abre
+    conexiones de red- ni el proceso completo.
+
+    `--config` decide qué instancia es esta: separa el proceso de producción
+    (VPS, `config.toml`) del de desarrollo (`config.dev.toml`), cada uno con
+    su propio `db_path`, para que una corrida de prueba no pueda escribir
+    físicamente en la base de datos de producción (ver `config.dev.toml`).
+    El valor por defecto reproduce el comportamiento anterior a este cambio,
+    así que la unidad systemd de producción sigue funcionando sin tocarla.
+    """
+    parser = argparse.ArgumentParser(
+        prog="python -m scanner_volumen",
+        description="Arranca el scanner de momentum de Bitget: sondea tickers, "
+                     "evalúa señales y sirve el dashboard.",
+    )
+    parser.add_argument(
+        "--config", type=Path, default=Path("config.toml"),
+        help="ruta al fichero de configuración (por defecto: ./config.toml). "
+             "Usa config.dev.toml para una instancia de desarrollo separada "
+             "-con su propia base de datos y puerto- de la de producción.",
+    )
+    return parser.parse_args(argv)
+
+
+async def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s"
     )
-    cfg = load_config(Path("config.toml"))
+    cfg = load_config(args.config)
+    # Procedencia (ver provenance.py): se resuelve UNA vez al arrancar, aquí
+    # -no dentro de evaluate()/insert(), que corren en caliente miles de
+    # veces- porque `code_revision` no cambia durante la vida del proceso
+    # (I-6: mismo principio que "ahora" se ancla en el reloj del exchange en
+    # vez de leerlo en cada sitio). Un proceso reiniciado tras un `git pull`
+    # recalcula la revisión en su propio arranque.
+    code_revision = get_code_revision(cwd=Path(__file__).resolve().parent.parent)
+    log.info("code_revision=%s", code_revision)
     conn = open_db(Path(cfg.server.db_path))
 
     candle_repo = CandleRepo(conn)
     profile_repo = ProfileRepo(conn)
     signal_repo = SignalRepo(conn)
     supply_repo = SupplyRepo(conn)
+    maintenance_repo = MaintenanceRepo(conn)
 
     async with httpx.AsyncClient(base_url=BASE_URL, timeout=20.0) as http:
         rest = BitgetRest(cfg.market.venue, cfg.rest.rate_limit_per_second, http)
@@ -167,7 +253,8 @@ async def main() -> None:
         bootstrapper = Bootstrapper(rest, candle_repo, profile_repo, cfg.profile)
         selector = UniverseSelector(cfg.universe)
         orq = Orchestrator(cfg, rest, ws, candle_repo, profile_repo,
-                            signal_repo, supply, bootstrapper)
+                            signal_repo, supply, bootstrapper,
+                            code_revision=code_revision)
         orq.state.stale_after_ms = int(cfg.dashboard.stale_after_seconds * 1000)
         tracker = OutcomeTracker(
             signal_repo, candle_repo, horizons=cfg.outcomes.horizons_minutes
@@ -213,13 +300,28 @@ async def main() -> None:
             """Poda diaria (I2) y recálculo diario del perfil de volumen (I4).
 
             `interval_hours` viene de `config.toml` (`[maintenance]`): todo
-            umbral/cadencia de negocio vive ahí, no hardcodeado aquí.
+            umbral/cadencia de negocio vive ahí, no hardcodeado aquí. El
+            cuerpo de cada paso -incluida la decisión de si toca correr y
+            cuánto dormir- vive en `paso_mantenimiento` (I-5): aquí solo se
+            arma el `while True` que encadena su resultado. A diferencia de
+            los demás bucles, la espera no es una cadencia fija: es
+            exactamente lo que `paso_mantenimiento` calcula que falta hasta
+            el próximo vencimiento (o el respiro de reintento si el último
+            intento fue un no-op), así que un mantenimiento vencido al
+            arrancar corre ya en la primera vuelta en vez de esperar
+            `interval_hours` completas.
             """
             while True:
-                await asyncio.sleep(cfg.maintenance.interval_hours * 3600)
-                await paso_mantenimiento(orq, orq.now_ms(ahora_ms()))
+                ahora = orq.now_ms(ahora_ms())
+                espera_ms = await paso_mantenimiento(
+                    orq, maintenance_repo, ahora, cfg.maintenance.interval_hours
+                )
+                await asyncio.sleep(espera_ms / 1000)
 
-        log.info("dashboard en http://%s:%d", cfg.server.host, cfg.server.port)
+        log.info(
+            "config=%s dashboard en http://%s:%d",
+            args.config, cfg.server.host, cfg.server.port,
+        )
         await asyncio.gather(
             ws.run(
                 orq.handle_ws_event,

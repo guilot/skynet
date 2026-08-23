@@ -20,6 +20,7 @@ from scanner_volumen.engine.candles import CandleBuffer
 from scanner_volumen.engine.metrics import MetricsBuilder
 from scanner_volumen.engine.profile import VolumeProfile, build_profile, placeholder_profile
 from scanner_volumen.models import State, Ticker
+from scanner_volumen.provenance import UNKNOWN_REVISION, config_fingerprint
 from scanner_volumen.scoring.score import score_symbol
 from scanner_volumen.scoring.states import StateMachine, Transition
 from scanner_volumen.storage.repos import CandleRepo, ProfileRepo, SignalRepo
@@ -34,6 +35,7 @@ class Orchestrator:
     def __init__(
         self, cfg: Config, rest, ws, candle_repo: CandleRepo,
         profile_repo: ProfileRepo, signal_repo: SignalRepo, supply, bootstrapper,
+        code_revision: str = UNKNOWN_REVISION,
     ) -> None:
         self.cfg = cfg
         self.rest = rest
@@ -43,6 +45,16 @@ class Orchestrator:
         self.signal_repo = signal_repo
         self.supply = supply
         self.bootstrapper = bootstrapper
+        # Procedencia (ver `provenance.py`): el fingerprint se deriva de
+        # `cfg` una sola vez aquí -es puro y determinista, no cambia durante
+        # la vida del proceso- y se estampa en cada señal persistida más
+        # abajo, en `evaluate`. `code_revision` la calcula el llamador
+        # (`__main__.py`, que sí hace I/O de git a propósito, una sola vez al
+        # arrancar) y se pasa ya resuelta; el valor por defecto
+        # (`UNKNOWN_REVISION`) es solo para no obligar a cada test que
+        # construye un Orchestrator a decidir una revisión que no le importa.
+        self._config_fingerprint = config_fingerprint(cfg)
+        self._code_revision = code_revision
 
         self.state = ScannerState()
         self.dirty: set[str] = set()
@@ -285,7 +297,7 @@ class Orchestrator:
             await self.ws.unsubscribe([symbol])
         return False
 
-    async def _reevaluar_rechazados(self, now_ms: int) -> None:
+    async def _reevaluar_rechazados(self, now_ms: int) -> bool:
         """Única puerta de reingreso para un símbolo rechazado por libro
         fino (I: "la puerta no puede ser permanente").
 
@@ -304,7 +316,17 @@ class Orchestrator:
         minutos, y comprobar cada símbolo rechazado a esa cadencia con
         ~cientos de páginas REST cada uno saturaría la tasa de peticiones
         para nada.
+
+        Devuelve `True` si al menos un símbolo se reevaluó de verdad -el
+        `bootstrap_symbol` terminó, con perfil fresco en mano, sin importar
+        si el resultado fue readmitirlo o dejarlo fuera- y `False` si la
+        lista de rechazados estaba vacía o todos los intentos fallaron por
+        REST (`except` de abajo: un reintento fallido no es un reintento
+        genuino, no aporta nada nuevo que justifique estampar el
+        mantenimiento como completo). Lo usa `run_maintenance` (I1/M3) para
+        que "hizo trabajo real" cuente resultados, no solo candidatos.
         """
+        reevaluo_algo = False
         for symbol in list(self._rejected_thin_book):
             try:
                 perfil = await self.bootstrapper.bootstrap_symbol(symbol, now_ms)
@@ -312,6 +334,7 @@ class Orchestrator:
                 log.warning("reevaluación de rechazo fallida para %s: %s", symbol, exc)
                 continue
 
+            reevaluo_algo = True
             tipico = perfil.typical_volume()
             if tipico is None or tipico < self.cfg.universe.min_profile_median_volume:
                 continue  # sigue fino (o sin datos suficientes): se queda fuera
@@ -326,6 +349,7 @@ class Orchestrator:
                 "%s vuelve al universo activo: volumen típico del perfil %.2f USDT/min",
                 symbol, tipico,
             )
+        return reevaluo_algo
 
     async def ensure_profile(self, symbol: str, now_ms: int) -> VolumeProfile:
         if symbol in self.profiles:
@@ -639,7 +663,10 @@ class Orchestrator:
                     # `_pending_book_validation` en `__init__`.
                     and simbolo not in self._pending_book_validation
                 ):
-                    self.signal_repo.insert(metricas, desglose, transicion.current)
+                    self.signal_repo.insert(
+                        metricas, desglose, transicion.current,
+                        self._config_fingerprint, self._code_revision,
+                    )
 
         return transiciones
 
@@ -888,7 +915,7 @@ class Orchestrator:
 
     # --- mantenimiento diario ---
 
-    async def run_maintenance(self, now_ms: int) -> None:
+    async def run_maintenance(self, now_ms: int) -> bool:
         """Tarea de mantenimiento diaria: poda velas fuera de la ventana
         retenida (I2), recalcula el perfil de volumen de cada símbolo con
         perfil real (I4), y es también el único punto de re-evaluación del
@@ -898,6 +925,61 @@ class Orchestrator:
         expulsado la oportunidad de volver (`_reevaluar_rechazados`, ver su
         docstring sobre por qué la cadencia diaria y no la de 15 min del
         refresco de universo).
+
+        Devuelve `True` si (a) el universo está completamente resuelto -
+        ningún símbolo sigue en `_placeholder_symbols` ni tiene un bootstrap
+        real en `_bootstrap_tasks` todavía en vuelo- Y (b) ese pase hizo
+        trabajo real de verdad: recalculó al menos un perfil real (contando
+        el resultado, no el candidato: ver Finding M3 abajo), o reevaluó de
+        verdad al menos un símbolo ya rechazado por libro fino (ver
+        `_reevaluar_rechazados`). `False` en cualquier otro caso.
+
+        (a) por sí solo no basta (Finding I1): `self.profiles` es el mismo
+        diccionario que `apply_universe` rellena de forma concurrente en el
+        loop principal, así que una foto tomada aquí -después de que la
+        poda de arriba ya cedió el hilo con un `await`- puede caer justo en
+        medio de la resolución del universo. En un VPS lento, el reintento
+        de 60s (`MANTENIMIENTO_REINTENTO_MS`, __main__.py) puede disparar
+        mientras el bootstrap de fondo de la mitad de los símbolos sigue en
+        vuelo: si esta función solo mirara "¿hubo algún candidato?", esos
+        símbolos ya resueltos se recalcularían de verdad (efecto secundario
+        legítimo, no se descarta) pero el mantenimiento se reportaría como
+        completo con el resto del universo todavía apuntando a sus
+        denominadores de RVOL obsoletos durante `interval_hours` enteras -
+        la misma clase de "perfil silenciosamente stale" que este trabajo
+        existe para eliminar, solo que más difícil de detectar. Por eso (a)
+        exige explícitamente que NINGÚN símbolo siga en placeholder o con
+        bootstrap en vuelo, no solo que `self.profiles` no esté vacío.
+
+        (b) por sí solo tampoco basta (Finding M3): antes, el valor de
+        retorno era `bool(candidatos)` -¿hubo algún símbolo candidato a
+        recalcular?-, sin mirar qué pasó realmente con cada uno. Un
+        candidato cuyo `_recalcular_perfil_de_mantenimiento` devolvió
+        `None` (sin velas en la ventana retenida: ver esa función) es un
+        no-op genuino para ese símbolo, y no debe contar. Uno que sí obtuvo
+        un perfil pero `_admite_libro` lo rechazó SÍ cuenta -el rechazo es
+        un resultado real, una reevaluación genuina del libro, no un no-op-
+        igual que readmitir a un símbolo previamente rechazado cuenta
+        aunque el resultado final sea "sigue fuera" (ver
+        `_reevaluar_rechazados`).
+
+        El caso de no-op que motiva ambas partes: en un arranque en frío,
+        `self.profiles` está vacío (o solo tiene placeholders cuyo
+        bootstrap real sigue en vuelo, ver `_placeholder_symbols`) durante
+        los primeros minutos, antes de que el universo termine de
+        poblarse. El llamador (`paso_mantenimiento`, __main__.py) usa este
+        valor para decidir si debe estampar la marca de "último
+        mantenimiento completado" (`MaintenanceRepo`): estamparla en un
+        no-op -sea porque no hubo nada que hacer o porque el universo
+        seguía a medio resolver- empujaría el primer mantenimiento REAL
+        `interval_hours` hacia el futuro, reintroduciendo bajo una forma
+        más difícil de detectar el propio bug de programación que esa
+        persistencia existe para corregir. Cuando esta función devuelve
+        `False` por universo sin resolver, `paso_mantenimiento` reintenta a
+        los `MANTENIMIENTO_REINTENTO_MS` (60s) de siempre -no hay riesgo de
+        busy-loop nuevo aquí, es la misma ruta de reintento que ya cubre el
+        caso de `self.profiles` vacío- y en cuanto el universo se asiente
+        (placeholders y bootstraps agotados) el siguiente pase sí estampa.
 
         Sin poda, `candles_1m` crece sin límite (~216k filas/día a 150
         símbolos, spec §9) y `latest_ts`/`load` se degradan con la tabla.
@@ -931,14 +1013,24 @@ class Orchestrator:
         desde = now_ms - self.cfg.profile.history_days * DIA_MS
         await asyncio.to_thread(self.candle_repo.prune, desde)
 
-        for simbolo in list(self.profiles):
-            if simbolo in self._placeholder_symbols:
-                continue
+        # candidatos: excluye los símbolos aún en placeholder (ver el
+        # comentario de más arriba sobre por qué recalcularlos aquí pisaría
+        # el resultado del bootstrap de fondo). Es una lista de candidatos,
+        # NO de resultados (Finding M3): `trabajo_real` de abajo es quien
+        # cuenta lo que de verdad pasó con cada uno.
+        candidatos = [s for s in list(self.profiles) if s not in self._placeholder_symbols]
+        trabajo_real = False
+        for simbolo in candidatos:
             perfil = await asyncio.to_thread(
                 self._recalcular_perfil_de_mantenimiento, simbolo, desde, now_ms
             )
             if perfil is None:
-                continue
+                continue  # sin velas en la ventana retenida: no-op genuino para este símbolo
+            # llegar aquí con un perfil en mano ya es trabajo real -se
+            # recalculó de verdad-, sin importar si `_admite_libro` lo
+            # acepta o lo rechaza a continuación: el rechazo también es un
+            # resultado genuino (expulsa al símbolo), no un no-op.
+            trabajo_real = True
             # el filtro de libro fino es una propiedad del libro, no un
             # evento de una sola vez en el bootstrap: un símbolo activo
             # cuyo perfil se ha ido secando debe salir aquí igual que uno
@@ -948,7 +1040,17 @@ class Orchestrator:
             self.profiles[simbolo] = perfil
             self.dirty.add(simbolo)
 
-        await self._reevaluar_rechazados(now_ms)
+        if await self._reevaluar_rechazados(now_ms):
+            trabajo_real = True
+
+        # (a) del docstring: ningún símbolo puede seguir en placeholder ni
+        # con un bootstrap real en vuelo -si lo hay, `apply_universe` sigue
+        # a medio resolver el universo concurrentemente y esta pasada no
+        # puede reportarse como completa aunque `trabajo_real` ya sea
+        # `True` para los símbolos que sí aterrizaron (Finding I1).
+        universo_resuelto = not self._placeholder_symbols and not self._bootstrap_tasks
+
+        return universo_resuelto and trabajo_real
 
     def _recalcular_perfil_de_mantenimiento(
         self, symbol: str, desde: int, now_ms: int

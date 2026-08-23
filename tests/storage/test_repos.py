@@ -8,10 +8,12 @@ from scanner_volumen.models import Candle, Direction, State
 from scanner_volumen.scoring.score import ScoreBreakdown
 from scanner_volumen.storage.db import open_db
 from scanner_volumen.storage.repos import (
-    CandleRepo, ProfileRepo, SignalRepo, SupplyRepo,
+    CandleRepo, MaintenanceRepo, ProfileRepo, SignalRepo, SupplyRepo,
 )
 
 MINUTO = 60_000
+FP_PRUEBA = "f" * 64
+REV_PRUEBA = "test-rev"
 
 
 @pytest.fixture
@@ -130,7 +132,7 @@ def desglose():
 
 def test_inserta_una_senal_con_todas_sus_metricas(conn):
     repo = SignalRepo(conn)
-    signal_id = repo.insert(metricas_de_prueba(), desglose(), State.SIGNAL)
+    signal_id = repo.insert(metricas_de_prueba(), desglose(), State.SIGNAL, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
     assert signal_id > 0
 
     filas = repo.recent(since_ms=0)
@@ -169,12 +171,25 @@ def test_inserta_una_senal_con_todas_sus_metricas(conn):
     assert fila["open_interest"] == 1000.0
     assert fila["funding_rate"] == 0.0001
     assert fila["profile_confidence"] == "high"
+    assert fila["config_fingerprint"] == FP_PRUEBA
+    assert fila["code_revision"] == REV_PRUEBA
+
+
+def test_insert_exige_procedencia_explicita_sin_valor_por_defecto(conn):
+    """`config_fingerprint`/`code_revision` no tienen valor por defecto a
+    propósito: sin esto, sería posible grabar una señal sin decidir
+    explícitamente su procedencia, exactamente la laxitud que motivó esta
+    tarea (285 señales de producción sin forma de reconstruir qué las
+    produjo)."""
+    repo = SignalRepo(conn)
+    with pytest.raises(TypeError):
+        repo.insert(metricas_de_prueba(), desglose(), State.SIGNAL)
 
 
 def test_recent_filtra_por_timestamp(conn):
     repo = SignalRepo(conn)
-    repo.insert(metricas_de_prueba(ts=1000), desglose(), State.SIGNAL)
-    repo.insert(metricas_de_prueba(ts=9000), desglose(), State.SIGNAL)
+    repo.insert(metricas_de_prueba(ts=1000), desglose(), State.SIGNAL, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
+    repo.insert(metricas_de_prueba(ts=9000), desglose(), State.SIGNAL, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
     assert len(repo.recent(since_ms=5000)) == 1
 
 
@@ -195,7 +210,8 @@ def test_metricas_nulas_se_guardan_como_null(conn):
             funding_rate=None,
         ),
         desglose(),
-        State.HOT
+        State.HOT,
+        config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA,
     )
     fila = repo.recent(since_ms=0)[0]
     # Se verifica por nombre para detectar si cambia el orden de _CAMPOS
@@ -223,7 +239,7 @@ def test_metricas_nulas_se_guardan_como_null(conn):
 
 def test_pending_outcomes_lista_los_horizontes_vencidos(conn):
     repo = SignalRepo(conn)
-    sid = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL)
+    sid = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
     # a los 6 minutos han vencido los horizontes de 1 y 5 minutos
     pendientes = repo.pending_outcomes(now_ms=6 * MINUTO, horizons=(1, 5, 15, 30, 60))
     horizontes = sorted(h for _, _, _, h, _ in pendientes)
@@ -239,7 +255,7 @@ def test_pending_outcomes_incluye_el_limite_exacto_de_vencimiento(conn):
     así que una implementación con un off-by-one en el filtro de vencimiento
     lo pasaría igualmente si no fuera por este test."""
     repo = SignalRepo(conn)
-    sid = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL)
+    sid = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
     pendientes = repo.pending_outcomes(now_ms=5 * MINUTO, horizons=(1, 5, 15, 30, 60))
     horizontes = sorted(h for _, _, _, h, _ in pendientes)
     assert horizontes == [1, 5]
@@ -259,7 +275,7 @@ def test_pending_outcomes_no_confunde_el_resultado_de_otro_horizonte(conn):
     test `test_un_outcome_guardado_deja_de_estar_pendiente` de casualidad
     (porque ahí solo se guarda un horizonte), pero fallaría aquí."""
     repo = SignalRepo(conn)
-    sid = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL)
+    sid = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
     repo.save_outcome(sid, horizon_min=1, price=7.0, return_pct=4.2,
                       mfe_pct=5.0, mae_pct=-0.5, candles_seen=2, candles_expected=2)
     pendientes = repo.pending_outcomes(now_ms=60 * MINUTO, horizons=(1, 5, 15, 30, 60))
@@ -269,7 +285,7 @@ def test_pending_outcomes_no_confunde_el_resultado_de_otro_horizonte(conn):
 
 def test_un_outcome_guardado_deja_de_estar_pendiente(conn):
     repo = SignalRepo(conn)
-    sid = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL)
+    sid = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
     repo.save_outcome(sid, horizon_min=1, price=7.0, return_pct=4.2,
                       mfe_pct=5.0, mae_pct=-0.5, candles_seen=2, candles_expected=2)
     pendientes = repo.pending_outcomes(now_ms=6 * MINUTO, horizons=(1, 5, 15, 30, 60))
@@ -282,7 +298,7 @@ def test_save_outcome_persiste_la_completitud_de_la_ventana(conn):
     en la lógica que la produjo: si `save_outcome` ignorara estos dos
     argumentos, esta lectura devolvería NULL o los valores de otra fila."""
     repo = SignalRepo(conn)
-    sid = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL)
+    sid = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
     repo.save_outcome(sid, horizon_min=5, price=7.0, return_pct=4.2,
                       mfe_pct=5.0, mae_pct=-0.5, candles_seen=4, candles_expected=6)
     fila = conn.execute(
@@ -295,9 +311,9 @@ def test_save_outcome_persiste_la_completitud_de_la_ventana(conn):
 
 def test_all_signals_devuelve_todo_ordenado_por_simbolo_y_ts(conn):
     repo = SignalRepo(conn)
-    repo.insert(metricas_de_prueba(symbol="BBB", ts=2000), desglose(), State.HOT)
-    repo.insert(metricas_de_prueba(symbol="AAA", ts=1000), desglose(), State.HOT)
-    repo.insert(metricas_de_prueba(symbol="AAA", ts=500), desglose(), State.HOT)
+    repo.insert(metricas_de_prueba(symbol="BBB", ts=2000), desglose(), State.HOT, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
+    repo.insert(metricas_de_prueba(symbol="AAA", ts=1000), desglose(), State.HOT, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
+    repo.insert(metricas_de_prueba(symbol="AAA", ts=500), desglose(), State.HOT, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
     filas = repo.all_signals()
     assert [(f["symbol"], f["ts"]) for f in filas] == [
         ("AAA", 500), ("AAA", 1000), ("BBB", 2000),
@@ -306,8 +322,8 @@ def test_all_signals_devuelve_todo_ordenado_por_simbolo_y_ts(conn):
 
 def test_all_outcomes_devuelve_todos_los_horizontes_de_todas_las_senales(conn):
     repo = SignalRepo(conn)
-    sid1 = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL)
-    sid2 = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL)
+    sid1 = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
+    sid2 = repo.insert(metricas_de_prueba(ts=0), desglose(), State.SIGNAL, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
     repo.save_outcome(sid1, horizon_min=1, price=7.0, return_pct=4.2,
                       mfe_pct=5.0, mae_pct=-0.5, candles_seen=2, candles_expected=2)
     repo.save_outcome(sid2, horizon_min=5, price=7.0, return_pct=-2.0,
@@ -324,3 +340,26 @@ def test_supply_repo_hace_upsert(conn):
     repo.upsert("BTCUSDT", "bitcoin", 19_900_000, 1.3e12, 1.4e12, updated_ms=1000)
     caps = repo.load_all()
     assert caps["BTCUSDT"] == 1.3e12
+
+
+def test_maintenance_repo_sin_mantenimiento_previo_devuelve_none(conn):
+    assert MaintenanceRepo(conn).get_last_completed_ms() is None
+
+
+def test_maintenance_repo_guarda_y_recupera_el_ultimo_completado(conn):
+    repo = MaintenanceRepo(conn)
+    repo.set_last_completed_ms(1_000)
+    assert repo.get_last_completed_ms() == 1_000
+
+
+def test_maintenance_repo_set_hace_upsert_no_inserta_una_fila_por_ciclo(conn):
+    """Tabla de una sola fila (I: `id` fijo a 1 por el CHECK): cada
+    mantenimiento completado debe sobrescribir la marca anterior, no
+    acumular una fila por ciclo -de lo contrario `maintenance_meta` crecería
+    para siempre, exactamente el tipo de fuga que I2 (poda) existe para
+    evitar en `candles_1m`."""
+    repo = MaintenanceRepo(conn)
+    repo.set_last_completed_ms(1_000)
+    repo.set_last_completed_ms(2_000)
+    assert repo.get_last_completed_ms() == 2_000
+    assert conn.execute("SELECT COUNT(*) AS n FROM maintenance_meta").fetchone()["n"] == 1

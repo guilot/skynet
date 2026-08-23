@@ -112,8 +112,10 @@ def test_signals_devuelve_las_senales_guardadas_filtrando_por_since(entorno):
     cliente, repo = entorno
     m_vieja, b_vieja = metrica_y_breakdown("CCCUSDT", 91.0, ts=500)
     m_nueva, b_nueva = metrica_y_breakdown("DDDUSDT", 95.0, ts=2000)
-    repo.insert(m_vieja, b_vieja, State.SIGNAL)
-    repo.insert(m_nueva, b_nueva, State.SIGNAL)
+    repo.insert(m_vieja, b_vieja, State.SIGNAL,
+                config_fingerprint="a" * 64, code_revision="test-rev")
+    repo.insert(m_nueva, b_nueva, State.SIGNAL,
+                config_fingerprint="a" * 64, code_revision="test-rev")
 
     cuerpo = cliente.get("/api/signals?since=1000").json()
 

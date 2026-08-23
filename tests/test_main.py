@@ -19,8 +19,8 @@ from pathlib import Path
 import pytest
 
 from scanner_volumen.__main__ import (
-    ahora_ms, marcar_ws_conectado, paso_evaluador, paso_mantenimiento,
-    paso_outcomes, paso_tickers,
+    MANTENIMIENTO_REINTENTO_MS, ahora_ms, marcar_ws_conectado, parse_args,
+    paso_evaluador, paso_mantenimiento, paso_outcomes, paso_tickers,
 )
 from scanner_volumen.app.orchestrator import Orchestrator
 from scanner_volumen.app.state import ScannerState
@@ -29,7 +29,9 @@ from scanner_volumen.config import load_config
 from scanner_volumen.engine.profile import build_profile
 from scanner_volumen.models import Candle, Contract, Ticker
 from scanner_volumen.storage.db import open_db
-from scanner_volumen.storage.repos import CandleRepo, ProfileRepo, SignalRepo
+from scanner_volumen.storage.repos import (
+    CandleRepo, MaintenanceRepo, ProfileRepo, SignalRepo,
+)
 from scanner_volumen.universe.selector import UniverseSelector
 
 MINUTO = 60_000
@@ -87,6 +89,18 @@ def orq(tmp_path):
     conn.close()
 
 
+@pytest.fixture
+def maintenance_repo(tmp_path):
+    """Conexión propia -no la de `orq`-: `paso_mantenimiento` recibe
+    `maintenance_repo` como colaborador explícito, igual que `orq`, y los
+    tests de este fichero solo necesitan que ambos existan, no que
+    compartan el mismo fichero SQLite (en producción sí comparten `conn`,
+    ver `main()`)."""
+    conn = open_db(tmp_path / "maintenance.db")
+    yield MaintenanceRepo(conn)
+    conn.close()
+
+
 def test_ahora_ms_devuelve_milisegundos_no_decrecientes():
     # único punto donde main.py lee legítimamente el reloj de pared
     # (arranque en frío): solo se comprueba la conversión ns->ms, nunca se
@@ -95,6 +109,36 @@ def test_ahora_ms_devuelve_milisegundos_no_decrecientes():
     b = ahora_ms()
     assert a > 0
     assert b >= a
+
+
+def test_parse_args_usa_config_toml_por_defecto():
+    """Sin `--config`, debe resolver a `config.toml` -el comportamiento
+    hardcodeado anterior a este cambio- para que la unidad systemd de
+    producción, que invoca `python -m scanner_volumen` sin argumentos, siga
+    funcionando sin tocarla."""
+    args = parse_args([])
+    assert args.config == Path("config.toml")
+
+
+def test_parse_args_admite_una_ruta_explicita():
+    """`--config PATH` es lo que hace posible una segunda instancia (dev)
+    apuntando a otra base de datos: dos procesos con `--config` distinto no
+    pueden, por construcción, escribir en el mismo fichero."""
+    args = parse_args(["--config", "config.dev.toml"])
+    assert args.config == Path("config.dev.toml")
+
+
+def test_config_inexistente_falla_con_filenotfounderror_claro(tmp_path):
+    """`parse_args` no valida que la ruta exista -eso lo hace `load_config`
+    al abrir el fichero-, pero el fallo debe ser un `FileNotFoundError` con
+    la ruta en el mensaje, no una excepción oscura varias capas más abajo
+    (p.ej. un KeyError de una sección ausente)."""
+    ruta = tmp_path / "no_existe.toml"
+    args = parse_args(["--config", str(ruta)])
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        load_config(args.config)
+    assert excinfo.value.filename == str(ruta)
 
 
 def test_marcar_ws_conectado_mueve_el_flag_del_estado():
@@ -149,24 +193,105 @@ async def test_paso_outcomes_no_propaga_un_fallo_del_tracker():
     await paso_outcomes(TrackerRoto(), ahora=0)  # no lanza
 
 
-async def test_paso_mantenimiento_delega_en_run_maintenance(orq):
+async def test_paso_mantenimiento_delega_en_run_maintenance(orq, maintenance_repo):
     base = 14 * DIA
     await orq.ensure_profile("AAAUSDT", now_ms=base)
     orq.candle_repo.save_many("AAAUSDT", [vela(base)])
 
-    await paso_mantenimiento(orq, base + DIA)
+    await paso_mantenimiento(
+        orq, maintenance_repo, base + DIA, orq.cfg.maintenance.interval_hours
+    )
 
     # run_maintenance real corrió de verdad: el perfil se recalculó
     assert "AAAUSDT" in orq.dirty
 
 
-async def test_paso_mantenimiento_no_propaga_un_fallo(orq, monkeypatch):
+async def test_paso_mantenimiento_no_propaga_un_fallo(orq, maintenance_repo, monkeypatch):
     async def roto(now_ms):
         raise RuntimeError("disco lleno")
 
     monkeypatch.setattr(orq, "run_maintenance", roto)
 
-    await paso_mantenimiento(orq, ahora=0)  # no lanza
+    # no lanza
+    await paso_mantenimiento(
+        orq, maintenance_repo, ahora=0, interval_hours=orq.cfg.maintenance.interval_hours
+    )
+    assert maintenance_repo.get_last_completed_ms() is None  # el fallo no estampa nada
+
+
+# --- persistencia del "último mantenimiento completado" a través de reinicios ---
+#
+# El bug de producción: `bucle_mantenimiento` dormía `interval_hours` ANTES
+# de correr nada, así que bajo systemd (`Restart=always`) un proceso que se
+# reinicia antes de acumular esas horas seguidas de vida nunca llegaba a
+# correr mantenimiento -medido en real: perfiles de volumen (el propio
+# denominador del RVOL) con seis días sin recalcularse, y la poda de
+# `candles_1m` sin correr nunca. Estos tres tests cubren la decisión de
+# `paso_mantenimiento`, que ahora se basa en `maintenance_repo` (sobrevive
+# al reinicio) en vez de en cuánto lleva vivo el proceso actual.
+
+async def test_paso_mantenimiento_vencido_al_arrancar_corre_de_inmediato(orq, maintenance_repo):
+    """Un `maintenance_repo` vacío (nunca se completó mantenimiento, ni en
+    este proceso ni en uno anterior) debe bastar para que la primera
+    llamada -el "arranque"- lo corra ya, sin esperar `interval_hours`."""
+    base = 14 * DIA
+    await orq.ensure_profile("AAAUSDT", now_ms=base)
+    # sin velas de verdad en candle_repo, `run_maintenance` no tendría nada
+    # que recalcular de verdad (M3: candidato != resultado) y este test
+    # dejaría de ejercitar la ruta "vencido, corre ya y estampa".
+    orq.candle_repo.save_many("AAAUSDT", [vela(base)])
+    assert maintenance_repo.get_last_completed_ms() is None
+
+    espera_ms = await paso_mantenimiento(
+        orq, maintenance_repo, base, orq.cfg.maintenance.interval_hours
+    )
+
+    assert maintenance_repo.get_last_completed_ms() == base  # corrió y quedó estampado
+    assert espera_ms == int(orq.cfg.maintenance.interval_hours * 3600_000)
+
+
+async def test_paso_mantenimiento_no_rerepite_poco_despues_de_completado(orq, maintenance_repo):
+    """Un reinicio 10 minutos después de un mantenimiento exitoso no debe
+    repetirlo: la decisión sobrevive al reinicio porque se lee de
+    `maintenance_repo`, no del tiempo de vida del proceso actual."""
+    base = 14 * DIA
+    maintenance_repo.set_last_completed_ms(base)
+
+    llamado = False
+
+    async def espia(now_ms):
+        nonlocal llamado
+        llamado = True
+        return True
+
+    orq.run_maintenance = espia
+
+    diez_min_despues = base + 10 * MINUTO
+    espera_ms = await paso_mantenimiento(
+        orq, maintenance_repo, diez_min_despues, orq.cfg.maintenance.interval_hours
+    )
+
+    assert llamado is False  # no se re-ejecutó
+    assert maintenance_repo.get_last_completed_ms() == base  # sin cambios
+    intervalo_ms = int(orq.cfg.maintenance.interval_hours * 3600_000)
+    assert espera_ms == base + intervalo_ms - diez_min_despues
+
+
+async def test_paso_mantenimiento_no_op_no_estampa_la_marca(orq, maintenance_repo):
+    """La trampa del no-op: en un arranque en frío, `orq.profiles` está
+    vacío (nada que recalcular todavía, el universo aún no se pobló), así
+    que `run_maintenance` no hace ningún trabajo real. Estampar la marca
+    igualmente empujaría el primer mantenimiento REAL `interval_hours` hacia
+    el futuro -reintroduciendo, en una forma más difícil de detectar, el
+    propio bug de programación que esta persistencia corrige."""
+    assert orq.profiles == {}  # nada cargado todavía: arranque en frío puro
+
+    espera_ms = await paso_mantenimiento(
+        orq, maintenance_repo, 0, orq.cfg.maintenance.interval_hours
+    )
+
+    assert maintenance_repo.get_last_completed_ms() is None  # no se estampó
+    assert espera_ms == MANTENIMIENTO_REINTENTO_MS  # reintenta pronto, no en 24h
 
 
 def contrato(symbol):

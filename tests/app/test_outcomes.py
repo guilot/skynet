@@ -9,6 +9,8 @@ from scanner_volumen.storage.db import open_db
 from scanner_volumen.storage.repos import CandleRepo, SignalRepo
 
 MINUTO = 60_000
+FP_PRUEBA = "e" * 64
+REV_PRUEBA = "test-rev"
 
 
 def vela(ts, close, high=None, low=None):
@@ -67,7 +69,7 @@ def desglose():
 
 def test_rellena_los_horizontes_vencidos(repos):
     signal_repo, candle_repo = repos
-    signal_repo.insert(metricas(ts=0, price=100.0), desglose(), State.SIGNAL)
+    signal_repo.insert(metricas(ts=0, price=100.0), desglose(), State.SIGNAL, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
     candle_repo.save_many("AAAUSDT", [vela(m * MINUTO, 100.0 + m) for m in range(0, 11)])
 
     tracker = OutcomeTracker(signal_repo, candle_repo, horizons=(1, 5, 15))
@@ -79,7 +81,7 @@ def test_rellena_los_horizontes_vencidos(repos):
 
 def test_no_escribe_si_faltan_velas(repos):
     signal_repo, candle_repo = repos
-    signal_repo.insert(metricas(ts=0, price=100.0), desglose(), State.SIGNAL)
+    signal_repo.insert(metricas(ts=0, price=100.0), desglose(), State.SIGNAL, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
     tracker = OutcomeTracker(signal_repo, candle_repo, horizons=(1,))
     assert tracker.run_once(now_ms=6 * MINUTO) == 0
 
@@ -94,7 +96,7 @@ def test_no_escribe_horizonte_con_ventana_incompleta(repos):
     `test_rellena_los_horizontes_vencidos` de casualidad, porque ahí sí hay
     velas hasta el final de cada horizonte vencido."""
     signal_repo, candle_repo = repos
-    signal_repo.insert(metricas(ts=0, price=100.0), desglose(), State.SIGNAL)
+    signal_repo.insert(metricas(ts=0, price=100.0), desglose(), State.SIGNAL, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
     candle_repo.save_many("AAAUSDT", [vela(m * MINUTO, 100.0 + m) for m in range(0, 4)])
 
     tracker = OutcomeTracker(signal_repo, candle_repo, horizons=(5,))
@@ -115,7 +117,7 @@ def test_ts_no_alineado_al_minuto_se_redondea_y_registra_resultado(repos):
     coincide con el ts de ninguna vela y el horizonte no se registra jamás."""
     signal_repo, candle_repo = repos
     ts_señal = 90_123
-    signal_repo.insert(metricas(ts=ts_señal, price=100.0), desglose(), State.SIGNAL)
+    signal_repo.insert(metricas(ts=ts_señal, price=100.0), desglose(), State.SIGNAL, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
     candle_repo.save_many("AAAUSDT", [
         vela(1 * MINUTO, 100.0, high=103.0, low=99.0),
         vela(2 * MINUTO, 104.0, high=108.0, low=101.0),
@@ -140,7 +142,7 @@ def test_no_escribe_si_las_velas_no_llegan_al_limite_con_ts_no_alineado(repos):
     ventanas truncadas debe seguir vigente tras redondear `ts`."""
     signal_repo, candle_repo = repos
     ts_señal = 90_123
-    signal_repo.insert(metricas(ts=ts_señal, price=100.0), desglose(), State.SIGNAL)
+    signal_repo.insert(metricas(ts=ts_señal, price=100.0), desglose(), State.SIGNAL, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
     candle_repo.save_many("AAAUSDT", [
         vela(1 * MINUTO, 100.0),  # solo llega la vela de entrada (minuto 1)
     ])
@@ -162,7 +164,7 @@ def test_registra_con_hueco_interno_si_los_datos_llegan_mas_alla_del_limite(repo
     velas que sí llegaron, en vez de esperar indefinidamente a una vela
     concreta que quizá nunca llegue."""
     signal_repo, candle_repo = repos
-    signal_repo.insert(metricas(ts=0, price=100.0), desglose(), State.SIGNAL)
+    signal_repo.insert(metricas(ts=0, price=100.0), desglose(), State.SIGNAL, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
     candle_repo.save_many("AAAUSDT", [
         vela(0 * MINUTO, 100.0, high=103.0, low=99.0),
         vela(1 * MINUTO, 104.0, high=108.0, low=101.0),
@@ -194,7 +196,7 @@ def test_guarda_el_resultado_correcto_para_el_horizonte(repos):
     (no solo el conteo) detecta tanto una ventana que se pasa del límite
     como una que excluye la vela de entrada."""
     signal_repo, candle_repo = repos
-    signal_repo.insert(metricas(ts=0, price=100.0), desglose(), State.SIGNAL)
+    signal_repo.insert(metricas(ts=0, price=100.0), desglose(), State.SIGNAL, config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA)
     candle_repo.save_many("AAAUSDT", [
         vela(0 * MINUTO, 100.0, high=103.0, low=99.0),
         vela(1 * MINUTO, 104.0, high=108.0, low=101.0),

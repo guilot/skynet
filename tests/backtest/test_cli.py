@@ -29,6 +29,7 @@ def _construir_base_sintetica(ruta):
         ScoreBreakdown(total=85.0, raw_total=85.0, momentum=35.0, demand=35.0,
                        structure=15.0, direction=Direction.LONG, components={}),
         State.HOT,
+        config_fingerprint="b" * 64, code_revision="test-rev",
     )
     repo.save_outcome(sid, 5, price=10.2, return_pct=2.0, mfe_pct=2.0, mae_pct=0.0,
                       candles_seen=5, candles_expected=5)

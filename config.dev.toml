@@ -1,3 +1,17 @@
+# config.dev.toml
+#
+# Configuración de la instancia de DESARROLLO del scanner. Sus únicas
+# diferencias respecto a config.toml son server.db_path (data/dev.db en vez
+# de data/scanner.db) y server.port (8001 en vez de 8000): todo lo demás
+# -universo, umbrales de score, cadencias- se mantiene idéntico a
+# producción a propósito, para que una corrida de desarrollo se comporte
+# igual que producción y no esconda bugs que solo aparecerían con otros
+# umbrales. Un entorno de iteración más rápida, si hace falta, debe vivir
+# en un fichero aparte -no aquí-.
+#
+# No edites este fichero para que difiera en nada más de config.toml sin
+# actualizar también tests/test_config.py::test_config_dev_solo_difiere_en_db_path_y_puerto,
+# que fija esta invariante.
 [market]
 venue = "USDT-FUTURES"
 
@@ -67,8 +81,8 @@ poll_seconds = 60
 
 [server]
 host = "127.0.0.1"
-port = 8000
-db_path = "data/scanner.db"
+port = 8001
+db_path = "data/dev.db"
 
 [backtest]
 # Umbrales de negocio de la herramienta de backtest (scanner_volumen/backtest).

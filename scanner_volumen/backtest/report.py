@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from scanner_volumen.backtest.runner import BacktestRun, ComboResult
+from scanner_volumen.provenance import PRE_PROVENANCE_SENTINEL
 
 _ANCHO_REGLA = 32
 
@@ -102,22 +103,47 @@ def _aviso_metodologico(run: BacktestRun) -> list[str]:
 
 
 def _segmentacion(run: BacktestRun) -> list[str]:
-    s = run.segmentation
-    return [
-        "SEGMENTACIÓN POR CAMBIO DE SCORING",
+    lineas = [
+        "SEGMENTACIÓN POR PROCEDENCIA (config_fingerprint)",
         "-" * 100,
-        f" Corte: ts < {s.cutoff_ts} ({_fmt_ts(s.cutoff_ts)}) tenía una",
-        "  penalización de extensión sobre VWAP más débil; no es estrictamente",
-        "  comparable con lo posterior. Los resultados de la tabla combinan",
-        "  ambos periodos.",
-        f" Antes del corte : {s.n_before} señales, {s.episodes_before} episodios",
-        f" Desde el corte  : {s.n_after} señales, {s.episodes_after} episodios",
-        " Nota: episodes_before + episodes_after puede superar el total de",
-        "  episodios de la cabecera -un mismo episodio físico que cruza el",
-        "  corte se cuenta una vez en cada lado, porque cada lado se agrupa",
-        "  por separado (ver `segmentation.compute_segmentation`).",
+        " Cada grupo comparte el mismo fingerprint de configuración -curvas",
+        "  de score, umbrales de estado, parámetros de motor/universo/perfil-",
+        "  que produjo esas señales; grupos distintos no son estrictamente",
+        "  comparables entre sí. Los resultados de la tabla de abajo combinan",
+        "  todos los grupos.",
+        f" Filas grabadas antes de que existiera esta columna comparten el",
+        f"  centinela {PRE_PROVENANCE_SENTINEL!r} -no se pueden distinguir por",
+        "  fingerprint entre sí-; si config.toml define un corte legado",
+        "  (backtest.score_change_cutoff_ts), ese grupo se parte además en un",
+        "  antes/después de ese corte, la única frontera de scoring conocida",
+        "  dentro de esas filas.",
         "",
     ]
+    if not run.segmentation:
+        lineas.append(" (sin señales)")
+        lineas.append("")
+        return lineas
+    for g in run.segmentation:
+        lineas.append(
+            f" {g.label}: {g.n_signals} señales, {g.n_episodes} episodios "
+            f"({_fmt_ts(g.ts_min)} .. {_fmt_ts(g.ts_max)})"
+        )
+    if len(run.segmentation) > 1:
+        lineas.append(
+            " Nota: la suma de episodios de todos los grupos puede superar el"
+        )
+        lineas.append(
+            "  total de episodios de la cabecera -un mismo episodio físico"
+        )
+        lineas.append(
+            "  que cruza el límite entre dos grupos se cuenta una vez en cada"
+        )
+        lineas.append(
+            "  lado, porque cada grupo se agrupa por separado (ver"
+        )
+        lineas.append("  `segmentation.compute_segmentation`).")
+    lineas.append("")
+    return lineas
 
 
 _COLS = (

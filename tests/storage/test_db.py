@@ -11,8 +11,30 @@ import sqlite3
 
 import pytest
 
+from scanner_volumen.engine.metrics import SymbolMetrics
+from scanner_volumen.models import Direction, State
+from scanner_volumen.provenance import PRE_PROVENANCE_SENTINEL
+from scanner_volumen.scoring.score import ScoreBreakdown
 from scanner_volumen.storage.db import open_db
-from scanner_volumen.storage.repos import SignalRepo
+from scanner_volumen.storage.repos import MaintenanceRepo, SignalRepo
+
+
+def _metricas_de_prueba(**kwargs):
+    base = dict(
+        symbol="AAAUSDT", price=10.0, ret_1m=0.1, ret_3m=0.1, ret_5m=0.1,
+        ret_15m=0.1, ret_30m=0.1, ret_1h=0.1, ret_24h=0.1,
+        rvol_1m_closed=1.0, rvol_1m_live=1.0, rvol_5m=1.0, rvol_session=1.0,
+        demand_burst=1.0, vwap=10.0, vwap_distance=0.0, z_return=1.0,
+        market_cap=1e8, volume_24h=1e7, open_interest=1.0, funding_rate=0.0,
+        profile_confidence="high", ts=2_000,
+    )
+    base.update(kwargs)
+    return SymbolMetrics(**base)
+
+
+def _desglose_de_prueba():
+    return ScoreBreakdown(total=70.0, raw_total=70.0, momentum=30.0, demand=25.0,
+                          structure=15.0, direction=Direction.LONG, components={})
 
 # Esquema tal y como era antes de I-4: sin candles_seen/candles_expected.
 # Solo las tablas relevantes para este test (signals + signal_outcomes);
@@ -128,6 +150,85 @@ def test_abrir_una_base_del_esquema_viejo_no_rompe_filas_ya_existentes(tmp_path)
         # 0 que se confundiría con "ventana completa de cero velas".
         assert fila["candles_seen"] == -1
         assert fila["candles_expected"] == -1
+    finally:
+        conn.close()
+
+
+def test_migra_signals_viejo_anade_columnas_de_procedencia_con_centinela(tmp_path):
+    """Regresión de la tarea de procedencia: `signals` ganó
+    `config_fingerprint`/`code_revision`, dos columnas NOT NULL, dentro de un
+    `CREATE TABLE IF NOT EXISTS` que es un no-op contra una base ya
+    existente -el mismo problema que motivó I-4, ahora contra la base de
+    producción real con 285 filas (ver config.toml/config.dev.toml y el
+    informe de la tarea): sin una migración real, abrir esa base con el
+    código actual dejaría la tabla `signals` sin esas columnas, y cualquier
+    INSERT posterior (SignalRepo.insert) rompería en tiempo de ejecución."""
+    path = tmp_path / "vieja_sin_procedencia.db"
+    _crear_db_con_esquema_viejo(path)  # crea también la fila id=1
+
+    conn = open_db(path)
+    try:
+        columnas = {f["name"] for f in conn.execute("PRAGMA table_info(signals)")}
+        assert "config_fingerprint" in columnas
+        assert "code_revision" in columnas
+
+        # la fila migrada (procedencia desconocida, grabada antes de que
+        # existiera esta columna) lleva el centinela, no NULL ni "" ni un
+        # valor que pudiera confundirse con un fingerprint real.
+        fila_migrada = conn.execute(
+            "SELECT config_fingerprint, code_revision FROM signals WHERE id = 1"
+        ).fetchone()
+        assert fila_migrada["config_fingerprint"] == PRE_PROVENANCE_SENTINEL
+        assert fila_migrada["code_revision"] == PRE_PROVENANCE_SENTINEL
+
+        # y la base migrada sigue siendo utilizable: una señal nueva, grabada
+        # por el código actual, SÍ lleva procedencia real y es distinguible
+        # de la migrada.
+        repo = SignalRepo(conn)
+        sid = repo.insert(
+            _metricas_de_prueba(), _desglose_de_prueba(), State.SIGNAL,
+            config_fingerprint="f" * 64, code_revision="abc1234",
+        )
+        fila_nueva = conn.execute(
+            "SELECT config_fingerprint, code_revision FROM signals WHERE id = ?", (sid,)
+        ).fetchone()
+        assert fila_nueva["config_fingerprint"] == "f" * 64
+        assert fila_nueva["code_revision"] == "abc1234"
+    finally:
+        conn.close()
+
+
+def test_abrir_una_base_del_esquema_viejo_crea_maintenance_meta_vacia(tmp_path):
+    """Regresión de la tarea de mantenimiento vencido: `maintenance_meta` es
+    una tabla enteramente nueva (nunca existió en ninguna versión previa del
+    esquema, ni siquiera la de I-4/procedencia), así que -a diferencia de
+    `signal_outcomes`/`signals`, que ganaron columnas dentro de un `CREATE
+    TABLE IF NOT EXISTS`- no hace falta ninguna migración explícita: el
+    propio `CREATE TABLE IF NOT EXISTS` la crea la primera vez que se abre
+    una base vieja con el código actual, sin tocar ninguna tabla ya
+    existente. Esto es justo lo que hace que sea seguro por construcción
+    contra la base de producción real, a la que no hay acceso."""
+    path = tmp_path / "vieja_sin_maintenance_meta.db"
+    _crear_db_con_esquema_viejo(path)  # esquema previo a esta tarea: ni rastro de maintenance_meta
+
+    conn = open_db(path)
+    try:
+        tablas = {
+            f["name"] for f in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert "maintenance_meta" in tablas
+        # la fila de `signals` que ya existía en la base vieja sobrevive
+        # intacta: abrir con el esquema nuevo no debe tocar datos ajenos a
+        # la tabla nueva.
+        fila_vieja = conn.execute("SELECT symbol FROM signals WHERE id = 1").fetchone()
+        assert fila_vieja["symbol"] == "AAAUSDT"
+
+        repo = MaintenanceRepo(conn)
+        assert repo.get_last_completed_ms() is None  # nunca corrió mantenimiento en esta base
+        repo.set_last_completed_ms(12_345)
+        assert repo.get_last_completed_ms() == 12_345
     finally:
         conn.close()
 

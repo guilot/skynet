@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from scanner_volumen.backtest.entry_rules import EntryRule, default_entry_rules
 from scanner_volumen.backtest.episodes import group_episodes
-from scanner_volumen.backtest.segmentation import SegmentSplit, compute_segmentation
+from scanner_volumen.backtest.segmentation import ProvenanceGroup, compute_segmentation
 from scanner_volumen.backtest.stats import HorizonStats, compute_combo_stats
 from scanner_volumen.storage.repos import SignalRepo
 
@@ -86,7 +86,7 @@ class BacktestRun:
     """Resultado completo listo para formatear (ver `report.py`)."""
 
     results: list[ComboResult]
-    segmentation: SegmentSplit
+    segmentation: tuple[ProvenanceGroup, ...]
     total_signals: int
     total_episodes: int
     ts_min: int | None
@@ -100,14 +100,19 @@ def run(
     signal_repo: SignalRepo,
     horizons: tuple[int, ...],
     gap_minutes: float,
-    cutoff_ts: int,
     min_episodes_for_significance: int,
     entry_rules: tuple[EntryRule, ...] | None = None,
+    legacy_cutoff_ts: int | None = None,
 ) -> BacktestRun:
+    """`legacy_cutoff_ts` (antes `cutoff_ts`, obligatorio) es ahora opcional
+    y solo se usa como fallback DENTRO del grupo centinela de señales
+    grabadas antes de que existiera `config_fingerprint` (ver
+    `backtest/segmentation.py`); las señales con fingerprint real ya se
+    segmentan solas, sin necesitarlo."""
     data = load_backtest_data(signal_repo)
     reglas = entry_rules if entry_rules is not None else default_entry_rules()
     resultados = compute_all(data, horizons, reglas, gap_minutes)
-    segmentacion = compute_segmentation(data.signals, cutoff_ts, gap_minutes)
+    segmentacion = compute_segmentation(data.signals, gap_minutes, legacy_cutoff_ts)
     episodios_totales = group_episodes(data.signals, gap_minutes) if data.signals else []
     return BacktestRun(
         results=resultados,

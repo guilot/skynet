@@ -1,3 +1,4 @@
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,28 @@ from scanner_volumen.config import CURVAS_ESPERADAS, load_config
 # Anclado a la ubicación del propio fichero, no al cwd: sin esto la suite
 # solo pasa si pytest se lanza desde la raíz del repo.
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.toml"
+CONFIG_DEV_PATH = CONFIG_PATH.parent / "config.dev.toml"
+
+
+def _diferencias_planas(a: dict, b: dict, prefijo: str = "") -> dict[str, tuple]:
+    """Compara dos TOML ya parseados (posiblemente anidados, p.ej.
+    `[score.curves]`) y devuelve, en formato plano `"seccion.clave"`, solo
+    las entradas cuyo valor difiere. Falla de inmediato si un dict tiene
+    claves que el otro no tiene -dev y producción deben tener exactamente
+    las mismas secciones y campos, nunca uno de más o de menos."""
+    claves_a, claves_b = set(a), set(b)
+    assert claves_a == claves_b, (
+        f"claves distintas en {prefijo or '<raíz>'!r}: {claves_a ^ claves_b}"
+    )
+    diffs: dict[str, tuple] = {}
+    for clave in claves_a:
+        valor_a, valor_b = a[clave], b[clave]
+        ruta = f"{prefijo}{clave}"
+        if isinstance(valor_a, dict) and isinstance(valor_b, dict):
+            diffs.update(_diferencias_planas(valor_a, valor_b, prefijo=f"{ruta}."))
+        elif valor_a != valor_b:
+            diffs[ruta] = (valor_a, valor_b)
+    return diffs
 
 
 def test_carga_valores_del_toml():
@@ -186,3 +209,26 @@ def test_falla_si_falta_una_curva_de_score(tmp_path):
     destino.write_text(toml_incompleto)
     with pytest.raises(ValueError, match="demand_burst"):
         load_config(destino)
+
+
+def test_config_dev_solo_difiere_de_produccion_en_db_path_y_puerto():
+    """Guarda la invariante que hace que dev *represente* producción: la
+    contaminación real que motivó esta separación de entornos (285 señales
+    en la base de producción, 227 de ellas de corridas de desarrollo
+    copiadas encima) fue posible porque no había ninguna frontera física
+    entre ambos entornos. `config.dev.toml` debe ser idéntico a
+    `config.toml` salvo `server.db_path` y `server.port` -si alguien cambia
+    un umbral de negocio (universo, curvas de score, cadencias...) en un
+    solo fichero, dev deja de representar producción y este test debe
+    fallar antes de que ese drift llegue a esconder un bug."""
+    with CONFIG_PATH.open("rb") as fh:
+        produccion = tomllib.load(fh)
+    with CONFIG_DEV_PATH.open("rb") as fh:
+        dev = tomllib.load(fh)
+
+    diferencias = _diferencias_planas(produccion, dev)
+
+    assert diferencias == {
+        "server.db_path": ("data/scanner.db", "data/dev.db"),
+        "server.port": (8000, 8001),
+    }

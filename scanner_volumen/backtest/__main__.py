@@ -53,8 +53,10 @@ def main(argv: list[str] | None = None) -> None:
             signal_repo,
             horizons=cfg.outcomes.horizons_minutes,
             gap_minutes=cfg.backtest.episode_gap_minutes,
-            cutoff_ts=cfg.backtest.score_change_cutoff_ts,
             min_episodes_for_significance=cfg.backtest.min_episodes_for_significance,
+            # fallback legado: solo parte el grupo centinela de señales sin
+            # config_fingerprint real (ver backtest/segmentation.py).
+            legacy_cutoff_ts=cfg.backtest.score_change_cutoff_ts,
         )
     finally:
         conn.close()
