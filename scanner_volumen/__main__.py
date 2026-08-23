@@ -38,6 +38,7 @@ from scanner_volumen.app.outcomes import OutcomeTracker
 from scanner_volumen.bitget.rest import BASE_URL, BitgetRest
 from scanner_volumen.bitget.ws import BitgetWebsocket
 from scanner_volumen.config import load_config
+from scanner_volumen.provenance import get_code_revision
 from scanner_volumen.storage.db import open_db
 from scanner_volumen.storage.repos import (
     CandleRepo, ProfileRepo, SignalRepo, SupplyRepo,
@@ -183,6 +184,14 @@ async def main(argv: list[str] | None = None) -> None:
         level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s"
     )
     cfg = load_config(args.config)
+    # Procedencia (ver provenance.py): se resuelve UNA vez al arrancar, aquí
+    # -no dentro de evaluate()/insert(), que corren en caliente miles de
+    # veces- porque `code_revision` no cambia durante la vida del proceso
+    # (I-6: mismo principio que "ahora" se ancla en el reloj del exchange en
+    # vez de leerlo en cada sitio). Un proceso reiniciado tras un `git pull`
+    # recalcula la revisión en su propio arranque.
+    code_revision = get_code_revision(cwd=Path(__file__).resolve().parent.parent)
+    log.info("code_revision=%s", code_revision)
     conn = open_db(Path(cfg.server.db_path))
 
     candle_repo = CandleRepo(conn)
@@ -197,7 +206,8 @@ async def main(argv: list[str] | None = None) -> None:
         bootstrapper = Bootstrapper(rest, candle_repo, profile_repo, cfg.profile)
         selector = UniverseSelector(cfg.universe)
         orq = Orchestrator(cfg, rest, ws, candle_repo, profile_repo,
-                            signal_repo, supply, bootstrapper)
+                            signal_repo, supply, bootstrapper,
+                            code_revision=code_revision)
         orq.state.stale_after_ms = int(cfg.dashboard.stale_after_seconds * 1000)
         tracker = OutcomeTracker(
             signal_repo, candle_repo, horizons=cfg.outcomes.horizons_minutes

@@ -93,6 +93,17 @@ episode_gap_minutes = 30
 # Por debajo de este número de episodios, todo resultado se marca como no
 # significativo y la herramienta nunca emite una recomendación (requisito 3).
 min_episodes_for_significance = 30
+# LEGADO desde la tarea de procedencia (config_fingerprint/code_revision,
+# ver scanner_volumen/provenance.py): la segmentación del backtest ya no
+# depende de este valor para separar el histórico -eso lo hace
+# automáticamente el fingerprint que cada señal lleva estampado desde que
+# existen esas columnas-. Sigue existiendo únicamente como fallback DENTRO
+# del grupo de señales grabadas ANTES de que esas columnas existieran (el
+# centinela "pre-provenance"), que no se pueden distinguir entre sí por
+# fingerprint pero si contienen esta frontera, identificada a mano. Nunca se
+# usa para señales con un fingerprint real: no hace falta actualizarlo en
+# futuros cambios de scoring.
+#
 # Señales anteriores a este ts (ms) se puntuaron con una penalización de
 # extensión sobre VWAP más débil; no son estrictamente comparables con las
 # posteriores. Ver `scanner_volumen/backtest/segmentation.py`.

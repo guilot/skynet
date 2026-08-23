@@ -3,7 +3,9 @@ from datetime import datetime, timezone
 from scanner_volumen.backtest.entry_rules import EntryRule
 from scanner_volumen.backtest.report import format_report
 from scanner_volumen.backtest.runner import BacktestRun, ComboResult
-from scanner_volumen.backtest.segmentation import SegmentSplit
+from scanner_volumen.backtest.segmentation import (
+    LEGACY_ANTES_DEL_CORTE, LEGACY_DESDE_EL_CORTE, ProvenanceGroup,
+)
 from scanner_volumen.backtest.stats import HorizonStats
 from scanner_volumen.models import State
 
@@ -19,13 +21,11 @@ def _stats(n, mean_pnl=1.0, mixed_direction_episodes=0):
                          mixed_direction_episodes=mixed_direction_episodes)
 
 
-def _run(results, segmentation=None, total_signals=0, total_episodes=0,
+def _run(results, segmentation=(), total_signals=0, total_episodes=0,
          min_episodes_for_significance=30, incomplete_outcomes=0):
     return BacktestRun(
         results=results,
-        segmentation=segmentation or SegmentSplit(
-            cutoff_ts=1000, n_before=0, n_after=0, episodes_before=0, episodes_after=0,
-        ),
+        segmentation=segmentation,
         total_signals=total_signals, total_episodes=total_episodes,
         ts_min=0, ts_max=1000, gap_minutes=30,
         min_episodes_for_significance=min_episodes_for_significance,
@@ -74,11 +74,15 @@ def test_incluye_grupo_vacio_sin_lanzar_y_lo_marca_como_sin_datos():
 
 
 def test_incluye_la_seccion_de_segmentacion_con_los_conteos():
-    split = SegmentSplit(cutoff_ts=1_787_004_306_142, n_before=5, n_after=38,
-                          episodes_before=2, episodes_after=6)
-    texto = format_report(_run([], segmentation=split))
+    grupos = (
+        ProvenanceGroup(label=LEGACY_ANTES_DEL_CORTE, n_signals=5, n_episodes=2,
+                         ts_min=1_787_004_306_142, ts_max=1_787_004_306_142),
+        ProvenanceGroup(label=LEGACY_DESDE_EL_CORTE, n_signals=38, n_episodes=6,
+                         ts_min=1_787_070_798_483, ts_max=1_787_070_798_999),
+    )
+    texto = format_report(_run([], segmentation=grupos))
     assert "5" in texto and "38" in texto
-    assert "1787004306142" in texto or "2026" in texto  # el corte se muestra de algún modo
+    assert "2026" in texto  # el ts de cada grupo se muestra formateado como fecha
 
 
 def test_cabecera_resume_senales_y_episodios_totales():
@@ -135,8 +139,12 @@ def test_cabecera_muestra_cero_resultados_incompletos_de_forma_explicita():
 # --- Minor: la segmentación puede sumar por encima del total -----------
 
 def test_segmentacion_documenta_que_puede_sumar_por_encima_del_total():
-    split = SegmentSplit(cutoff_ts=1000, n_before=5, n_after=38,
-                          episodes_before=8, episodes_after=8)
-    texto = format_report(_run([], segmentation=split, total_episodes=15))
+    grupos = (
+        ProvenanceGroup(label=LEGACY_ANTES_DEL_CORTE, n_signals=5, n_episodes=8,
+                         ts_min=0, ts_max=999),
+        ProvenanceGroup(label=LEGACY_DESDE_EL_CORTE, n_signals=38, n_episodes=8,
+                         ts_min=1000, ts_max=2000),
+    )
+    texto = format_report(_run([], segmentation=grupos, total_episodes=15))
     minuscula = texto.lower()
     assert "cruza el" in minuscula or "cruzar" in minuscula or "cada lado" in minuscula

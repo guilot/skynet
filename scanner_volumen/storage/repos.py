@@ -128,17 +128,25 @@ class SignalRepo:
         "ret_1m", "ret_3m", "ret_5m", "ret_15m", "ret_30m", "ret_1h", "ret_24h",
         "vwap", "vwap_distance", "z_return", "market_cap", "volume_24h",
         "open_interest", "funding_rate", "profile_confidence",
+        "config_fingerprint", "code_revision",
     )
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
     def insert(
-        self, metrics: SymbolMetrics, breakdown: ScoreBreakdown, state: State
+        self, metrics: SymbolMetrics, breakdown: ScoreBreakdown, state: State,
+        config_fingerprint: str, code_revision: str,
     ) -> int:
         """Guarda la foto completa de métricas en el instante de la señal.
         Cualquier métrica en None se persiste como NULL (nunca como 0), para
-        no confundir "no se pudo calcular" con "el valor fue cero"."""
+        no confundir "no se pudo calcular" con "el valor fue cero".
+
+        `config_fingerprint`/`code_revision` (procedencia, ver
+        `scanner_volumen/provenance.py`) son obligatorios -sin valor por
+        defecto- a propósito: la ausencia de un default hace imposible
+        grabar una señal sin decidir explícitamente qué procedencia lleva,
+        que es justo la disciplina que faltaba y que motivó esta tarea."""
         valores = (
             metrics.ts, metrics.symbol, breakdown.direction.value, state.value,
             breakdown.total, breakdown.momentum, breakdown.demand,
@@ -150,6 +158,7 @@ class SignalRepo:
             metrics.vwap, metrics.vwap_distance, metrics.z_return,
             metrics.market_cap, metrics.volume_24h, metrics.open_interest,
             metrics.funding_rate, metrics.profile_confidence,
+            config_fingerprint, code_revision,
         )
         marcadores = ", ".join("?" * len(self._CAMPOS))
         cur = self._conn.execute(

@@ -20,6 +20,7 @@ from scanner_volumen.engine.candles import CandleBuffer
 from scanner_volumen.engine.metrics import MetricsBuilder
 from scanner_volumen.engine.profile import VolumeProfile, build_profile, placeholder_profile
 from scanner_volumen.models import State, Ticker
+from scanner_volumen.provenance import UNKNOWN_REVISION, config_fingerprint
 from scanner_volumen.scoring.score import score_symbol
 from scanner_volumen.scoring.states import StateMachine, Transition
 from scanner_volumen.storage.repos import CandleRepo, ProfileRepo, SignalRepo
@@ -34,6 +35,7 @@ class Orchestrator:
     def __init__(
         self, cfg: Config, rest, ws, candle_repo: CandleRepo,
         profile_repo: ProfileRepo, signal_repo: SignalRepo, supply, bootstrapper,
+        code_revision: str = UNKNOWN_REVISION,
     ) -> None:
         self.cfg = cfg
         self.rest = rest
@@ -43,6 +45,16 @@ class Orchestrator:
         self.signal_repo = signal_repo
         self.supply = supply
         self.bootstrapper = bootstrapper
+        # Procedencia (ver `provenance.py`): el fingerprint se deriva de
+        # `cfg` una sola vez aquí -es puro y determinista, no cambia durante
+        # la vida del proceso- y se estampa en cada señal persistida más
+        # abajo, en `evaluate`. `code_revision` la calcula el llamador
+        # (`__main__.py`, que sí hace I/O de git a propósito, una sola vez al
+        # arrancar) y se pasa ya resuelta; el valor por defecto
+        # (`UNKNOWN_REVISION`) es solo para no obligar a cada test que
+        # construye un Orchestrator a decidir una revisión que no le importa.
+        self._config_fingerprint = config_fingerprint(cfg)
+        self._code_revision = code_revision
 
         self.state = ScannerState()
         self.dirty: set[str] = set()
@@ -639,7 +651,10 @@ class Orchestrator:
                     # `_pending_book_validation` en `__init__`.
                     and simbolo not in self._pending_book_validation
                 ):
-                    self.signal_repo.insert(metricas, desglose, transicion.current)
+                    self.signal_repo.insert(
+                        metricas, desglose, transicion.current,
+                        self._config_fingerprint, self._code_revision,
+                    )
 
         return transiciones
 
