@@ -903,7 +903,7 @@ class Orchestrator:
 
     # --- mantenimiento diario ---
 
-    async def run_maintenance(self, now_ms: int) -> None:
+    async def run_maintenance(self, now_ms: int) -> bool:
         """Tarea de mantenimiento diaria: poda velas fuera de la ventana
         retenida (I2), recalcula el perfil de volumen de cada símbolo con
         perfil real (I4), y es también el único punto de re-evaluación del
@@ -913,6 +913,20 @@ class Orchestrator:
         expulsado la oportunidad de volver (`_reevaluar_rechazados`, ver su
         docstring sobre por qué la cadencia diaria y no la de 15 min del
         refresco de universo).
+
+        Devuelve `True` si hizo algún trabajo real -recalculó al menos un
+        perfil real, o reevaluó al menos un símbolo ya rechazado por libro
+        fino- y `False` si fue un no-op. El caso de no-op que motiva este
+        valor de retorno: en un arranque en frío, `self.profiles` está
+        vacío (o solo tiene placeholders cuyo bootstrap real sigue en
+        vuelo, ver `_placeholder_symbols`) durante los primeros minutos,
+        antes de que el universo termine de poblarse. El llamador
+        (`paso_mantenimiento`, __main__.py) usa este valor para decidir si
+        debe estampar la marca de "último mantenimiento completado"
+        (`MaintenanceRepo`): estamparla en un no-op empujaría el primer
+        mantenimiento REAL `interval_hours` hacia el futuro, reintroduciendo
+        bajo una forma más difícil de detectar el propio bug de
+        programación que esa persistencia existe para corregir.
 
         Sin poda, `candles_1m` crece sin límite (~216k filas/día a 150
         símbolos, spec §9) y `latest_ts`/`load` se degradan con la tabla.
@@ -946,9 +960,14 @@ class Orchestrator:
         desde = now_ms - self.cfg.profile.history_days * DIA_MS
         await asyncio.to_thread(self.candle_repo.prune, desde)
 
-        for simbolo in list(self.profiles):
-            if simbolo in self._placeholder_symbols:
-                continue
+        # candidatos reales: excluye los símbolos aún en placeholder (ver
+        # el comentario de más arriba sobre por qué recalcularlos aquí
+        # pisaría el resultado del bootstrap de fondo). Si esta lista sale
+        # vacía -arranque en frío puro, `self.profiles` todavía sin nada
+        # real- el bucle de abajo no itera ni una vez: eso es justo la
+        # señal de no-op que el valor de retorno reporta al llamador.
+        candidatos = [s for s in list(self.profiles) if s not in self._placeholder_symbols]
+        for simbolo in candidatos:
             perfil = await asyncio.to_thread(
                 self._recalcular_perfil_de_mantenimiento, simbolo, desde, now_ms
             )
@@ -963,7 +982,10 @@ class Orchestrator:
             self.profiles[simbolo] = perfil
             self.dirty.add(simbolo)
 
+        habia_rechazados = bool(self._rejected_thin_book)
         await self._reevaluar_rechazados(now_ms)
+
+        return bool(candidatos) or habia_rechazados
 
     def _recalcular_perfil_de_mantenimiento(
         self, symbol: str, desde: int, now_ms: int

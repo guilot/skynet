@@ -1177,6 +1177,33 @@ async def test_run_maintenance_recalcula_el_perfil_de_volumen(orq):
     assert "AAAUSDT" in orq.dirty  # el dashboard debe reevaluar con el perfil nuevo
 
 
+async def test_run_maintenance_devuelve_true_si_recalculo_al_menos_un_perfil_real(orq):
+    """El valor de retorno (usado por `paso_mantenimiento`, __main__.py,
+    para decidir si estampar el "último mantenimiento completado") debe ser
+    `True` en cuanto hay al menos un perfil real que recalcular -el caso
+    normal de un proceso ya con universo poblado."""
+    base = 14 * DIA
+    await orq.ensure_profile("AAAUSDT", now_ms=base)
+
+    hizo_trabajo = await orq.run_maintenance(base + DIA)
+
+    assert hizo_trabajo is True
+
+
+async def test_run_maintenance_devuelve_false_si_no_hay_nada_que_recalcular(orq):
+    """La trampa del no-op: en un arranque en frío, `orq.profiles` está
+    vacío -nada real que recalcular, ningún símbolo previamente rechazado
+    que reevaluar-. `run_maintenance` sigue podando velas (I2, un no-op
+    inofensivo aquí porque no hay ninguna) pero no hace ningún trabajo que
+    justifique marcar el mantenimiento como completado."""
+    assert orq.profiles == {}
+    assert orq._rejected_thin_book == set()
+
+    hizo_trabajo = await orq.run_maintenance(14 * DIA)
+
+    assert hizo_trabajo is False
+
+
 async def test_run_maintenance_no_recalcula_placeholders_en_bootstrap(orq):
     """Un símbolo con bootstrap real todavía en vuelo (placeholder) no debe
     recalcularse con lo poco que hubiera en SQLite: pisaría el resultado del

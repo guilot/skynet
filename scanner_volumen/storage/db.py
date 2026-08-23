@@ -93,6 +93,23 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     PRIMARY KEY (signal_id, horizon_min),
     FOREIGN KEY (signal_id) REFERENCES signals(id)
 ) WITHOUT ROWID;
+
+-- Tabla de una sola fila (el CHECK fija `id` a 1): registra en qué ts del
+-- reloj del exchange completó trabajo real la última vez `Orchestrator.
+-- run_maintenance` (poda I2 + recálculo de perfil I4). Ver
+-- `MaintenanceRepo` (storage/repos.py) y `paso_mantenimiento` (__main__.py)
+-- para por qué esto vive en su propia tabla y no se deriva de
+-- `MAX(profile_meta.updated_ms)`: esa columna también la escribe
+-- `Bootstrapper.bootstrap_symbol` en cada alta de universo normal, no solo
+-- el mantenimiento diario, así que su máximo no distinguiría "se
+-- bootstrapeó un símbolo nuevo" de "corrió el ciclo de mantenimiento".
+-- Tabla nueva: un `CREATE TABLE IF NOT EXISTS` no toca ninguna tabla ya
+-- existente, así que no hace falta ninguna migración explícita para que
+-- esto sea seguro contra la base de producción.
+CREATE TABLE IF NOT EXISTS maintenance_meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last_completed_ms INTEGER NOT NULL
+);
 """
 
 

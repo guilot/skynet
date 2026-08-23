@@ -8,7 +8,7 @@ from scanner_volumen.models import Candle, Direction, State
 from scanner_volumen.scoring.score import ScoreBreakdown
 from scanner_volumen.storage.db import open_db
 from scanner_volumen.storage.repos import (
-    CandleRepo, ProfileRepo, SignalRepo, SupplyRepo,
+    CandleRepo, MaintenanceRepo, ProfileRepo, SignalRepo, SupplyRepo,
 )
 
 MINUTO = 60_000
@@ -340,3 +340,26 @@ def test_supply_repo_hace_upsert(conn):
     repo.upsert("BTCUSDT", "bitcoin", 19_900_000, 1.3e12, 1.4e12, updated_ms=1000)
     caps = repo.load_all()
     assert caps["BTCUSDT"] == 1.3e12
+
+
+def test_maintenance_repo_sin_mantenimiento_previo_devuelve_none(conn):
+    assert MaintenanceRepo(conn).get_last_completed_ms() is None
+
+
+def test_maintenance_repo_guarda_y_recupera_el_ultimo_completado(conn):
+    repo = MaintenanceRepo(conn)
+    repo.set_last_completed_ms(1_000)
+    assert repo.get_last_completed_ms() == 1_000
+
+
+def test_maintenance_repo_set_hace_upsert_no_inserta_una_fila_por_ciclo(conn):
+    """Tabla de una sola fila (I: `id` fijo a 1 por el CHECK): cada
+    mantenimiento completado debe sobrescribir la marca anterior, no
+    acumular una fila por ciclo -de lo contrario `maintenance_meta` crecería
+    para siempre, exactamente el tipo de fuga que I2 (poda) existe para
+    evitar en `candles_1m`."""
+    repo = MaintenanceRepo(conn)
+    repo.set_last_completed_ms(1_000)
+    repo.set_last_completed_ms(2_000)
+    assert repo.get_last_completed_ms() == 2_000
+    assert conn.execute("SELECT COUNT(*) AS n FROM maintenance_meta").fetchone()["n"] == 1

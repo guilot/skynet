@@ -16,7 +16,7 @@ from scanner_volumen.models import Direction, State
 from scanner_volumen.provenance import PRE_PROVENANCE_SENTINEL
 from scanner_volumen.scoring.score import ScoreBreakdown
 from scanner_volumen.storage.db import open_db
-from scanner_volumen.storage.repos import SignalRepo
+from scanner_volumen.storage.repos import MaintenanceRepo, SignalRepo
 
 
 def _metricas_de_prueba(**kwargs):
@@ -194,6 +194,41 @@ def test_migra_signals_viejo_anade_columnas_de_procedencia_con_centinela(tmp_pat
         ).fetchone()
         assert fila_nueva["config_fingerprint"] == "f" * 64
         assert fila_nueva["code_revision"] == "abc1234"
+    finally:
+        conn.close()
+
+
+def test_abrir_una_base_del_esquema_viejo_crea_maintenance_meta_vacia(tmp_path):
+    """Regresión de la tarea de mantenimiento vencido: `maintenance_meta` es
+    una tabla enteramente nueva (nunca existió en ninguna versión previa del
+    esquema, ni siquiera la de I-4/procedencia), así que -a diferencia de
+    `signal_outcomes`/`signals`, que ganaron columnas dentro de un `CREATE
+    TABLE IF NOT EXISTS`- no hace falta ninguna migración explícita: el
+    propio `CREATE TABLE IF NOT EXISTS` la crea la primera vez que se abre
+    una base vieja con el código actual, sin tocar ninguna tabla ya
+    existente. Esto es justo lo que hace que sea seguro por construcción
+    contra la base de producción real, a la que no hay acceso."""
+    path = tmp_path / "vieja_sin_maintenance_meta.db"
+    _crear_db_con_esquema_viejo(path)  # esquema previo a esta tarea: ni rastro de maintenance_meta
+
+    conn = open_db(path)
+    try:
+        tablas = {
+            f["name"] for f in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert "maintenance_meta" in tablas
+        # la fila de `signals` que ya existía en la base vieja sobrevive
+        # intacta: abrir con el esquema nuevo no debe tocar datos ajenos a
+        # la tabla nueva.
+        fila_vieja = conn.execute("SELECT symbol FROM signals WHERE id = 1").fetchone()
+        assert fila_vieja["symbol"] == "AAAUSDT"
+
+        repo = MaintenanceRepo(conn)
+        assert repo.get_last_completed_ms() is None  # nunca corrió mantenimiento en esta base
+        repo.set_last_completed_ms(12_345)
+        assert repo.get_last_completed_ms() == 12_345
     finally:
         conn.close()
 

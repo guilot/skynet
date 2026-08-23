@@ -236,6 +236,48 @@ class SignalRepo:
         self._conn.commit()
 
 
+class MaintenanceRepo:
+    """Persiste cuándo completó trabajo real por última vez `Orchestrator.
+    run_maintenance` (poda I2 + recálculo de perfil I4), para que
+    `paso_mantenimiento` (__main__.py) decida si el mantenimiento diario
+    está vencido sin depender de cuánto lleva vivo el proceso actual.
+
+    Bajo systemd con `Restart=always`, un proceso puede reiniciarse antes
+    de acumular `interval_hours` seguidas de vida; sin esta persistencia,
+    `bucle_mantenimiento` dormía la cadencia completa ANTES de correr nada,
+    así que un proceso que se reinicia con esa frecuencia no llegaba a
+    correr mantenimiento nunca -medido en real: los perfiles de volumen
+    más viejos llevaban seis días sin recalcularse-.
+
+    Tabla dedicada de una sola fila (`maintenance_meta`, ver storage/db.py),
+    no `MAX(profile_meta.updated_ms)`: esa columna también la actualiza
+    `Bootstrapper.bootstrap_symbol` en cada alta normal de universo (no solo
+    el mantenimiento diario), así que su máximo confundiría "se bootstrapeó
+    un símbolo nuevo" con "corrió el ciclo de mantenimiento completo"."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def get_last_completed_ms(self) -> int | None:
+        fila = self._conn.execute(
+            "SELECT last_completed_ms FROM maintenance_meta WHERE id = 1"
+        ).fetchone()
+        return fila["last_completed_ms"] if fila is not None else None
+
+    def set_last_completed_ms(self, now_ms: int) -> None:
+        """`now_ms` debe venir siempre del reloj del exchange (nunca de
+        `time.time()`), igual que el resto del motor. El llamador
+        (`paso_mantenimiento`) es responsable de invocar esto solo cuando
+        `run_maintenance` hizo trabajo real -ver su docstring sobre el
+        no-op de arranque en frío-, nunca en cada vencimiento."""
+        self._conn.execute(
+            """INSERT INTO maintenance_meta (id, last_completed_ms) VALUES (1, ?)
+               ON CONFLICT(id) DO UPDATE SET last_completed_ms = excluded.last_completed_ms""",
+            (now_ms,),
+        )
+        self._conn.commit()
+
+
 class SupplyRepo:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn

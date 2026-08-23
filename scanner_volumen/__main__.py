@@ -41,7 +41,7 @@ from scanner_volumen.config import load_config
 from scanner_volumen.provenance import get_code_revision
 from scanner_volumen.storage.db import open_db
 from scanner_volumen.storage.repos import (
-    CandleRepo, ProfileRepo, SignalRepo, SupplyRepo,
+    CandleRepo, MaintenanceRepo, ProfileRepo, SignalRepo, SupplyRepo,
 )
 from scanner_volumen.universe.selector import UniverseSelector
 from scanner_volumen.universe.supply import SupplyCache
@@ -132,13 +132,59 @@ async def paso_outcomes(tracker: OutcomeTracker, ahora: int) -> None:
         log.warning("seguimiento de resultados fallido: %s", exc)
 
 
-async def paso_mantenimiento(orq: Orchestrator, ahora: int) -> None:
+# Ms de reintento cuando el mantenimiento está vencido pero no logró hacer
+# trabajo real (ver Orchestrator.run_maintenance: típicamente un arranque
+# en frío en el que el universo todavía se está poblando, `self.profiles`
+# vacío o solo con placeholders). Sin este respiro, `bucle_mantenimiento`
+# reintentaría en cada vuelta sin dormir -un busy-loop- en vez de esperar
+# un tramo razonable a que el bootstrap de fondo avance.
+MANTENIMIENTO_REINTENTO_MS = 60_000
+
+
+async def paso_mantenimiento(
+    orq: Orchestrator, maintenance_repo: MaintenanceRepo, ahora: int, interval_hours: float,
+) -> int:
     """Un paso de `bucle_mantenimiento` (I2 poda + I4 recálculo). Ver
-    `paso_tickers` (I-5)."""
+    `paso_tickers` (I-5) sobre por qué está extraído como función con
+    nombre a nivel de módulo.
+
+    A diferencia de los demás `paso_*`, este no solo ejecuta el trabajo:
+    también decide SI toca ejecutarlo y devuelve cuántos ms debe dormir el
+    llamador antes de volver a invocarlo. Antes, `bucle_mantenimiento`
+    dormía `interval_hours` ANTES de hacer nada; bajo systemd con
+    `Restart=always`, un proceso que se reinicia antes de acumular esas
+    horas seguidas de vida nunca llegaba a correr mantenimiento -medido en
+    real: los perfiles de volumen más viejos llevaban seis días sin
+    recalcularse (el propio denominador del RVOL), y la poda de
+    `candles_1m` nunca corrió-.
+
+    La decisión de "toca o no" se lee de `maintenance_repo`
+    (`MaintenanceRepo`, tabla `maintenance_meta`), que sobrevive a un
+    reinicio del proceso -no de cuánto lleva vivo el proceso actual, que es
+    justo lo que systemd resetea en cada reinicio-. Un mantenimiento que no
+    completó ningún trabajo real (`run_maintenance` devuelve `False`; ver
+    su docstring sobre el no-op de arranque en frío) NO estampa la marca:
+    seguiría vencido, así que este método devuelve
+    `MANTENIMIENTO_REINTENTO_MS` en vez de las `interval_hours` completas,
+    para que el llamador reintente pronto sin caer en un busy-loop.
+    """
+    intervalo_ms = int(interval_hours * 3600_000)
+    ultimo = maintenance_repo.get_last_completed_ms()
+    vencido = ultimo is None or ahora - ultimo >= intervalo_ms
+    if not vencido:
+        return ultimo + intervalo_ms - ahora
+
     try:
-        await orq.run_maintenance(ahora)
+        hizo_trabajo = await orq.run_maintenance(ahora)
     except Exception as exc:  # noqa: BLE001
         log.warning("mantenimiento diario fallido: %s", exc)
+        hizo_trabajo = False
+
+    if hizo_trabajo:
+        maintenance_repo.set_last_completed_ms(ahora)
+        return intervalo_ms
+
+    return MANTENIMIENTO_REINTENTO_MS
 
 
 def marcar_ws_conectado(state, conectado: bool) -> None:
@@ -198,6 +244,7 @@ async def main(argv: list[str] | None = None) -> None:
     profile_repo = ProfileRepo(conn)
     signal_repo = SignalRepo(conn)
     supply_repo = SupplyRepo(conn)
+    maintenance_repo = MaintenanceRepo(conn)
 
     async with httpx.AsyncClient(base_url=BASE_URL, timeout=20.0) as http:
         rest = BitgetRest(cfg.market.venue, cfg.rest.rate_limit_per_second, http)
@@ -253,11 +300,23 @@ async def main(argv: list[str] | None = None) -> None:
             """Poda diaria (I2) y recálculo diario del perfil de volumen (I4).
 
             `interval_hours` viene de `config.toml` (`[maintenance]`): todo
-            umbral/cadencia de negocio vive ahí, no hardcodeado aquí.
+            umbral/cadencia de negocio vive ahí, no hardcodeado aquí. El
+            cuerpo de cada paso -incluida la decisión de si toca correr y
+            cuánto dormir- vive en `paso_mantenimiento` (I-5): aquí solo se
+            arma el `while True` que encadena su resultado. A diferencia de
+            los demás bucles, la espera no es una cadencia fija: es
+            exactamente lo que `paso_mantenimiento` calcula que falta hasta
+            el próximo vencimiento (o el respiro de reintento si el último
+            intento fue un no-op), así que un mantenimiento vencido al
+            arrancar corre ya en la primera vuelta en vez de esperar
+            `interval_hours` completas.
             """
             while True:
-                await asyncio.sleep(cfg.maintenance.interval_hours * 3600)
-                await paso_mantenimiento(orq, orq.now_ms(ahora_ms()))
+                ahora = orq.now_ms(ahora_ms())
+                espera_ms = await paso_mantenimiento(
+                    orq, maintenance_repo, ahora, cfg.maintenance.interval_hours
+                )
+                await asyncio.sleep(espera_ms / 1000)
 
         log.info(
             "config=%s dashboard en http://%s:%d",
