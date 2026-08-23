@@ -1,0 +1,134 @@
+# config.dev.toml
+#
+# Configuración de la instancia de DESARROLLO del scanner. Sus únicas
+# diferencias respecto a config.toml son server.db_path (data/dev.db en vez
+# de data/scanner.db) y server.port (8001 en vez de 8000): todo lo demás
+# -universo, umbrales de score, cadencias- se mantiene idéntico a
+# producción a propósito, para que una corrida de desarrollo se comporte
+# igual que producción y no esconda bugs que solo aparecerían con otros
+# umbrales. Un entorno de iteración más rápida, si hace falta, debe vivir
+# en un fichero aparte -no aquí-.
+#
+# No edites este fichero para que difiera en nada más de config.toml sin
+# actualizar también tests/test_config.py::test_config_dev_solo_difiere_en_db_path_y_puerto,
+# que fija esta invariante.
+[market]
+venue = "USDT-FUTURES"
+
+[universe]
+# Prefiltro barato: solo acota cuántos símbolos llegan a pedir 14 días de
+# histórico por REST. No decide qué se queda en el universo activo -eso lo
+# hace min_profile_median_volume, una vez existe el perfil (ver
+# UniverseConfig y Orchestrator._admite_libro): medido en real, el volumen
+# 24h no distingue un libro sostenible de dos ráfagas y silencio.
+min_volume_24h = 5_000_000
+# Puerta real: volumen típico de minuto (mediana de las medianas del
+# perfil, VolumeProfile.typical_volume()) por debajo del cual un símbolo
+# sale del universo activo aunque su volumen 24h sea alto. Medido en real:
+# a $2_000/min el universo se reduce a 19 símbolos, el peor con $2_092/min;
+# ningún umbral de volumen 24h logra ese mismo filtrado (incluso a $50M
+# sigue colando un símbolo con mediana de minuto $0).
+min_profile_median_volume = 2_000.0
+max_symbols = 150
+exclude_rwa = true
+refresh_minutes = 15
+exit_grace_minutes = 60
+
+[profile]
+history_days = 14
+smoothing_window_minutes = 7
+min_days_for_confidence = 3
+rolling_fallback_candles = 120
+
+[engine]
+tick_seconds = 1.0
+ticker_poll_seconds = 3.0
+live_rvol_min_elapsed_seconds = 15
+zscore_window_minutes = 60
+zscore_min_samples = 8
+burst_lookback_minutes = 5
+demand_burst_min_denominator = 0.5
+
+[rest]
+rate_limit_per_second = 10
+
+[maintenance]
+interval_hours = 24
+
+[dashboard]
+stale_after_seconds = 30
+
+[states]
+watch = 50
+hot = 65
+signal = 80
+extreme = 90
+exit_margin = 5
+exit_ticks = 3
+cooldown_minutes = 15
+alert_min_state = "SIGNAL"
+
+[orchestrator]
+persisted_min_state = "HOT"
+gap_tolerance_minutes = 3
+
+[supply]
+refresh_hours = 6
+
+[outcomes]
+horizons_minutes = [1, 5, 15, 30, 60]
+poll_seconds = 60
+
+[server]
+host = "127.0.0.1"
+port = 8001
+db_path = "data/dev.db"
+
+[backtest]
+# Umbrales de negocio de la herramienta de backtest (scanner_volumen/backtest).
+# Ventana para colapsar señales consecutivas del mismo símbolo en un único
+# episodio (requisito 2): por debajo de este hueco entre dos señales
+# seguidas se consideran la misma racha, no dos observaciones independientes.
+episode_gap_minutes = 30
+# Por debajo de este número de episodios, todo resultado se marca como no
+# significativo y la herramienta nunca emite una recomendación (requisito 3).
+min_episodes_for_significance = 30
+# Señales anteriores a este ts (ms) se puntuaron con una penalización de
+# extensión sobre VWAP más débil; no son estrictamente comparables con las
+# posteriores. Ver `scanner_volumen/backtest/segmentation.py`.
+#
+# Este valor es la primera señal puntuada con la curva de VWAP endurecida
+# (commit e1937d8), NO el ts de ese commit: el proceso del scanner que
+# corría en ese momento ya tenía la config antigua cargada en memoria, así
+# que el cambio no surtió efecto hasta el siguiente arranque. e1937d8 se
+# hizo a las 2026-08-18 15:23:43 UTC (ts=1787066623000), en medio de un
+# hueco de ~18.5 h sin ninguna señal (id 43 a las 22:05:06 del día
+# anterior, id 44 a las 2026-08-18 16:33:18 UTC): consistente con un
+# reinicio del proceso alrededor del commit. id 44 es la primera señal tras
+# ese hueco, y para id 53 (vwap_distance=11.81%, fuera del tramo 0-10% que
+# es idéntico en ambas curvas) su score_structure coincide exactamente con
+# la curva NUEVA (-4.5186... vs -2.8919... que daría la curva vieja),
+# confirmando que el reinicio ya había ocurrido para entonces. El valor
+# anterior (1787004306142) era el ts de la señal id 43 -la más reciente en
+# el momento en que alguien miró la base de datos, no el momento en que el
+# cambio de curva entró en vigor- y dejaba 17 h de señales ya reprocesadas
+# con la curva nueva marcadas como "antes del corte".
+score_change_cutoff_ts = 1787070798483
+
+[score]
+neutral_multiplier = 0.5
+
+[score.curves]
+ret_1m       = { max_points = 4,  breakpoints = [[0.0, 0], [0.3, 2], [0.8, 4]] }
+ret_3m       = { max_points = 6,  breakpoints = [[0.0, 0], [0.8, 3], [2.0, 6]] }
+ret_5m       = { max_points = 10, breakpoints = [[0.0, 0], [1.5, 5], [3.5, 10]] }
+ret_15m      = { max_points = 8,  breakpoints = [[0.0, 0], [2.5, 4], [5.0, 8]] }
+ret_1h       = { max_points = 6,  breakpoints = [[0.0, 0], [4.0, 3], [8.0, 6]] }
+ret_24h      = { max_points = 6,  breakpoints = [[0.0, 0], [5.0, 3], [12.0, 6]] }
+rvol_1m      = { max_points = 15, breakpoints = [[1.0, 0], [3.0, 7], [5.0, 11], [10.0, 15]] }
+rvol_5m      = { max_points = 10, breakpoints = [[1.0, 0], [2.0, 4], [3.0, 7], [6.0, 10]] }
+rvol_session = { max_points = 5,  breakpoints = [[1.0, 0], [2.0, 3], [4.0, 5]] }
+demand_burst = { max_points = 10, breakpoints = [[1.0, 0], [1.5, 5], [2.5, 10]] }
+z_return     = { max_points = 7,  breakpoints = [[1.0, 0], [2.0, 3], [3.0, 5], [4.5, 7]] }
+market_cap   = { max_points = 5,  breakpoints = [[1_000_000_000, 0], [300_000_000, 2], [80_000_000, 5]] }
+vwap         = { max_points = 8,  breakpoints = [[-20.0, -8], [-2.0, 0], [2.0, 8], [6.0, 8], [10.0, 0], [14.0, -10], [20.0, -25], [35.0, -45]] }

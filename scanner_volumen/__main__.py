@@ -22,6 +22,7 @@ un hueco silencioso en el histórico.
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import time
@@ -148,11 +149,40 @@ def marcar_ws_conectado(state, conectado: bool) -> None:
     state.ws_connected = conectado
 
 
-async def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parsea los argumentos de línea de comandos de `python -m scanner_volumen`.
+
+    Función independiente (igual que `marcar_ws_conectado` y los `paso_*` de
+    arriba, I-5) para poder probarla sin arrancar `main()` -que abre
+    conexiones de red- ni el proceso completo.
+
+    `--config` decide qué instancia es esta: separa el proceso de producción
+    (VPS, `config.toml`) del de desarrollo (`config.dev.toml`), cada uno con
+    su propio `db_path`, para que una corrida de prueba no pueda escribir
+    físicamente en la base de datos de producción (ver `config.dev.toml`).
+    El valor por defecto reproduce el comportamiento anterior a este cambio,
+    así que la unidad systemd de producción sigue funcionando sin tocarla.
+    """
+    parser = argparse.ArgumentParser(
+        prog="python -m scanner_volumen",
+        description="Arranca el scanner de momentum de Bitget: sondea tickers, "
+                     "evalúa señales y sirve el dashboard.",
+    )
+    parser.add_argument(
+        "--config", type=Path, default=Path("config.toml"),
+        help="ruta al fichero de configuración (por defecto: ./config.toml). "
+             "Usa config.dev.toml para una instancia de desarrollo separada "
+             "-con su propia base de datos y puerto- de la de producción.",
+    )
+    return parser.parse_args(argv)
+
+
+async def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s"
     )
-    cfg = load_config(Path("config.toml"))
+    cfg = load_config(args.config)
     conn = open_db(Path(cfg.server.db_path))
 
     candle_repo = CandleRepo(conn)
@@ -219,7 +249,10 @@ async def main() -> None:
                 await asyncio.sleep(cfg.maintenance.interval_hours * 3600)
                 await paso_mantenimiento(orq, orq.now_ms(ahora_ms()))
 
-        log.info("dashboard en http://%s:%d", cfg.server.host, cfg.server.port)
+        log.info(
+            "config=%s dashboard en http://%s:%d",
+            args.config, cfg.server.host, cfg.server.port,
+        )
         await asyncio.gather(
             ws.run(
                 orq.handle_ws_event,

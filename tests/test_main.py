@@ -19,8 +19,8 @@ from pathlib import Path
 import pytest
 
 from scanner_volumen.__main__ import (
-    ahora_ms, marcar_ws_conectado, paso_evaluador, paso_mantenimiento,
-    paso_outcomes, paso_tickers,
+    ahora_ms, marcar_ws_conectado, parse_args, paso_evaluador,
+    paso_mantenimiento, paso_outcomes, paso_tickers,
 )
 from scanner_volumen.app.orchestrator import Orchestrator
 from scanner_volumen.app.state import ScannerState
@@ -95,6 +95,36 @@ def test_ahora_ms_devuelve_milisegundos_no_decrecientes():
     b = ahora_ms()
     assert a > 0
     assert b >= a
+
+
+def test_parse_args_usa_config_toml_por_defecto():
+    """Sin `--config`, debe resolver a `config.toml` -el comportamiento
+    hardcodeado anterior a este cambio- para que la unidad systemd de
+    producción, que invoca `python -m scanner_volumen` sin argumentos, siga
+    funcionando sin tocarla."""
+    args = parse_args([])
+    assert args.config == Path("config.toml")
+
+
+def test_parse_args_admite_una_ruta_explicita():
+    """`--config PATH` es lo que hace posible una segunda instancia (dev)
+    apuntando a otra base de datos: dos procesos con `--config` distinto no
+    pueden, por construcción, escribir en el mismo fichero."""
+    args = parse_args(["--config", "config.dev.toml"])
+    assert args.config == Path("config.dev.toml")
+
+
+def test_config_inexistente_falla_con_filenotfounderror_claro(tmp_path):
+    """`parse_args` no valida que la ruta exista -eso lo hace `load_config`
+    al abrir el fichero-, pero el fallo debe ser un `FileNotFoundError` con
+    la ruta en el mensaje, no una excepción oscura varias capas más abajo
+    (p.ej. un KeyError de una sección ausente)."""
+    ruta = tmp_path / "no_existe.toml"
+    args = parse_args(["--config", str(ruta)])
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        load_config(args.config)
+    assert excinfo.value.filename == str(ruta)
 
 
 def test_marcar_ws_conectado_mueve_el_flag_del_estado():
