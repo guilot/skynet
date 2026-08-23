@@ -1,0 +1,21 @@
+[Unit]
+Description=Bitget momentum scanner (scanner_volumen)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# __USER__ y __APP_DIR__ los sustituye deploy/setup.sh con sed.
+User=__USER__
+WorkingDirectory=__APP_DIR__
+ExecStart=__APP_DIR__/.venv/bin/python -m scanner_volumen
+# El proceso esta disenado para reinicios baratos: al arrancar rellena los
+# huecos de velas y el perfil viene de la BD persistida, asi que Restart=
+# siempre es la politica correcta (crash -> reintento en 5s).
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
