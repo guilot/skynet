@@ -76,6 +76,26 @@ def test_fingerprint_cambia_si_una_curva_de_score_cambia(tmp_path):
     assert original_fp != modificado_fp
 
 
+def test_fingerprint_cambia_si_cambia_el_umbral_de_persistencia(tmp_path):
+    """`persisted_min_state` decide QUÉ FILAS llegan a la tabla (hoy, HOT o
+    más). Si cambiara, las filas de antes y las de después vendrían de
+    poblaciones distintas y cualquier estadística sobre el conjunto tendría
+    sesgo de selección -el backtest calcularía la regla `HOT+` sobre un tramo
+    en el que las filas HOT ni siquiera se guardaban-. La huella responde
+    "¿son comparables estas filas?", así que esto tiene que moverla."""
+    original = CONFIG_PATH.read_text()
+    modificado = original.replace(
+        'persisted_min_state = "HOT"', 'persisted_min_state = "SIGNAL"'
+    )
+    assert modificado != original  # guarda contra un replace que no encontró nada
+    destino = tmp_path / "config_persistencia.toml"
+    destino.write_text(modificado)
+
+    assert config_fingerprint(load_config(CONFIG_PATH)) != config_fingerprint(
+        load_config(destino)
+    )
+
+
 def test_fingerprint_no_cambia_si_solo_cambian_ajustes_operativos(tmp_path):
     """server (host/puerto/db_path), dashboard (stale_after_seconds) y
     maintenance (interval_hours) son ajustes operativos: no gobiernan qué se

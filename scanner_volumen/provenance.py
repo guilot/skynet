@@ -58,7 +58,19 @@ _SUFIJO_ARBOL_SUCIO = "-dirty"
 # config.toml -que solo difieren en server.port/server.db_path, ver
 # tests/test_config.py- crearía una frontera falsa de "cambio de scoring" en
 # cuanto se guardara la primera señal de una corrida de desarrollo.
-_SECCIONES_FINGERPRINT = ("score", "states", "engine", "universe", "profile")
+# `orchestrator` entra porque `persisted_min_state` decide QUE FILAS llegan a
+# la tabla (hoy, HOT o mas). Si ese umbral cambiara, las filas de antes y las
+# de despues vendrian de poblaciones distintas y toda estadistica sobre el
+# conjunto tendria sesgo de seleccion: el backtest calcularia la regla `HOT+`
+# sobre un tramo en el que las filas HOT ni siquiera se guardaban. La huella
+# no responde "cambio el scoring?" sino "son comparables estas filas?", y esto
+# ultimo si las hace incomparables. Arrastra `gap_tolerance_minutes`, que es
+# operativo y podria crear alguna frontera de mas; se acepta porque los dos
+# errores no cuestan igual: una frontera de mas parte los datos de forma
+# visible y recuperable, una de menos los mezcla en silencio.
+_SECCIONES_FINGERPRINT = (
+    "score", "states", "engine", "universe", "profile", "orchestrator",
+)
 
 
 def config_fingerprint(cfg: Config) -> str:
