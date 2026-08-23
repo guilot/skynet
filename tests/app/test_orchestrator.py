@@ -1180,10 +1180,22 @@ async def test_run_maintenance_recalcula_el_perfil_de_volumen(orq):
 async def test_run_maintenance_devuelve_true_si_recalculo_al_menos_un_perfil_real(orq):
     """El valor de retorno (usado por `paso_mantenimiento`, __main__.py,
     para decidir si estampar el "último mantenimiento completado") debe ser
-    `True` en cuanto hay al menos un perfil real que recalcular -el caso
-    normal de un proceso ya con universo poblado."""
+    `True` en cuanto hay al menos un perfil real que se recalcula de
+    verdad -el caso normal de un proceso ya con universo poblado. M3: no
+    basta con que el símbolo sea "candidato" (esté en `orq.profiles`, fuera
+    de placeholder); tiene que haber velas de verdad en `candle_repo` para
+    que `_recalcular_perfil_de_mantenimiento` produzca un resultado real,
+    así que se guardan aquí igual que en `test_run_maintenance_recalcula_
+    el_perfil_de_volumen`."""
     base = 14 * DIA
     await orq.ensure_profile("AAAUSDT", now_ms=base)
+    # vol=3000.0, no el 100.0 por defecto: por debajo de
+    # min_profile_median_volume (config.toml) `_admite_libro` expulsaría a
+    # AAAUSDT del universo -sigue contando como trabajo real (Finding M3),
+    # pero este test solo quiere el caso normal de recálculo aceptado.
+    orq.candle_repo.save_many(
+        "AAAUSDT", [vela(base + m * MINUTO, vol=3000.0) for m in range(1440)]
+    )
 
     hizo_trabajo = await orq.run_maintenance(base + DIA)
 
@@ -1204,10 +1216,60 @@ async def test_run_maintenance_devuelve_false_si_no_hay_nada_que_recalcular(orq)
     assert hizo_trabajo is False
 
 
+async def test_run_maintenance_no_estampa_si_el_universo_esta_solo_parcialmente_resuelto(orq):
+    """Regresión I1: el predicado de "hizo trabajo real" no puede basarse en
+    una foto de `self.profiles` tomada DESPUÉS de que la poda ya esperó
+    (`await`), porque `apply_universe` sigue rellenando ese mismo diccionario
+    en paralelo. En un VPS lento el reintento de 60s puede caer justo en medio
+    de la resolución del universo: si 1 de 2 símbolos ya aterrizó, ese uno se
+    recalcula de verdad (efecto secundario real, `dirty`), pero el otro sigue
+    en placeholder con su bootstrap en vuelo -si `run_maintenance` reportara
+    `True` aquí, `paso_mantenimiento` (`__main__.py`) estamparía el
+    mantenimiento como completo con el RVOL de ese símbolo anclado a un
+    denominador obsoleto durante `interval_hours` enteras."""
+    orq.ws = WsFalso()
+    orq.bootstrapper = BootstrapperLento(orq.cfg.profile)
+    base = 14 * DIA
+
+    # BBBUSDT ya tiene perfil (y velas) reales: se resuelve en caliente,
+    # síncrono, sin pasar por placeholder.
+    velas_bbb = [vela(base + m * MINUTO, vol=5000.0) for m in range(1440)]
+    orq.candle_repo.save_many("BBBUSDT", velas_bbb)
+    orq.profile_repo.save(
+        build_profile("BBBUSDT", velas_bbb, orq.cfg.profile), now_ms=base
+    )
+
+    # AAAUSDT no tiene nada en disco: cae en placeholder + bootstrap de
+    # fondo, que BootstrapperLento nunca resuelve (el test no libera su
+    # evento) -simula el universo todavía "en vuelo".
+    update = UniverseUpdate(
+        symbols=frozenset({"AAAUSDT", "BBBUSDT"}),
+        added=frozenset({"AAAUSDT", "BBBUSDT"}),
+        removed=frozenset(), ordered=["BBBUSDT", "AAAUSDT"],
+    )
+    await orq.apply_universe(update, now_ms=base)
+    assert "AAAUSDT" in orq._placeholder_symbols
+    assert "AAAUSDT" in orq._bootstrap_tasks
+    assert "BBBUSDT" not in orq._placeholder_symbols
+    # un placeholder siempre tiene typical_volume() None (sin slots); un
+    # perfil real -aunque de baja confianza, un solo día- no.
+    assert orq.profiles["BBBUSDT"].typical_volume() is not None
+
+    hizo_trabajo = await orq.run_maintenance(base + DIA)
+
+    # BBBUSDT sí se recalculó de verdad (efecto secundario real)...
+    assert "BBBUSDT" in orq.dirty
+    # ...pero el universo sigue sin resolverse del todo (AAAUSDT en
+    # placeholder/bootstrap): el mantenimiento NO debe reportarse completo.
+    assert hizo_trabajo is False
+
+
 async def test_run_maintenance_no_recalcula_placeholders_en_bootstrap(orq):
     """Un símbolo con bootstrap real todavía en vuelo (placeholder) no debe
     recalcularse con lo poco que hubiera en SQLite: pisaría el resultado del
-    bootstrap de fondo si terminara justo después."""
+    bootstrap de fondo si terminara justo después. M4: además, el único
+    símbolo del universo sigue en placeholder -así que el universo no está
+    resuelto- y `run_maintenance` debe reportarlo como no-op."""
     orq.ws = WsFalso()
     orq.bootstrapper = BootstrapperLento(orq.cfg.profile)
     update = UniverseUpdate(
@@ -1217,9 +1279,10 @@ async def test_run_maintenance_no_recalcula_placeholders_en_bootstrap(orq):
     await orq.apply_universe(update, now_ms=14 * DIA)
     assert "AAAUSDT" in orq._placeholder_symbols
 
-    await orq.run_maintenance(14 * DIA + DIA)
+    hizo_trabajo = await orq.run_maintenance(14 * DIA + DIA)
 
     assert orq.profile_repo.load("AAAUSDT") is None  # no se guardó nada de fondo
+    assert hizo_trabajo is False  # universo sin resolver: solo hay un placeholder en vuelo
 
 
 async def test_run_maintenance_no_bloquea_el_event_loop(orq, monkeypatch):
@@ -1410,13 +1473,20 @@ async def test_un_simbolo_rechazado_vuelve_si_el_mantenimiento_diario_ve_que_su_
     # el libro mejora antes del siguiente mantenimiento diario
     vol_por_simbolo["FINOUSDT"] = 5000.0
 
-    await orq.run_maintenance(14 * DIA + DIA)
+    # M4: en este punto `orq.profiles` está vacío (FINOUSDT sigue rechazado,
+    # sin perfil activo) -el único candidato de la rama normal- así que este
+    # es justo el caso "solo se reevaluó un rechazado" del predicado de
+    # retorno: debe reportarse `True` igual que si hubiera recalculado un
+    # perfil activo.
+    assert orq.profiles == {}
+    hizo_trabajo = await orq.run_maintenance(14 * DIA + DIA)
 
     assert "FINOUSDT" not in orq._rejected_thin_book
     assert orq.profiles["FINOUSDT"].confidence == "high"
     assert "FINOUSDT" in orq.buffers
     assert orq.ws.subscribed[-1] == ["FINOUSDT"]  # re-suscrito
     assert orq.bootstrapper.pedidos.count("FINOUSDT") == 2  # rechazo inicial + reevaluación
+    assert hizo_trabajo is True
 
 
 async def test_run_maintenance_excluye_un_simbolo_activo_cuyo_perfil_se_ha_vuelto_fino(orq):

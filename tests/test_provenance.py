@@ -96,6 +96,25 @@ def test_fingerprint_cambia_si_cambia_el_umbral_de_persistencia(tmp_path):
     )
 
 
+def test_fingerprint_cambia_si_cambia_el_venue_del_mercado(tmp_path):
+    """M1: `market.venue` (spot vs USDT-perp) cambia el universo de
+    instrumentos entero -una incomparabilidad más fuerte que la que ya
+    justificó arrastrar `gap_tolerance_minutes`-, así que debe mover el
+    fingerprint igual que un cambio de curva de score o de umbral de
+    persistencia."""
+    original = CONFIG_PATH.read_text()
+    modificado = original.replace(
+        'venue = "USDT-FUTURES"', 'venue = "SPOT"',
+    )
+    assert modificado != original  # guarda contra un replace que no encontró nada
+    destino = tmp_path / "config_venue.toml"
+    destino.write_text(modificado)
+
+    original_fp = config_fingerprint(load_config(CONFIG_PATH))
+    modificado_fp = config_fingerprint(load_config(destino))
+    assert original_fp != modificado_fp
+
+
 def test_fingerprint_no_cambia_si_solo_cambian_ajustes_operativos(tmp_path):
     """server (host/puerto/db_path), dashboard (stale_after_seconds) y
     maintenance (interval_hours) son ajustes operativos: no gobiernan qué se

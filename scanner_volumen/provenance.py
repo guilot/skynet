@@ -52,12 +52,12 @@ _SUFIJO_ARBOL_SUCIO = "-dirty"
 # smoothing...). Deliberadamente EXCLUYE las secciones puramente operativas:
 # server (host/puerto/db_path), dashboard (stale_after_seconds), maintenance
 # (interval_hours), rest (rate limiting), supply (cadencia de refresco de
-# market cap), outcomes (cadencia del tracker) y orchestrator/backtest
-# (gobiernan cuándo se persiste o cómo se agrupa un episodio, no qué ni cómo
-# se puntúa). Sin esta exclusión, arrancar con config.dev.toml en vez de
-# config.toml -que solo difieren en server.port/server.db_path, ver
-# tests/test_config.py- crearía una frontera falsa de "cambio de scoring" en
-# cuanto se guardara la primera señal de una corrida de desarrollo.
+# market cap), outcomes (cadencia del tracker) y backtest (cómo se agrupa un
+# episodio, no qué ni cómo se puntúa). Sin esta exclusión, arrancar con
+# config.dev.toml en vez de config.toml -que solo difieren en
+# server.port/server.db_path, ver tests/test_config.py- crearía una frontera
+# falsa de "cambio de scoring" en cuanto se guardara la primera señal de una
+# corrida de desarrollo.
 # `orchestrator` entra porque `persisted_min_state` decide QUE FILAS llegan a
 # la tabla (hoy, HOT o mas). Si ese umbral cambiara, las filas de antes y las
 # de despues vendrian de poblaciones distintas y toda estadistica sobre el
@@ -68,15 +68,25 @@ _SUFIJO_ARBOL_SUCIO = "-dirty"
 # operativo y podria crear alguna frontera de mas; se acepta porque los dos
 # errores no cuestan igual: una frontera de mas parte los datos de forma
 # visible y recuperable, una de menos los mezcla en silencio.
+# `market` entra por el mismo criterio de "son comparables estas filas?"
+# (Finding M1): `venue` (spot vs USDT-perp) no ajusta el scoring, cambia el
+# universo de instrumentos entero -precios, volumenes y volatilidad de un
+# perp no son el mismo activo estadistico que los del spot correspondiente-,
+# una incomparabilidad mas fuerte que la que ya justifico arrastrar
+# `gap_tolerance_minutes`. Omitirlo era la inconsistencia: un cambio de venue
+# mezclaria en silencio filas de dos poblaciones distintas bajo el mismo
+# fingerprint, exactamente el error que el modulo dice preferir evitar sobre
+# el de crear una frontera de mas.
 _SECCIONES_FINGERPRINT = (
-    "score", "states", "engine", "universe", "profile", "orchestrator",
+    "market", "score", "states", "engine", "universe", "profile", "orchestrator",
 )
 
 
 def config_fingerprint(cfg: Config) -> str:
     """Hash estable de las secciones de `cfg` que determinan qué se detecta y
-    cómo se puntúa (ver `_SECCIONES_FINGERPRINT` arriba para el porqué de
-    exactamente estas cinco y no las demás).
+    cómo se puntúa, o que de otro modo hacen incomparables dos filas de
+    `signals` (ver `_SECCIONES_FINGERPRINT` arriba para el porqué de
+    exactamente estas siete y no las demás).
 
     Determinista y ajeno al formato del TOML de origen: se calcula sobre los
     valores ya parseados (`dataclasses.asdict`), serializados con

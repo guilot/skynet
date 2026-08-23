@@ -236,6 +236,10 @@ async def test_paso_mantenimiento_vencido_al_arrancar_corre_de_inmediato(orq, ma
     llamada -el "arranque"- lo corra ya, sin esperar `interval_hours`."""
     base = 14 * DIA
     await orq.ensure_profile("AAAUSDT", now_ms=base)
+    # sin velas de verdad en candle_repo, `run_maintenance` no tendría nada
+    # que recalcular de verdad (M3: candidato != resultado) y este test
+    # dejaría de ejercitar la ruta "vencido, corre ya y estampa".
+    orq.candle_repo.save_many("AAAUSDT", [vela(base)])
     assert maintenance_repo.get_last_completed_ms() is None
 
     espera_ms = await paso_mantenimiento(
