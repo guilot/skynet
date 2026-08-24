@@ -34,10 +34,28 @@ class UniverseConfig:
 
 @dataclass(frozen=True)
 class ProfileConfig:
+    """Parámetros del perfil de volumen intradía (ver `engine/profile.py`).
+
+    `stale_after_hours` (Finding "perfil rancio al entrar", medido en real:
+    BTWUSDT reingresó al universo cargando un perfil de disco con 7 días de
+    antigüedad y generó 11 señales con RVOL inflado x1.2 contra un baseline
+    que no reflejaba una semana de volumen más alto) es la edad máxima que
+    tolera `Orchestrator._resolver_perfil` en un perfil recién cargado de
+    disco antes de reconstruirlo desde las velas ya persistidas en
+    `candle_repo`. Sin esto, un símbolo que entra al universo ENTRE dos
+    pasadas de `run_maintenance` (que solo recalcula símbolos YA presentes
+    en `self.profiles`, y corre cada `maintenance.interval_hours`, no cada
+    `universe.refresh_minutes`) podía puntuar hasta 24 h contra un perfil
+    arbitrariamente viejo. Por defecto igual a `maintenance.interval_hours`:
+    un perfil no debería ser más viejo que un ciclo completo de
+    mantenimiento, que es la garantía que ya tienen los símbolos con más
+    tiempo en el universo."""
+
     history_days: int
     smoothing_window_minutes: int
     min_days_for_confidence: int
     rolling_fallback_candles: int
+    stale_after_hours: float
 
 
 @dataclass(frozen=True)

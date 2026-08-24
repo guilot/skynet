@@ -17,7 +17,8 @@ def perfil_plano(volumen=100.0):
     velas = [vela(d * DIA + m * MINUTO, vol=volumen) for d in range(14) for m in range(1440)]
     return build_profile("AAAUSDT", velas,
                          ProfileConfig(history_days=14, smoothing_window_minutes=0,
-                                       min_days_for_confidence=3, rolling_fallback_candles=120))
+                                       min_days_for_confidence=3, rolling_fallback_candles=120,
+                                       stale_after_hours=24.0))
 
 
 def constructor():
@@ -27,7 +28,8 @@ def constructor():
                      zscore_min_samples=8, burst_lookback_minutes=5,
                      demand_burst_min_denominator=0.5),
         ProfileConfig(history_days=14, smoothing_window_minutes=0,
-                      min_days_for_confidence=3, rolling_fallback_candles=120),
+                      min_days_for_confidence=3, rolling_fallback_candles=120,
+                      stale_after_hours=24.0),
     )
 
 
@@ -114,7 +116,8 @@ def test_usa_baseline_rolling_cuando_la_confianza_es_baja():
     perfil_corto = build_profile(
         "AAAUSDT", velas_pocas,
         ProfileConfig(history_days=14, smoothing_window_minutes=0,
-                      min_days_for_confidence=3, rolling_fallback_candles=120),
+                      min_days_for_confidence=3, rolling_fallback_candles=120,
+                      stale_after_hours=24.0),
     )
     assert perfil_corto.confidence == "low"
     assert perfil_corto.baseline(129) == 50.0  # verifica la premisa del test
@@ -166,7 +169,8 @@ def test_rvol_session_es_none_con_confianza_baja_sin_fallback_rolling():
     perfil_corto = build_profile(
         "AAAUSDT", velas_pocas,
         ProfileConfig(history_days=14, smoothing_window_minutes=0,
-                      min_days_for_confidence=3, rolling_fallback_candles=120),
+                      min_days_for_confidence=3, rolling_fallback_candles=120,
+                      stale_after_hours=24.0),
     )
     assert perfil_corto.confidence == "low"
 

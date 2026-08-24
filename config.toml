@@ -25,6 +25,14 @@ history_days = 14
 smoothing_window_minutes = 7
 min_days_for_confidence = 3
 rolling_fallback_candles = 120
+# Edad máxima (horas) que tolera un perfil cargado de disco en
+# Orchestrator._resolver_perfil antes de reconstruirse desde las velas ya
+# persistidas en SQLite (ver ProfileConfig.stale_after_hours, Finding
+# "perfil rancio al entrar" / BTWUSDT). Igual a maintenance.interval_hours a
+# propósito: un perfil no debe ser más viejo que un ciclo completo de
+# mantenimiento, la misma garantía que ya tienen los símbolos que llevan más
+# tiempo en el universo.
+stale_after_hours = 24.0
 
 [engine]
 tick_seconds = 1.0

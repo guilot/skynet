@@ -111,6 +111,25 @@ def test_save_estampa_el_now_ms_real_y_lo_refresca_en_cada_guardado(conn):
     assert fila["updated_ms"] == 2_000  # el ON CONFLICT sí lo actualizó
 
 
+def test_get_updated_ms_devuelve_la_edad_del_perfil_persistido(conn):
+    """`Orchestrator._resolver_perfil` (Finding "perfil rancio al entrar":
+    BTWUSDT reingresó al universo con un perfil de 7 días de antigüedad y
+    generó señales con RVOL inflado x1.2) necesita leer
+    `profile_meta.updated_ms` para decidir si un perfil cargado de disco
+    está demasiado viejo para usarse tal cual. `load` no lo expone -solo
+    `confidence`/`days_covered`-, así que hace falta un método aparte."""
+    repo = ProfileRepo(conn)
+    assert repo.get_updated_ms("AAAUSDT") is None  # sin perfil, sin metadato
+
+    slots = tuple(None for _ in range(1440))
+    perfil = VolumeProfile("AAAUSDT", slots, confidence="low", days_covered=0.0)
+    repo.save(perfil, now_ms=1_000)
+    assert repo.get_updated_ms("AAAUSDT") == 1_000
+
+    repo.save(perfil, now_ms=2_000)
+    assert repo.get_updated_ms("AAAUSDT") == 2_000  # el ON CONFLICT también lo refresca aquí
+
+
 def metricas_de_prueba(**kwargs):
     base = dict(
         symbol="XYZUSDT", price=6.72, ret_1m=0.82, ret_3m=1.91, ret_5m=3.7,

@@ -73,7 +73,8 @@ def repos(tmp_path):
 
 def cfg():
     return ProfileConfig(history_days=2, smoothing_window_minutes=0,
-                         min_days_for_confidence=1, rolling_fallback_candles=120)
+                         min_days_for_confidence=1, rolling_fallback_candles=120,
+                         stale_after_hours=24.0)
 
 
 async def test_bootstrap_descarga_persiste_y_construye_el_perfil(repos):

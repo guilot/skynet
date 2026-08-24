@@ -1,5 +1,6 @@
 # tests/app/test_orchestrator.py
 import asyncio
+import dataclasses
 import logging
 import time
 
@@ -1124,6 +1125,136 @@ async def test_updated_ms_sigue_al_ts_de_la_ultima_vela_no_al_de_evaluate(orq):
     orq.evaluate(now_ms=base + 5 * MINUTO)  # 5 min después, sin ninguna vela nueva
 
     assert orq.state.snapshot("AAAUSDT").updated_ms == base  # sigue anclado a la vela
+
+
+# --- Finding "perfil rancio al entrar": _resolver_perfil no debe usar un
+# perfil de disco sin mirar su edad (ver ProfileConfig.stale_after_hours) ---
+
+async def test_resolver_perfil_reconstruye_un_perfil_mas_viejo_que_el_umbral(orq):
+    """Medido en real: BTWUSDT entró al universo cargando un perfil de disco
+    con 7 días de antigüedad y generó 11 señales con RVOL inflado x1.2
+    contra un baseline que no reflejaba una semana de volumen más alto.
+    `run_maintenance` solo recalcula símbolos YA presentes en `self.profiles`
+    una vez al día; un símbolo que entra al universo ENTRE dos pasadas
+    (refresh_minutes=15 vs interval_hours=24) cargaba lo que hubiera en
+    disco tal cual, sin que nada mirase `profile_meta.updated_ms`. Antes del
+    fix, este test fallaba con `slots[0].median == 100.0` (el perfil rancio
+    tal cual)."""
+    orq.ws = WsFalso()
+    orq.cfg = dataclasses.replace(
+        orq.cfg, profile=dataclasses.replace(orq.cfg.profile, stale_after_hours=6.0)
+    )
+
+    ahora = 30 * DIA
+    desde_ventana = ahora - 14 * DIA  # = 16 * DIA: ventana que relee _reconstruir_perfil_rancio
+
+    # perfil rancio en disco: baja cobertura (3 días) y un volumen distinto
+    # al que hay ahora en candle_repo, para distinguir "se usó tal cual" de
+    # "se reconstruyó de verdad".
+    velas_viejas = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(3) for m in range(1440)]
+    perfil_viejo = build_profile("AAAUSDT", velas_viejas, orq.cfg.profile)
+    orq.profile_repo.save(perfil_viejo, now_ms=desde_ventana - 10 * DIA)  # muy por encima de 6h
+
+    # 14 días completos YA en SQLite (el símbolo ya había estado en el
+    # universo antes), con un patrón de volumen distinto al del perfil viejo.
+    orq.candle_repo.save_many(
+        "AAAUSDT",
+        [vela(desde_ventana + d * DIA + m * MINUTO, vol=9000.0)
+         for d in range(14) for m in range(1440)],
+    )
+
+    update = UniverseUpdate(
+        symbols=frozenset({"AAAUSDT"}), added=frozenset({"AAAUSDT"}),
+        removed=frozenset(), ordered=["AAAUSDT"],
+    )
+    await orq.apply_universe(update, now_ms=ahora)
+
+    perfil_resultante = orq.profiles["AAAUSDT"]
+    assert perfil_resultante.confidence == "high"
+    assert perfil_resultante.slots[0].median == pytest.approx(9000.0)  # refleja las velas nuevas
+    assert orq.profile_repo.get_updated_ms("AAAUSDT") == ahora  # quedó fresco en disco (punto 5)
+    assert orq.bootstrapper.pedidos == []  # no fue un bootstrap real por REST: vino de SQLite
+
+
+async def test_resolver_perfil_usa_el_perfil_fresco_tal_cual_sin_reconstruir(orq):
+    """Contraparte del test anterior: un perfil recién recalculado (dentro
+    del umbral) se usa tal cual, sin gastar ciclos en reconstruirlo -ni
+    siquiera se toca `candle_repo` para nada que cambie el resultado, aunque
+    haya velas ahí con un patrón de volumen distinto que delataría una
+    reconstrucción indebida."""
+    orq.ws = WsFalso()
+    orq.cfg = dataclasses.replace(
+        orq.cfg, profile=dataclasses.replace(orq.cfg.profile, stale_after_hours=6.0)
+    )
+
+    base = 14 * DIA
+    # vol=3000.0, no un valor bajo: por debajo de min_profile_median_volume
+    # (config.toml) _admite_libro expulsaría a AAAUSDT del universo activo,
+    # y este test solo quiere comprobar que no se reconstruye, no ejercitar
+    # esa puerta.
+    velas = [vela(d * DIA + m * MINUTO, vol=3000.0) for d in range(14) for m in range(1440)]
+    perfil_fresco = build_profile("AAAUSDT", velas, orq.cfg.profile)
+    orq.profile_repo.save(perfil_fresco, now_ms=base)
+
+    # velas "envenenadas" en SQLite: si el código reconstruyera pese a estar
+    # fresco, esto lo delataría con un valor distinto de 3000.0.
+    orq.candle_repo.save_many(
+        "AAAUSDT",
+        [vela(d * DIA + m * MINUTO, vol=9000.0) for d in range(14) for m in range(1440)],
+    )
+
+    ahora = base + 3 * 3_600_000  # 3h después: por debajo del umbral de 6h
+    update = UniverseUpdate(
+        symbols=frozenset({"AAAUSDT"}), added=frozenset({"AAAUSDT"}),
+        removed=frozenset(), ordered=["AAAUSDT"],
+    )
+    await orq.apply_universe(update, now_ms=ahora)
+
+    assert orq.profiles["AAAUSDT"].slots[0].median == pytest.approx(3000.0)
+    assert orq.profile_repo.get_updated_ms("AAAUSDT") == base  # no se reescribió
+
+
+async def test_resolver_perfil_no_degrada_un_perfil_rancio_si_la_reconstruccion_sale_mas_fina(orq):
+    """Punto 4 del diseño: un símbolo recién reingresado puede no tener
+    todavía 14 días de velas en SQLite. Si la reconstrucción saldría más
+    fina (menos días de cobertura) que el perfil rancio, se mantiene el
+    rancio -no se degrada un perfil de alta confianza a uno más pobre solo
+    por respetar ciegamente el umbral de edad-, y el perfil rancio en disco
+    tampoco se sobreescribe con el resultado inferior (para que un
+    reintento futuro, con más velas acumuladas, lo vuelva a intentar)."""
+    orq.ws = WsFalso()
+    orq.cfg = dataclasses.replace(
+        orq.cfg, profile=dataclasses.replace(orq.cfg.profile, stale_after_hours=6.0)
+    )
+
+    ahora = 30 * DIA
+    # perfil rancio pero de alta confianza: 14 días completos, vol=3000.0
+    # (por encima de min_profile_median_volume, para que _admite_libro no lo
+    # expulse y el test pueda comprobar qué perfil quedó puesto).
+    velas_viejas = [vela(d * DIA + m * MINUTO, vol=3000.0) for d in range(14) for m in range(1440)]
+    perfil_viejo = build_profile("AAAUSDT", velas_viejas, orq.cfg.profile)
+    edad_guardado = 6 * DIA  # muy por encima del umbral de 6h
+    orq.profile_repo.save(perfil_viejo, now_ms=edad_guardado)
+
+    # el símbolo acaba de reingresar: SQLite solo tiene 1h de velas
+    # recientes, ni de lejos 14 días -la reconstrucción saldría mucho más
+    # fina que el perfil rancio.
+    orq.candle_repo.save_many(
+        "AAAUSDT", [vela(ahora - m * MINUTO, vol=50.0) for m in range(60)],
+    )
+
+    update = UniverseUpdate(
+        symbols=frozenset({"AAAUSDT"}), added=frozenset({"AAAUSDT"}),
+        removed=frozenset(), ordered=["AAAUSDT"],
+    )
+    await orq.apply_universe(update, now_ms=ahora)
+
+    perfil_resultante = orq.profiles["AAAUSDT"]
+    assert perfil_resultante.confidence == "high"
+    assert perfil_resultante.days_covered == pytest.approx(perfil_viejo.days_covered)
+    assert perfil_resultante.slots[0].median == pytest.approx(3000.0)  # el rancio, no las velas nuevas
+    # el perfil rancio en disco NO se sobreescribe con el resultado inferior
+    assert orq.profile_repo.get_updated_ms("AAAUSDT") == edad_guardado
 
 
 # --- I2 + I4: mantenimiento diario (poda de velas + recálculo de perfil) ---

@@ -68,6 +68,17 @@ _SUFIJO_ARBOL_SUCIO = "-dirty"
 # operativo y podria crear alguna frontera de mas; se acepta porque los dos
 # errores no cuestan igual: una frontera de mas parte los datos de forma
 # visible y recuperable, una de menos los mezcla en silencio.
+# `profile.stale_after_hours` (Finding "perfil rancio al entrar") es un
+# umbral de TIMING -cuánto tarda un perfil rancio en reconstruirse al
+# entrar un símbolo al universo-, pero se deja arrastrar dentro de
+# `profile` a propósito, no se separa a una sección operativa aparte: a
+# diferencia de `maintenance.interval_hours` (excluido, puramente de
+# cadencia), este umbral decide DIRECTAMENTE qué baseline -el denominador
+# real del RVOL- termina usando un símbolo recién reingresado. Dos
+# corridas con distinto `stale_after_hours` producirían RVOL distintos
+# para las mismas velas en esa ventana de entrada; no marcar una frontera
+# ahí sería mezclar en silencio filas calculadas con reglas de frescura
+# distintas, exactamente el riesgo que este módulo existe para evitar.
 # `market` entra por el mismo criterio de "son comparables estas filas?"
 # (Finding M1): `venue` (spot vs USDT-perp) no ajusta el scoring, cambia el
 # universo de instrumentos entero -precios, volumenes y volatilidad de un
