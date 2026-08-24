@@ -54,6 +54,14 @@ rate_limit_per_second = 10
 
 [maintenance]
 interval_hours = 24
+# Edad máxima (horas) que tolera un perfil cargado de disco en
+# Orchestrator._resolver_perfil antes de reconstruirse desde las velas ya
+# persistidas en SQLite (ver MaintenanceConfig.stale_after_hours, Finding
+# "perfil rancio al entrar" / BTWUSDT). Igual a interval_hours a propósito:
+# un perfil no debe ser más viejo que un ciclo completo de mantenimiento, la
+# misma garantía que ya tienen los símbolos que llevan más tiempo en el
+# universo.
+stale_after_hours = 24.0
 
 [dashboard]
 stale_after_seconds = 30

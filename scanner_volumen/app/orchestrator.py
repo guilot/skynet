@@ -383,11 +383,12 @@ class Orchestrator:
         """Único punto del código que resuelve un "reinicio en caliente".
 
         Carga el perfil de disco si ya existe; si lo hay, lo marca cargado
-        en el bootstrapper y dispara el relleno del hueco de histórico
-        entre la parada y el reinicio (C4c: sin esto la spec y el README
-        prometen algo que el código no cumplía). Devuelve `None` si no hay
-        nada en disco, para que el llamador sepa que hace falta un
-        bootstrap real por REST.
+        en el bootstrapper, lo reconstruye si está rancio (Finding "perfil
+        rancio al entrar", ver `_perfil_esta_rancio`) y dispara el relleno
+        del hueco de histórico entre la parada y el reinicio (C4c: sin esto
+        la spec y el README prometen algo que el código no cumplía).
+        Devuelve `None` si no hay nada en disco, para que el llamador sepa
+        que hace falta un bootstrap real por REST.
 
         `_load_or_bootstrap` (usado por `ensure_profile` y por el bootstrap
         de fondo) y `apply_universe` compartían antes cada uno su propia
@@ -401,16 +402,125 @@ class Orchestrator:
         relleno en una tarea de fondo separada (`_gap_fill_tasks`);
         `ensure_profile`, en cambio, es una llamada directa que sí espera un
         perfil "terminado".
+
+        La reconstrucción por rancidez, a diferencia del relleno de hueco, se
+        resuelve SIEMPRE aquí mismo -incluso con `hueco_en_fondo=True`, el
+        camino de `apply_universe`-: lee de `candle_repo` (SQLite local), no
+        hace ningún I/O de red. Su cuerpo (`_reconstruir_perfil_rancio`)
+        sigue siendo síncrono, pero se despacha con `asyncio.to_thread`
+        (Finding "rebuild síncrono bloquea el loop", el mismo patrón que
+        `run_maintenance`/I-3, ver el docstring de esa función): en régimen
+        normal es un símbolo suelto (~74 ms, ver el docstring de
+        `_reconstruir_perfil_rancio`), pero un reinicio en caliente tras
+        >24h de caída deja `self.profiles` vacío y puede encontrar rancios a
+        la vez a los ~150 símbolos del universo entero -sin `to_thread` esa
+        ráfaga bloquearía el event loop ~11s de un tirón, exactamente el
+        estancamiento que I-3 ya eliminó de `run_maintenance`. Corre ANTES
+        del relleno de hueco a propósito: ambos son independientes -uno
+        reconstruye desde lo que YA hay en SQLite, el otro trae por REST lo
+        que falta- y esperar al relleno solo para reconstruir con datos más
+        completos reintroduciría el bloqueo de `apply_universe` (C1) que
+        `hueco_en_fondo` existe para evitar.
         """
         perfil = self.profile_repo.load(symbol)
         if perfil is None:
             return None
         self.bootstrapper.mark_loaded(symbol)
+        if self._perfil_esta_rancio(symbol, now_ms):
+            perfil = await asyncio.to_thread(
+                self._reconstruir_perfil_rancio, symbol, perfil, now_ms
+            )
         if hueco_en_fondo:
             self._lanzar_relleno_de_hueco_en_fondo(symbol, now_ms)
         else:
             await self._rellenar_hueco_de_reinicio(symbol, now_ms)
         return perfil
+
+    def _perfil_esta_rancio(self, symbol: str, now_ms: int) -> bool:
+        """True si el perfil de `symbol` en disco lleva más de
+        `cfg.maintenance.stale_after_hours` sin recalcularse (Finding "perfil
+        rancio al entrar": BTWUSDT entró al universo cargando un perfil de 7
+        días de antigüedad y generó 11 señales con RVOL inflado x1.2 contra
+        un baseline que no reflejaba una semana de volumen más alto).
+
+        `run_maintenance` recalcula el perfil de cada símbolo YA presente en
+        `self.profiles` una vez al día (I4); pero un símbolo que entra al
+        universo ENTRE dos pasadas de mantenimiento (el universo se
+        refresca cada `universe.refresh_minutes` = 15 min, mantenimiento
+        cada `maintenance.interval_hours` = 24 h) cargaba lo que hubiera en
+        disco tal cual, sin que nada comprobara su edad -ese hueco es justo
+        lo que este método cierra, evaluado en el único punto que carga un
+        perfil de disco (`_resolver_perfil`).
+
+        `None` (sin metadato de edad -no debería ocurrir si `load` ya
+        devolvió un perfil, porque ambos leen de `profile_meta`, pero es más
+        seguro que asumir rancio ante un dato que no se pudo leer) se trata
+        como "no rancio": se prefiere seguir usando el perfil tal cual antes
+        que forzar una reconstrucción basada en una premisa que no se pudo
+        verificar.
+        """
+        actualizado = self.profile_repo.get_updated_ms(symbol)
+        if actualizado is None:
+            return False
+        umbral_ms = int(self.cfg.maintenance.stale_after_hours * 3_600_000)
+        return (now_ms - actualizado) > umbral_ms
+
+    def _reconstruir_perfil_rancio(
+        self, symbol: str, perfil: VolumeProfile, now_ms: int
+    ) -> VolumeProfile:
+        """Reconstruye `perfil` a partir de las velas ya persistidas en
+        SQLite, con la misma maquinaria que usa el recálculo diario
+        (`_recalcular_perfil_de_mantenimiento` / `build_profile` sobre
+        `candle_repo`), pero sin su guardado incondicional: aquí el
+        resultado puede salir PEOR que el perfil rancio -un símbolo recién
+        reingresado puede no tener todavía `history_days` completos de
+        velas en `candle_repo` (punto 4 del diseño)-, y degradar un perfil
+        de alta confianza a uno más pobre sería peor que dejarlo tal cual.
+        Si la reconstrucción sale más fina, ni se usa ni se persiste: el
+        perfil rancio en disco queda intacto para que un intento futuro (la
+        próxima vez que este símbolo se resuelva, o el propio mantenimiento
+        diario una vez tenga más velas acumuladas) lo vuelva a intentar.
+
+        Cuando SÍ se acepta la reconstrucción, `profile_repo.save` la deja
+        con `updated_ms` fresco (`now_ms`) -así el siguiente pase de
+        `run_maintenance` no la vuelve a recalcular de inmediato, y
+        viceversa: son la misma operación de guardado, no hay forma de que
+        se pisen entre sí (punto 5 del diseño).
+
+        Cuerpo síncrono a propósito (I/O de disco + CPU, sin ningún `await`),
+        igual que `_recalcular_perfil_de_mantenimiento` para `run_maintenance`
+        -aislado en su propio método por la misma razón: para que
+        `asyncio.to_thread` pueda ejecutarlo en un hilo aparte. No toca
+        ningún estado del orquestador que no sea `candle_repo`/`profile_repo`
+        (SQLite, `check_same_thread=False`, el mismo patrón ya probado por
+        `run_maintenance`); `self.profiles`/`self.dirty` los sigue mutando el
+        llamador (`apply_universe`), de vuelta en el hilo del event loop.
+
+        El costo medido es ~74 ms en el peor caso para UN símbolo (~9.1s/150
+        de `candle_repo.load` + ~2.0s/150 de `build_profile`, misma medición
+        que el docstring de `run_maintenance`) -tolerable bloqueando el loop
+        una vez por refresco de universo en el caso normal, un reingreso
+        aislado. Pero un reinicio en caliente tras >24h de caída puede
+        encontrar rancios a los ~150 símbolos del universo entero a la vez
+        (`self.profiles` vacío, Finding "rebuild síncrono bloquea el loop"),
+        y esa ráfaga sí reintroduce el mismo estancamiento de ~11s que I-3 ya
+        eliminó de `run_maintenance` -por eso el llamador (`_resolver_perfil`)
+        despacha esta función completa con `asyncio.to_thread`, exactamente
+        el mismo patrón que `run_maintenance` usa por símbolo: el event loop
+        recupera el control entre cada símbolo del universo, aunque
+        `apply_universe` en conjunto siga tardando lo mismo en completarse.
+        """
+        desde = now_ms - self.cfg.profile.history_days * DIA_MS
+        velas = self.candle_repo.load(symbol, desde)
+        if not velas:
+            return perfil  # sin velas para reconstruir: se mantiene el rancio
+        nuevo = build_profile(symbol, velas, self.cfg.profile)
+        if nuevo.days_covered < perfil.days_covered:
+            # la reconstrucción saldría más fina (menos días de histórico
+            # real todavía en SQLite) que el perfil rancio: no degradar.
+            return perfil
+        self.profile_repo.save(nuevo, now_ms)
+        return nuevo
 
     def _lanzar_relleno_de_hueco_en_fondo(self, symbol: str, now_ms: int) -> None:
         """Lanza `_rellenar_hueco_de_reinicio` sin esperarlo (usado por

@@ -117,9 +117,9 @@ def test_fingerprint_cambia_si_cambia_el_venue_del_mercado(tmp_path):
 
 def test_fingerprint_no_cambia_si_solo_cambian_ajustes_operativos(tmp_path):
     """server (host/puerto/db_path), dashboard (stale_after_seconds) y
-    maintenance (interval_hours) son ajustes operativos: no gobiernan qué se
-    detecta ni cómo se puntúa, así que cambiarlos no debe crear una frontera
-    falsa en el dataset."""
+    maintenance (interval_hours, stale_after_hours) son ajustes operativos:
+    no gobiernan qué se detecta ni cómo se puntúa, así que cambiarlos no debe
+    crear una frontera falsa en el dataset."""
     original = CONFIG_PATH.read_text()
     modificado = (
         original
@@ -127,9 +127,31 @@ def test_fingerprint_no_cambia_si_solo_cambian_ajustes_operativos(tmp_path):
         .replace('db_path = "data/scanner.db"', 'db_path = "data/otra.db"')
         .replace("stale_after_seconds = 30", "stale_after_seconds = 999")
         .replace("interval_hours = 24", "interval_hours = 1")
+        .replace("stale_after_hours = 24.0", "stale_after_hours = 6.0")
     )
     assert modificado != original
     destino = tmp_path / "config_operativo.toml"
+    destino.write_text(modificado)
+
+    original_fp = config_fingerprint(load_config(CONFIG_PATH))
+    modificado_fp = config_fingerprint(load_config(destino))
+    assert original_fp == modificado_fp
+
+
+def test_fingerprint_no_cambia_si_cambia_maintenance_stale_after_hours(tmp_path):
+    """`maintenance.stale_after_hours` gobierna CUÁNDO se refresca un perfil
+    rancio al entrar un símbolo al universo -no QUÉ ni CÓMO se puntúa, ni qué
+    filas se persisten-, así que vive en `maintenance` (sección operativa,
+    fuera de `_SECCIONES_FINGERPRINT`) junto a su gemelo `interval_hours`, no
+    en `profile`. Test dedicado, además del genérico de ajustes operativos de
+    arriba, para pinnear explícitamente que nadie lo vuelva a mover a una
+    sección fingerprinted: si `stale_after_hours` viviera en `[profile]`
+    -sección SÍ incluida en `_SECCIONES_FINGERPRINT`- este assert fallaría,
+    porque `profile` pasaría a llevar un valor distinto al de config.toml."""
+    original = CONFIG_PATH.read_text()
+    modificado = original.replace("stale_after_hours = 24.0", "stale_after_hours = 6.0")
+    assert modificado != original  # guarda contra un replace que no encontró nada
+    destino = tmp_path / "config_stale_after_hours.toml"
     destino.write_text(modificado)
 
     original_fp = config_fingerprint(load_config(CONFIG_PATH))

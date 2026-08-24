@@ -119,6 +119,19 @@ class ProfileRepo:
             days_covered=meta["days_covered"],
         )
 
+    def get_updated_ms(self, symbol: str) -> int | None:
+        """Edad del perfil persistido (I4 / Finding "perfil rancio al
+        entrar"): `Orchestrator._resolver_perfil` la usa para decidir si un
+        perfil cargado de disco lleva demasiado tiempo sin recalcularse y
+        debe reconstruirse antes de usarse. Separado de `load` -que no
+        expone `updated_ms`, solo `confidence`/`days_covered`- porque la
+        mayoría de sus llamadores no lo necesitan. `None` si el símbolo no
+        tiene perfil guardado, igual que `load`."""
+        fila = self._conn.execute(
+            "SELECT updated_ms FROM profile_meta WHERE symbol = ?", (symbol,)
+        ).fetchone()
+        return fila["updated_ms"] if fila is not None else None
+
 
 class SignalRepo:
     _CAMPOS = (
