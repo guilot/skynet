@@ -12,8 +12,7 @@ DIA = 1440 * MINUTO
 
 def cfg(**kwargs):
     base = dict(history_days=14, smoothing_window_minutes=7,
-                min_days_for_confidence=3, rolling_fallback_candles=120,
-                stale_after_hours=24.0)
+                min_days_for_confidence=3, rolling_fallback_candles=120)
     base.update(kwargs)
     return ProfileConfig(**base)
 

@@ -16,8 +16,7 @@ def vela(ts, vol):
 def perfil_plano(volumen=100.0, dias=14):
     velas = [vela(d * DIA + m * MINUTO, volumen) for d in range(dias) for m in range(1440)]
     cfg = ProfileConfig(history_days=14, smoothing_window_minutes=0,
-                        min_days_for_confidence=3, rolling_fallback_candles=120,
-                        stale_after_hours=24.0)
+                        min_days_for_confidence=3, rolling_fallback_candles=120)
     return build_profile("AAAUSDT", velas, cfg)
 
 
@@ -35,8 +34,7 @@ def perfil_con_baselines_distintos(dias=14):
     velas = [vela(d * DIA + m * MINUTO, volumen_del_minuto(m))
              for d in range(dias) for m in range(1440)]
     cfg = ProfileConfig(history_days=14, smoothing_window_minutes=0,
-                        min_days_for_confidence=3, rolling_fallback_candles=120,
-                        stale_after_hours=24.0)
+                        min_days_for_confidence=3, rolling_fallback_candles=120)
     return build_profile("AAAUSDT", velas, cfg)
 
 
@@ -45,8 +43,7 @@ def perfil_con_slot_vacio(dias=14):
     recibe ninguna vela y por tanto su slot queda sin baseline (None)."""
     velas = [vela(d * DIA + 500 * MINUTO, 100.0) for d in range(dias)]
     cfg = ProfileConfig(history_days=14, smoothing_window_minutes=0,
-                        min_days_for_confidence=3, rolling_fallback_candles=120,
-                        stale_after_hours=24.0)
+                        min_days_for_confidence=3, rolling_fallback_candles=120)
     return build_profile("AAAUSDT", velas, cfg)
 
 

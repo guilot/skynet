@@ -428,7 +428,7 @@ class Orchestrator:
 
     def _perfil_esta_rancio(self, symbol: str, now_ms: int) -> bool:
         """True si el perfil de `symbol` en disco lleva más de
-        `cfg.profile.stale_after_hours` sin recalcularse (Finding "perfil
+        `cfg.maintenance.stale_after_hours` sin recalcularse (Finding "perfil
         rancio al entrar": BTWUSDT entró al universo cargando un perfil de 7
         días de antigüedad y generó 11 señales con RVOL inflado x1.2 contra
         un baseline que no reflejaba una semana de volumen más alto).
@@ -452,7 +452,7 @@ class Orchestrator:
         actualizado = self.profile_repo.get_updated_ms(symbol)
         if actualizado is None:
             return False
-        umbral_ms = int(self.cfg.profile.stale_after_hours * 3_600_000)
+        umbral_ms = int(self.cfg.maintenance.stale_after_hours * 3_600_000)
         return (now_ms - actualizado) > umbral_ms
 
     def _reconstruir_perfil_rancio(

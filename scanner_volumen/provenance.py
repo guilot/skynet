@@ -51,10 +51,10 @@ _SUFIJO_ARBOL_SUCIO = "-dirty"
 # max_symbols...) y los parámetros del perfil de volumen (history_days,
 # smoothing...). Deliberadamente EXCLUYE las secciones puramente operativas:
 # server (host/puerto/db_path), dashboard (stale_after_seconds), maintenance
-# (interval_hours), rest (rate limiting), supply (cadencia de refresco de
-# market cap), outcomes (cadencia del tracker) y backtest (cómo se agrupa un
-# episodio, no qué ni cómo se puntúa). Sin esta exclusión, arrancar con
-# config.dev.toml en vez de config.toml -que solo difieren en
+# (interval_hours, stale_after_hours), rest (rate limiting), supply (cadencia
+# de refresco de market cap), outcomes (cadencia del tracker) y backtest
+# (cómo se agrupa un episodio, no qué ni cómo se puntúa). Sin esta exclusión,
+# arrancar con config.dev.toml en vez de config.toml -que solo difieren en
 # server.port/server.db_path, ver tests/test_config.py- crearía una frontera
 # falsa de "cambio de scoring" en cuanto se guardara la primera señal de una
 # corrida de desarrollo.
@@ -68,17 +68,17 @@ _SUFIJO_ARBOL_SUCIO = "-dirty"
 # operativo y podria crear alguna frontera de mas; se acepta porque los dos
 # errores no cuestan igual: una frontera de mas parte los datos de forma
 # visible y recuperable, una de menos los mezcla en silencio.
-# `profile.stale_after_hours` (Finding "perfil rancio al entrar") es un
-# umbral de TIMING -cuánto tarda un perfil rancio en reconstruirse al
-# entrar un símbolo al universo-, pero se deja arrastrar dentro de
-# `profile` a propósito, no se separa a una sección operativa aparte: a
-# diferencia de `maintenance.interval_hours` (excluido, puramente de
-# cadencia), este umbral decide DIRECTAMENTE qué baseline -el denominador
-# real del RVOL- termina usando un símbolo recién reingresado. Dos
-# corridas con distinto `stale_after_hours` producirían RVOL distintos
-# para las mismas velas en esa ventana de entrada; no marcar una frontera
-# ahí sería mezclar en silencio filas calculadas con reglas de frescura
-# distintas, exactamente el riesgo que este módulo existe para evitar.
+# `maintenance.stale_after_hours` vive fuera del fingerprint junto a su
+# gemelo `interval_hours` (ambos deciden CUÁNDO se refresca un perfil, no
+# QUÉ ni CÓMO se puntúa): es un umbral de TIMING -cuánto tarda un perfil
+# rancio en reconstruirse al entrar un símbolo al universo-, no una regla
+# de scoring ni un filtro de qué filas se persisten. Cambiar cuándo se
+# refresca un perfil no lo hace "distinto" en el mismo sentido que cambiar
+# una curva de score o `persisted_min_state`: el propio mecanismo de
+# refresco (Finding "perfil rancio al entrar") ya existe justamente para
+# que un perfil usado en el scoring nunca sea más viejo que un ciclo de
+# mantenimiento, así que el umbral que gobierna ESE mecanismo pertenece
+# con sus pares operativos, no con las secciones que fingerprint protege.
 # `market` entra por el mismo criterio de "son comparables estas filas?"
 # (Finding M1): `venue` (spot vs USDT-perp) no ajusta el scoring, cambia el
 # universo de instrumentos entero -precios, volumenes y volatilidad de un

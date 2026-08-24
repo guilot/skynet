@@ -1128,7 +1128,7 @@ async def test_updated_ms_sigue_al_ts_de_la_ultima_vela_no_al_de_evaluate(orq):
 
 
 # --- Finding "perfil rancio al entrar": _resolver_perfil no debe usar un
-# perfil de disco sin mirar su edad (ver ProfileConfig.stale_after_hours) ---
+# perfil de disco sin mirar su edad (ver MaintenanceConfig.stale_after_hours) ---
 
 async def test_resolver_perfil_reconstruye_un_perfil_mas_viejo_que_el_umbral(orq):
     """Medido en real: BTWUSDT entró al universo cargando un perfil de disco
@@ -1142,7 +1142,7 @@ async def test_resolver_perfil_reconstruye_un_perfil_mas_viejo_que_el_umbral(orq
     tal cual)."""
     orq.ws = WsFalso()
     orq.cfg = dataclasses.replace(
-        orq.cfg, profile=dataclasses.replace(orq.cfg.profile, stale_after_hours=6.0)
+        orq.cfg, maintenance=dataclasses.replace(orq.cfg.maintenance, stale_after_hours=6.0)
     )
 
     ahora = 30 * DIA
@@ -1184,7 +1184,7 @@ async def test_resolver_perfil_usa_el_perfil_fresco_tal_cual_sin_reconstruir(orq
     reconstrucción indebida."""
     orq.ws = WsFalso()
     orq.cfg = dataclasses.replace(
-        orq.cfg, profile=dataclasses.replace(orq.cfg.profile, stale_after_hours=6.0)
+        orq.cfg, maintenance=dataclasses.replace(orq.cfg.maintenance, stale_after_hours=6.0)
     )
 
     base = 14 * DIA
@@ -1224,7 +1224,7 @@ async def test_resolver_perfil_no_degrada_un_perfil_rancio_si_la_reconstruccion_
     reintento futuro, con más velas acumuladas, lo vuelva a intentar)."""
     orq.ws = WsFalso()
     orq.cfg = dataclasses.replace(
-        orq.cfg, profile=dataclasses.replace(orq.cfg.profile, stale_after_hours=6.0)
+        orq.cfg, maintenance=dataclasses.replace(orq.cfg.maintenance, stale_after_hours=6.0)
     )
 
     ahora = 30 * DIA
