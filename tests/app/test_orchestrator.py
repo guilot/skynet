@@ -1257,6 +1257,65 @@ async def test_resolver_perfil_no_degrada_un_perfil_rancio_si_la_reconstruccion_
     assert orq.profile_repo.get_updated_ms("AAAUSDT") == edad_guardado
 
 
+async def test_resolver_perfil_acepta_reconstruccion_equivalente_por_ruido_de_coma_flotante(orq):
+    """Finding "degradación por ruido de coma flotante" (medido en real,
+    BTWUSDT): `days_covered` es `(max_ts - min_ts) / dia_ms` sobre las
+    velas disponibles, así que dos perfiles que representan la MISMA
+    cobertura real de ~14 días pueden diferir en su último decimal según en
+    qué minuto exacto cae la vela más vieja/nueva disponible en cada
+    cálculo -no por ninguna pérdida real de histórico-. El perfil rancio en
+    disco venía de un cálculo con 20161 velas consecutivas de un minuto
+    (rango de 20160 min = 14.0 días exactos); `candle_repo` ya tiene esas
+    mismas ~14 días pero con 20159 velas consecutivas (rango de 20158 min =
+    13.9986 días, el valor exacto medido en real para BTWUSDT). Antes del
+    fix, la comparación estricta `nuevo.days_covered < perfil.days_covered`
+    descartaba esta reconstrucción como "más fina" -13.9986 < 14.0- y dejaba
+    `profile_repo.get_updated_ms` sin refrescar: BTWUSDT seguía puntuando
+    contra el baseline de 7 días de antigüedad hasta el siguiente
+    mantenimiento diario, exactamente el defecto que la reconstrucción por
+    rancidez existe para prevenir. Con el fix, la diferencia (~0.0014 días)
+    cae dentro de `TOLERANCIA_DIAS_COBERTURA` y la reconstrucción, más
+    fresca, se acepta."""
+    orq.ws = WsFalso()
+    orq.cfg = dataclasses.replace(
+        orq.cfg, maintenance=dataclasses.replace(orq.cfg.maintenance, stale_after_hours=6.0)
+    )
+
+    ahora = 30 * DIA
+    desde_ventana = ahora - orq.cfg.profile.history_days * DIA  # = 16 * DIA
+
+    # perfil rancio en disco: 14.0 días exactos (20161 velas consecutivas de
+    # un minuto, rango de 20160 min), alta confianza y volumen suficiente
+    # para pasar `_admite_libro` tal cual (vol=5000, distinto del de las
+    # velas nuevas para poder distinguir "se usó el rancio" de "se
+    # reconstruyó de verdad").
+    velas_viejas = [vela(m * MINUTO, vol=5000.0) for m in range(20161)]
+    perfil_viejo = build_profile("AAAUSDT", velas_viejas, orq.cfg.profile)
+    assert perfil_viejo.days_covered == pytest.approx(14.0)
+    orq.profile_repo.save(perfil_viejo, now_ms=ahora - 10 * DIA)  # muy por encima de 6h
+
+    # candle_repo ya tiene ~14 días completos, pero con una vela menos en el
+    # rango (20159 velas consecutivas, rango de 20158 min = 13.9986 días):
+    # el mismo histórico real, solo que el cálculo del rango cae un pelín
+    # distinto.
+    orq.candle_repo.save_many(
+        "AAAUSDT",
+        [vela(desde_ventana + m * MINUTO, vol=9000.0) for m in range(20159)],
+    )
+
+    update = UniverseUpdate(
+        symbols=frozenset({"AAAUSDT"}), added=frozenset({"AAAUSDT"}),
+        removed=frozenset(), ordered=["AAAUSDT"],
+    )
+    await orq.apply_universe(update, now_ms=ahora)
+
+    perfil_resultante = orq.profiles["AAAUSDT"]
+    assert perfil_resultante.confidence == "high"
+    assert perfil_resultante.days_covered == pytest.approx(20158 / 1440)  # ~13.9986
+    assert perfil_resultante.slots[0].median == pytest.approx(9000.0)  # se aceptó la reconstrucción
+    assert orq.profile_repo.get_updated_ms("AAAUSDT") == ahora  # quedó fresco en disco
+
+
 async def test_resolver_perfil_reconstruccion_no_bloquea_el_event_loop(orq, monkeypatch):
     """Regresión "rebuild síncrono bloquea el loop": un reinicio en caliente
     tras >24h de caída deja `self.profiles` vacío, así que el primer

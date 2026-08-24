@@ -465,6 +465,36 @@ class Orchestrator:
         umbral_ms = int(self.cfg.maintenance.stale_after_hours * 3_600_000)
         return (now_ms - actualizado) > umbral_ms
 
+    # Tolerancia de "no degradar" (ver `_reconstruir_perfil_rancio`, Finding
+    # "degradación por ruido de coma flotante"): `days_covered` es
+    # `(max_ts - min_ts) / dia_ms` sobre las velas disponibles en cada
+    # cálculo, así que dos perfiles que representan la MISMA cobertura real
+    # de ~14 días pueden diferir en su último decimal según en qué minuto
+    # exacto cae la vela más vieja/nueva disponible -no por ninguna pérdida
+    # real de histórico-. Medido en real: BTWUSDT con un perfil rancio en
+    # disco de `days_covered=14.0` (20161 velas consecutivas de un minuto,
+    # rango de 20160 min) y una reconstrucción con esas mismas ~14 días de
+    # velas ya en `candle_repo` salía en `days_covered=13.9986` (20159
+    # velas consecutivas, rango de 20158 min) -una diferencia de ~2 minutos
+    # (~0.0014 días), nacida solo de en qué vela cae exactamente el borde
+    # de la ventana, no de una cobertura real distinta-. La comparación
+    # estricta descartaba esa reconstrucción como "más fina" y dejaba
+    # `updated_ms` sin refrescar: el símbolo seguía puntuando contra el
+    # baseline rancio hasta el siguiente mantenimiento diario, exactamente
+    # el defecto que esta reconstrucción existe para prevenir.
+    #
+    # Es una guarda de PUNTO FLOTANTE, no un umbral de negocio -no vive en
+    # `config.toml` por lo mismo que `MIN_SLOTS_POBLADOS_PARA_TIPICO` en
+    # `engine/profile.py` no vive ahí-: no expresa ninguna decisión sobre
+    # "cuánta pérdida de cobertura es aceptable", solo absorbe el ruido
+    # aritmético de contar velas. 1 día de margen es deliberadamente
+    # generoso frente a ese ruido (unos pocos minutos en el peor caso
+    # plausible) y sigue muy por debajo de la diferencia real que el caso
+    # protegido -un símbolo recién reingresado con solo un par de días de
+    # histórico frente a un perfil rancio de 14 días completos, ~12 días de
+    # diferencia- necesita para disparar la protección.
+    TOLERANCIA_DIAS_COBERTURA = 1.0
+
     def _reconstruir_perfil_rancio(
         self, symbol: str, perfil: VolumeProfile, now_ms: int
     ) -> VolumeProfile:
@@ -515,9 +545,15 @@ class Orchestrator:
         if not velas:
             return perfil  # sin velas para reconstruir: se mantiene el rancio
         nuevo = build_profile(symbol, velas, self.cfg.profile)
-        if nuevo.days_covered < perfil.days_covered:
-            # la reconstrucción saldría más fina (menos días de histórico
-            # real todavía en SQLite) que el perfil rancio: no degradar.
+        if nuevo.days_covered < perfil.days_covered - self.TOLERANCIA_DIAS_COBERTURA:
+            # la reconstrucción saldría MATERIALMENTE más fina (menos días
+            # de histórico real todavía en SQLite) que el perfil rancio: no
+            # degradar. La resta de `TOLERANCIA_DIAS_COBERTURA` (ver su
+            # comentario, justo encima del método) evita que dos perfiles
+            # que representan la misma cobertura real -ambos "14 días
+            # completos"- se traten como una degradación solo porque
+            # `days_covered` cae un pelín distinto por ruido de coma
+            # flotante.
             return perfil
         self.profile_repo.save(nuevo, now_ms)
         return nuevo
