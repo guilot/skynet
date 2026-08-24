@@ -1257,6 +1257,72 @@ async def test_resolver_perfil_no_degrada_un_perfil_rancio_si_la_reconstruccion_
     assert orq.profile_repo.get_updated_ms("AAAUSDT") == edad_guardado
 
 
+async def test_resolver_perfil_reconstruccion_no_bloquea_el_event_loop(orq, monkeypatch):
+    """Regresión "rebuild síncrono bloquea el loop": un reinicio en caliente
+    tras >24h de caída deja `self.profiles` vacío, así que el primer
+    `apply_universe` puede encontrar rancios a los ~150 símbolos del
+    universo entero a la vez (`_perfil_esta_rancio`) -sin `asyncio.to_thread`
+    esa ráfaga bloquea el event loop de un tirón (medido: ~11s, la misma
+    clase de estancamiento que `run_maintenance` ya resolvía con I-3, ver su
+    docstring).
+
+    Se reproduce igual que `test_run_maintenance_no_bloquea_el_event_loop`:
+    un `candle_repo.load` sintético pero de verdad bloqueante (`time.sleep`,
+    no una corrutina lenta) para varios símbolos con perfil rancio en disco,
+    y una tarea concurrente que solo cuenta cuántas veces consigue correr
+    mientras tanto. Con el bug (`_reconstruir_perfil_rancio` invocada
+    directamente, sin `to_thread`), el event loop nunca vuelve a esa tarea
+    hasta que `apply_universe` termina del todo, así que `vueltas` se queda
+    en 0."""
+    orq.ws = WsFalso()
+    orq.cfg = dataclasses.replace(
+        orq.cfg, maintenance=dataclasses.replace(orq.cfg.maintenance, stale_after_hours=6.0)
+    )
+
+    simbolos = [f"SYM{i}USDT" for i in range(6)]
+    ahora = 30 * DIA
+    viejo = ahora - 10 * DIA  # muy por encima del umbral de 6h: perfil rancio
+    for simbolo in simbolos:
+        velas_viejas = [vela(d * DIA + m * MINUTO, vol=100.0) for d in range(3) for m in range(1440)]
+        perfil_viejo = build_profile(simbolo, velas_viejas, orq.cfg.profile)
+        orq.profile_repo.save(perfil_viejo, now_ms=viejo)
+
+    real_load = orq.candle_repo.load
+
+    def load_lento(symbol, since_ms):
+        time.sleep(0.05)  # I/O síncrono lento, bloqueante de verdad
+        return real_load(symbol, since_ms)
+
+    monkeypatch.setattr(orq.candle_repo, "load", load_lento)
+
+    vueltas = 0
+
+    async def latido():
+        nonlocal vueltas
+        while True:
+            await asyncio.sleep(0.01)
+            vueltas += 1
+
+    update = UniverseUpdate(
+        symbols=frozenset(simbolos), added=frozenset(simbolos),
+        removed=frozenset(), ordered=simbolos,
+    )
+
+    tarea_latido = asyncio.create_task(latido())
+    try:
+        await orq.apply_universe(update, now_ms=ahora)
+    finally:
+        tarea_latido.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tarea_latido
+
+    # 6 símbolos x 50ms bloqueantes = ~300ms de trabajo sintético: si el
+    # event loop nunca se libera durante ese tramo, `latido` no consigue
+    # correr ni una vez. Con el fix (asyncio.to_thread envolviendo
+    # `_reconstruir_perfil_rancio`), debe intercalarse varias veces.
+    assert vueltas > 0
+
+
 # --- I2 + I4: mantenimiento diario (poda de velas + recálculo de perfil) ---
 
 async def test_run_maintenance_poda_las_velas_fuera_de_la_ventana_retenida(orq):

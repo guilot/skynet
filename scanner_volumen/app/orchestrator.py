@@ -403,23 +403,33 @@ class Orchestrator:
         `ensure_profile`, en cambio, es una llamada directa que sí espera un
         perfil "terminado".
 
-        La reconstrucción por rancidez, a diferencia del relleno de hueco,
-        es SIEMPRE síncrona -incluso con `hueco_en_fondo=True`, el camino de
-        `apply_universe`-: lee de `candle_repo` (SQLite local), no hace
-        ningún I/O de red, así que no hay nada que lanzar en segundo plano
-        (ver `_reconstruir_perfil_rancio` sobre el coste medido, ~74 ms en
-        el peor caso). Corre ANTES del relleno de hueco a propósito: ambos
-        son independientes -uno reconstruye desde lo que YA hay en SQLite,
-        el otro trae por REST lo que falta- y esperar al relleno solo para
-        reconstruir con datos más completos reintroduciría el bloqueo de
-        `apply_universe` (C1) que `hueco_en_fondo` existe para evitar.
+        La reconstrucción por rancidez, a diferencia del relleno de hueco, se
+        resuelve SIEMPRE aquí mismo -incluso con `hueco_en_fondo=True`, el
+        camino de `apply_universe`-: lee de `candle_repo` (SQLite local), no
+        hace ningún I/O de red. Su cuerpo (`_reconstruir_perfil_rancio`)
+        sigue siendo síncrono, pero se despacha con `asyncio.to_thread`
+        (Finding "rebuild síncrono bloquea el loop", el mismo patrón que
+        `run_maintenance`/I-3, ver el docstring de esa función): en régimen
+        normal es un símbolo suelto (~74 ms, ver el docstring de
+        `_reconstruir_perfil_rancio`), pero un reinicio en caliente tras
+        >24h de caída deja `self.profiles` vacío y puede encontrar rancios a
+        la vez a los ~150 símbolos del universo entero -sin `to_thread` esa
+        ráfaga bloquearía el event loop ~11s de un tirón, exactamente el
+        estancamiento que I-3 ya eliminó de `run_maintenance`. Corre ANTES
+        del relleno de hueco a propósito: ambos son independientes -uno
+        reconstruye desde lo que YA hay en SQLite, el otro trae por REST lo
+        que falta- y esperar al relleno solo para reconstruir con datos más
+        completos reintroduciría el bloqueo de `apply_universe` (C1) que
+        `hueco_en_fondo` existe para evitar.
         """
         perfil = self.profile_repo.load(symbol)
         if perfil is None:
             return None
         self.bootstrapper.mark_loaded(symbol)
         if self._perfil_esta_rancio(symbol, now_ms):
-            perfil = self._reconstruir_perfil_rancio(symbol, perfil, now_ms)
+            perfil = await asyncio.to_thread(
+                self._reconstruir_perfil_rancio, symbol, perfil, now_ms
+            )
         if hueco_en_fondo:
             self._lanzar_relleno_de_hueco_en_fondo(symbol, now_ms)
         else:
@@ -477,18 +487,28 @@ class Orchestrator:
         viceversa: son la misma operación de guardado, no hay forma de que
         se pisen entre sí (punto 5 del diseño).
 
-        Síncrono a propósito (I/O de disco + CPU, sin ningún `await`), a
-        diferencia del recálculo de `run_maintenance` -que sí usa
-        `asyncio.to_thread`, porque ahí se repite por cada símbolo del
-        universo entero (~150, ~74 ms cada uno: ~9.1s/150 de
-        `candle_repo.load` + ~2.0s/150 de `build_profile`, medido en el
-        docstring de `run_maintenance`). Aquí es un símbolo suelto, el caso
-        ocasional de un reingreso con perfil rancio, no un barrido completo:
-        bloquear el event loop una vez ~74 ms por refresco de universo no
-        reintroduce el estancamiento de arranque en frío (C1) que
-        `apply_universe` evita en el resto de sus caminos -ese estancamiento
-        es de MINUTOS por descarga REST paginada, no de milisegundos por una
-        lectura local ya en SQLite.
+        Cuerpo síncrono a propósito (I/O de disco + CPU, sin ningún `await`),
+        igual que `_recalcular_perfil_de_mantenimiento` para `run_maintenance`
+        -aislado en su propio método por la misma razón: para que
+        `asyncio.to_thread` pueda ejecutarlo en un hilo aparte. No toca
+        ningún estado del orquestador que no sea `candle_repo`/`profile_repo`
+        (SQLite, `check_same_thread=False`, el mismo patrón ya probado por
+        `run_maintenance`); `self.profiles`/`self.dirty` los sigue mutando el
+        llamador (`apply_universe`), de vuelta en el hilo del event loop.
+
+        El costo medido es ~74 ms en el peor caso para UN símbolo (~9.1s/150
+        de `candle_repo.load` + ~2.0s/150 de `build_profile`, misma medición
+        que el docstring de `run_maintenance`) -tolerable bloqueando el loop
+        una vez por refresco de universo en el caso normal, un reingreso
+        aislado. Pero un reinicio en caliente tras >24h de caída puede
+        encontrar rancios a los ~150 símbolos del universo entero a la vez
+        (`self.profiles` vacío, Finding "rebuild síncrono bloquea el loop"),
+        y esa ráfaga sí reintroduce el mismo estancamiento de ~11s que I-3 ya
+        eliminó de `run_maintenance` -por eso el llamador (`_resolver_perfil`)
+        despacha esta función completa con `asyncio.to_thread`, exactamente
+        el mismo patrón que `run_maintenance` usa por símbolo: el event loop
+        recupera el control entre cada símbolo del universo, aunque
+        `apply_universe` en conjunto siga tardando lo mismo en completarse.
         """
         desde = now_ms - self.cfg.profile.history_days * DIA_MS
         velas = self.candle_repo.load(symbol, desde)
