@@ -233,7 +233,16 @@ def test_fade_invierte_el_pnl_direccional_de_un_short():
     assert stats_señal_fade.mean_pnl == pytest.approx(-3.0)
 
 
-def test_fade_intercambia_favorable_y_adversa():
+def test_fade_intercambia_y_niega_favorable_y_adversa():
+    # El fade es la posición contraria: no basta con intercambiar favorable
+    # y adversa, hay que NEGARLAS también. Ejemplo del bug real (regla FADE
+    # HOT+ / ALL a 60 min sobre datos reales): mfe=+3%, mae=-1% de la señal
+    # original producían FAV -2.25% / ADV +1.42% en el fade -una favorable
+    # negativa y una adversa positiva son semánticamente imposibles: lo
+    # favorable es el mejor punto a tu favor (>=0) y lo adverso el peor en
+    # tu contra (<=0)-. La regla correcta:
+    #   fade_favourable = -adjusted_adverse(señal)
+    #   fade_adverse    = -adjusted_favourable(señal)
     señales = [_senal(1, "AAA", 0, direction="LONG")]
     outcomes = {1: {5: _outcome(return_pct=2.0, mfe_pct=5.0, mae_pct=-1.5)}}
     episodios = group_episodes(señales, gap_minutes=30)
@@ -245,9 +254,30 @@ def test_fade_intercambia_favorable_y_adversa():
     )
     assert stats_señal_normal.mean_favourable == pytest.approx(5.0)
     assert stats_señal_normal.mean_adverse == pytest.approx(-1.5)
-    # fade: la favorable pasa a ser la adversa original, y viceversa.
-    assert stats_señal_fade.mean_favourable == pytest.approx(-1.5)
-    assert stats_señal_fade.mean_adverse == pytest.approx(5.0)
+    # fade: la favorable es la adversa original NEGADA, y viceversa.
+    assert stats_señal_fade.mean_favourable == pytest.approx(1.5)
+    assert stats_señal_fade.mean_adverse == pytest.approx(-5.0)
+    assert stats_señal_fade.mean_favourable == pytest.approx(-stats_señal_normal.mean_adverse)
+    assert stats_señal_fade.mean_adverse == pytest.approx(-stats_señal_normal.mean_favourable)
+
+
+def test_fade_favorable_es_positiva_y_adversa_es_negativa_por_construccion():
+    """Invariante semántica que ninguna fila fade puede violar: favorable es
+    el mejor punto a favor de la posición (siempre >= 0 si hubo algún
+    movimiento a favor) y adversa el peor punto en contra (siempre <= 0 si
+    hubo algún movimiento en contra) -sea la fila fade o no-. Reproduce el
+    caso concreto del bug: señal original con mfe=+3.0 (favorable) y
+    mae=-1.0 (adversa) reales -> fade favorable=+1.0, fade adversa=-3.0."""
+    señales = [_senal(1, "AAA", 0, direction="LONG")]
+    outcomes = {1: {5: _outcome(return_pct=2.0, mfe_pct=3.0, mae_pct=-1.0)}}
+    episodios = group_episodes(señales, gap_minutes=30)
+    stats_señal_fade, _ = compute_combo_stats(
+        señales, episodios, outcomes, horizon=5, fade=True
+    )
+    assert stats_señal_fade.mean_favourable == pytest.approx(1.0)
+    assert stats_señal_fade.mean_adverse == pytest.approx(-3.0)
+    assert stats_señal_fade.mean_favourable > 0
+    assert stats_señal_fade.mean_adverse < 0
 
 
 def test_fade_agrupa_episodios_igual_que_sin_fade():

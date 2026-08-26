@@ -181,8 +181,12 @@ def test_run_con_regla_fade_invierte_el_pnl_de_su_gemela_no_fade(conn):
     normal, fade = resultado.results
     assert fade.per_episode.n == normal.per_episode.n == 1
     assert fade.per_episode.mean_pnl == pytest.approx(-normal.per_episode.mean_pnl)
-    assert fade.per_episode.mean_favourable == pytest.approx(normal.per_episode.mean_adverse)
-    assert fade.per_episode.mean_adverse == pytest.approx(normal.per_episode.mean_favourable)
+    # El fade es la posición contraria: sus excursiones son las de la señal
+    # original intercambiadas Y NEGADAS (no solo intercambiadas) -si no, la
+    # favorable del fade sale negativa y la adversa positiva, lo cual es
+    # semánticamente imposible-.
+    assert fade.per_episode.mean_favourable == pytest.approx(-normal.per_episode.mean_adverse)
+    assert fade.per_episode.mean_adverse == pytest.approx(-normal.per_episode.mean_favourable)
 
 
 def test_regla_fade_filtra_por_direccion_de_la_senal_original_no_por_la_operacion(conn):
