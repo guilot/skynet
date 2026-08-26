@@ -163,6 +163,56 @@ def test_run_no_divide_episodio_por_senales_de_otra_direccion_filtradas(conn):
     assert combo.per_episode.n == 1  # NO 2: mismo episodio bajo la regla LONG
 
 
+# --- fade ---------------------------------------------------------------
+
+def test_run_con_regla_fade_invierte_el_pnl_de_su_gemela_no_fade(conn):
+    repo = SignalRepo(conn)
+    sid = insertar_senal(repo, "AAAUSDT", 0, State.HOT, Direction.LONG)
+    insertar_outcome(repo, sid, 5, return_pct=2.0, mfe_pct=2.5, mae_pct=-0.5)
+
+    regla_normal = EntryRule(label="HOT+ / ALL", min_state=State.HOT, direction="ALL")
+    regla_fade = EntryRule(
+        label="FADE HOT+ / ALL", min_state=State.HOT, direction="ALL", fade=True
+    )
+    resultado = run(
+        repo, horizons=(5,), gap_minutes=30, legacy_cutoff_ts=10**15,
+        min_episodes_for_significance=30, entry_rules=(regla_normal, regla_fade),
+    )
+    normal, fade = resultado.results
+    assert fade.per_episode.n == normal.per_episode.n == 1
+    assert fade.per_episode.mean_pnl == pytest.approx(-normal.per_episode.mean_pnl)
+    # El fade es la posición contraria: sus excursiones son las de la señal
+    # original intercambiadas Y NEGADAS (no solo intercambiadas) -si no, la
+    # favorable del fade sale negativa y la adversa positiva, lo cual es
+    # semánticamente imposible-.
+    assert fade.per_episode.mean_favourable == pytest.approx(-normal.per_episode.mean_adverse)
+    assert fade.per_episode.mean_adverse == pytest.approx(-normal.per_episode.mean_favourable)
+
+
+def test_regla_fade_filtra_por_direccion_de_la_senal_original_no_por_la_operacion(conn):
+    """El filtro de dirección de la regla se aplica a la señal tal cual fue
+    grabada -qué señales se toman-, no a la operación resultante del fade
+    -cómo se toman-. Una regla FADE/SHORT solo admite señales SHORT, aunque
+    lo que se opere sea, en la práctica, un LONG."""
+    repo = SignalRepo(conn)
+    sid_long = insertar_senal(repo, "AAAUSDT", 0, State.HOT, Direction.LONG)
+    sid_short = insertar_senal(repo, "BBBUSDT", 0, State.HOT, Direction.SHORT)
+    insertar_outcome(repo, sid_long, 5, return_pct=1.0, mfe_pct=1.0, mae_pct=0.0)
+    insertar_outcome(repo, sid_short, 5, return_pct=-1.0, mfe_pct=0.0, mae_pct=-1.0)
+
+    regla_fade_short = EntryRule(
+        label="FADE HOT+ / SHORT", min_state=State.HOT, direction="SHORT", fade=True
+    )
+    resultado = run(
+        repo, horizons=(5,), gap_minutes=30, legacy_cutoff_ts=10**15,
+        min_episodes_for_significance=30, entry_rules=(regla_fade_short,),
+    )
+    combo = resultado.results[0]
+    assert combo.per_signal.n == 1  # solo la señal SHORT califica
+    # SHORT con return_pct=-1.0 -> P&L normal +1.0 (gana); fade lo invierte a -1.0.
+    assert combo.per_signal.mean_pnl == pytest.approx(-1.0)
+
+
 def test_run_con_base_vacia_no_lanza(conn):
     repo = SignalRepo(conn)
     regla = EntryRule(label="HOT+ / ALL", min_state=State.HOT, direction="ALL")

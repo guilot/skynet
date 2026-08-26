@@ -75,7 +75,8 @@ def compute_all(
         ]
         for horizonte in horizons:
             stats_señal, stats_episodio = compute_combo_stats(
-                calificados, episodios_totales, data.outcomes_by_signal, horizonte
+                calificados, episodios_totales, data.outcomes_by_signal, horizonte,
+                fade=regla.fade,
             )
             resultados.append(ComboResult(regla, horizonte, stats_señal, stats_episodio))
     return resultados

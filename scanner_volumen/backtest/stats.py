@@ -85,6 +85,7 @@ def compute_combo_stats(
     all_episodes: list[Episode],
     outcomes_by_signal: dict[int, dict[int, dict]],
     horizon: int,
+    fade: bool = False,
 ) -> tuple[HorizonStats, HorizonStats]:
     """Calcula las estadísticas por-señal y por-episodio para una
     combinación (regla de entrada ya aplicada -> `qualifying_signals`,
@@ -111,7 +112,25 @@ def compute_combo_stats(
     señal aislada. Un episodio sin ningún miembro calificado con resultado
     en este horizonte se descarta para este horizonte (no aporta un cero
     falso).
-    """
+
+    `fade`: si es `True`, cada punto (pnl, fav, adv) ya ajustado por
+    dirección se invierte -fadear una señal es tomar la posición contraria-.
+    El P&L se niega tal cual; lo favorable y lo adverso se intercambian Y SE
+    NIEGAN (no basta con el intercambio): lo que era adverso para la señal
+    original, negado, pasa a ser favorable para su fade, y viceversa. Negar
+    es obligatorio porque el fade es la posición contraria -si el precio
+    subió hasta mfe_pct=+3.0 (adverso para un short que fadea un long) eso
+    se traduce en una adversa de fade de -3.0, no de +3.0-; sin la negación,
+    la favorable del fade podía salir negativa y la adversa positiva, lo
+    cual es semánticamente imposible (favorable es el mejor punto a favor,
+    siempre >= 0 si hubo movimiento a favor; adversa el peor punto en
+    contra, siempre <= 0 si hubo movimiento en contra).
+    `qualifying_signals` ya viene filtrado por `EntryRule.matches`
+    sobre la señal ORIGINAL -el fade no cambia qué señales entran aquí, solo
+    cómo se puntúa cada una-. Una señal NEUTRAL no se trata distinto aquí:
+    `adjusted_return`/`adjusted_favourable`/`adjusted_adverse` ya la tratan
+    como un LONG (no invierten), así que su fade es, sin más, la negación de
+    ese mismo valor -no hay una rama NEUTRAL separada que mantener."""
     puntos: dict[int, tuple[float, float, float]] = {}
     direcciones: dict[int, str] = {}
     for s in qualifying_signals:
@@ -123,6 +142,8 @@ def compute_combo_stats(
         pnl = adjusted_return(direction, outcome["return_pct"])
         fav = adjusted_favourable(direction, outcome["mfe_pct"], outcome["mae_pct"])
         adv = adjusted_adverse(direction, outcome["mfe_pct"], outcome["mae_pct"])
+        if fade:
+            pnl, fav, adv = -pnl, -adv, -fav
         puntos[s["id"]] = (pnl, fav, adv)
 
     stats_señal = _resumen(list(puntos.values()))

@@ -138,6 +138,49 @@ def test_cabecera_muestra_cero_resultados_incompletos_de_forma_explicita():
 
 # --- Minor: la segmentación puede sumar por encima del total -----------
 
+# --- fade ---------------------------------------------------------------
+
+def test_fila_de_regla_fade_se_etiqueta_inconfundiblemente():
+    regla = EntryRule(
+        label="FADE HOT+ / ALL", min_state=State.HOT, direction="ALL", fade=True
+    )
+    resultado = ComboResult(regla, 5, per_signal=_stats(10), per_episode=_stats(30))
+    texto = format_report(_run([resultado]))
+    assert "FADE HOT+ / ALL" in texto
+
+
+def test_aviso_explica_que_el_fade_no_es_una_estrategia_operable():
+    texto = format_report(_run([]))
+    minuscula = texto.lower()
+    assert "fade" in minuscula
+    assert "horizonte fijo" in minuscula
+    assert "no es una estrategia operable" in minuscula or "no es una estrategia" in minuscula
+
+
+def test_aviso_explica_que_el_fade_no_modela_stop_ni_take_profit():
+    texto = format_report(_run([]))
+    minuscula = texto.lower()
+    # ya existe una sección general sobre stop/target; el aviso del fade
+    # debe remachar que tampoco a él se le puede derivar un resultado SL/TP.
+    assert "sl/tp" in minuscula or ("stop" in minuscula and "take profit" in minuscula)
+
+
+def test_aviso_explica_que_el_fade_no_modela_apalancamiento_liquidacion_slippage_ni_funding():
+    texto = format_report(_run([]))
+    minuscula = texto.lower()
+    for palabra in ("apalancamiento", "liquidaci", "slippage", "funding"):
+        assert palabra in minuscula, f"falta {palabra!r} en el aviso metodológico"
+    assert "adv%" in minuscula  # remite a la columna que sí mide el riesgo real
+
+
+def test_aviso_explica_que_la_muestra_del_fade_es_un_unico_regimen_de_mercado():
+    texto = format_report(_run([]))
+    minuscula = texto.lower()
+    assert "régimen" in minuscula or "regimen" in minuscula
+    assert "revers" in minuscula  # reversión a la media / mean-reversion
+    assert "cuatro días" in minuscula or "4 días" in minuscula or "4 dias" in minuscula
+
+
 def test_segmentacion_documenta_que_puede_sumar_por_encima_del_total():
     grupos = (
         ProvenanceGroup(label=LEGACY_ANTES_DEL_CORTE, n_signals=5, n_episodes=8,

@@ -1,6 +1,8 @@
 import pytest
 
-from scanner_volumen.backtest.entry_rules import EntryRule, default_entry_rules
+from scanner_volumen.backtest.entry_rules import (
+    DIRECCIONES_VALIDAS, EntryRule, default_entry_rules,
+)
 from scanner_volumen.models import State
 
 
@@ -60,3 +62,31 @@ def test_default_entry_rules_incluye_variantes_con_filtro_de_vwap():
     reglas = default_entry_rules()
     con_filtro = [r for r in reglas if r.max_vwap_distance is not None]
     assert con_filtro  # al menos una regla demuestra el filtro opcional
+
+
+# --- fade ---------------------------------------------------------------
+
+def test_entry_rule_fade_por_defecto_es_false():
+    regla = EntryRule(label="x", min_state=State.HOT, direction="ALL")
+    assert regla.fade is False
+
+
+def test_matches_no_depende_de_fade_filtra_igual_sobre_la_senal_original():
+    """El fade decide CÓMO se opera la señal, no CUÁLES señales califican:
+    `matches` debe comportarse idéntico con fade=True o fade=False, porque
+    los filtros de estado/dirección/vwap se evalúan siempre sobre la señal
+    tal cual fue grabada, nunca sobre la operación invertida."""
+    regla_normal = EntryRule(label="x", min_state=State.HOT, direction="SHORT")
+    regla_fade = EntryRule(label="x", min_state=State.HOT, direction="SHORT", fade=True)
+    for direccion in ("LONG", "SHORT", "NEUTRAL"):
+        assert regla_normal.matches(
+            state="HOT", direction=direccion, vwap_distance=None
+        ) == regla_fade.matches(state="HOT", direction=direccion, vwap_distance=None)
+
+
+def test_default_entry_rules_incluye_variantes_fade_de_hot_para_las_tres_direcciones():
+    reglas = default_entry_rules()
+    fade = [r for r in reglas if r.fade]
+    assert {r.direction for r in fade} == set(DIRECCIONES_VALIDAS)
+    assert all(r.min_state == State.HOT for r in fade)
+    assert all(r.label.startswith("FADE") for r in fade)

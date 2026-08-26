@@ -203,6 +203,131 @@ def test_compute_combo_stats_cuenta_episodios_de_direccion_mixta():
     assert stats_episodio.mean_pnl == pytest.approx((2.75 + 1.0) / 2)
 
 
+# --- fade: negación/intercambio de las tres cantidades direccionales ---
+
+def test_fade_invierte_el_pnl_direccional_de_un_long():
+    # LONG que sube +2% -> P&L normal +2.0, fade -2.0.
+    señales = [_senal(1, "AAA", 0, direction="LONG")]
+    outcomes = {1: {5: _outcome(return_pct=2.0, mfe_pct=2.0, mae_pct=0.0)}}
+    episodios = group_episodes(señales, gap_minutes=30)
+    stats_señal, stats_episodio = compute_combo_stats(
+        señales, episodios, outcomes, horizon=5, fade=True
+    )
+    assert stats_señal.mean_pnl == pytest.approx(-2.0)
+    assert stats_episodio.mean_pnl == pytest.approx(-2.0)
+
+
+def test_fade_invierte_el_pnl_direccional_de_un_short():
+    # SHORT cuyo precio cae -3.0%: P&L normal de la posición es +3.0
+    # (adjusted_return invierte el signo), y su fade es -3.0.
+    señales = [_senal(2, "BBB", 0, direction="SHORT")]
+    outcomes = {2: {5: _outcome(return_pct=-3.0, mfe_pct=0.0, mae_pct=-3.0)}}
+    episodios = group_episodes(señales, gap_minutes=30)
+    stats_señal_normal, _ = compute_combo_stats(
+        señales, episodios, outcomes, horizon=5, fade=False
+    )
+    stats_señal_fade, _ = compute_combo_stats(
+        señales, episodios, outcomes, horizon=5, fade=True
+    )
+    assert stats_señal_normal.mean_pnl == pytest.approx(3.0)
+    assert stats_señal_fade.mean_pnl == pytest.approx(-3.0)
+
+
+def test_fade_intercambia_y_niega_favorable_y_adversa():
+    # El fade es la posición contraria: no basta con intercambiar favorable
+    # y adversa, hay que NEGARLAS también. Ejemplo del bug real (regla FADE
+    # HOT+ / ALL a 60 min sobre datos reales): mfe=+3%, mae=-1% de la señal
+    # original producían FAV -2.25% / ADV +1.42% en el fade -una favorable
+    # negativa y una adversa positiva son semánticamente imposibles: lo
+    # favorable es el mejor punto a tu favor (>=0) y lo adverso el peor en
+    # tu contra (<=0)-. La regla correcta:
+    #   fade_favourable = -adjusted_adverse(señal)
+    #   fade_adverse    = -adjusted_favourable(señal)
+    señales = [_senal(1, "AAA", 0, direction="LONG")]
+    outcomes = {1: {5: _outcome(return_pct=2.0, mfe_pct=5.0, mae_pct=-1.5)}}
+    episodios = group_episodes(señales, gap_minutes=30)
+    stats_señal_normal, _ = compute_combo_stats(
+        señales, episodios, outcomes, horizon=5, fade=False
+    )
+    stats_señal_fade, _ = compute_combo_stats(
+        señales, episodios, outcomes, horizon=5, fade=True
+    )
+    assert stats_señal_normal.mean_favourable == pytest.approx(5.0)
+    assert stats_señal_normal.mean_adverse == pytest.approx(-1.5)
+    # fade: la favorable es la adversa original NEGADA, y viceversa.
+    assert stats_señal_fade.mean_favourable == pytest.approx(1.5)
+    assert stats_señal_fade.mean_adverse == pytest.approx(-5.0)
+    assert stats_señal_fade.mean_favourable == pytest.approx(-stats_señal_normal.mean_adverse)
+    assert stats_señal_fade.mean_adverse == pytest.approx(-stats_señal_normal.mean_favourable)
+
+
+def test_fade_favorable_es_positiva_y_adversa_es_negativa_por_construccion():
+    """Invariante semántica que ninguna fila fade puede violar: favorable es
+    el mejor punto a favor de la posición (siempre >= 0 si hubo algún
+    movimiento a favor) y adversa el peor punto en contra (siempre <= 0 si
+    hubo algún movimiento en contra) -sea la fila fade o no-. Reproduce el
+    caso concreto del bug: señal original con mfe=+3.0 (favorable) y
+    mae=-1.0 (adversa) reales -> fade favorable=+1.0, fade adversa=-3.0."""
+    señales = [_senal(1, "AAA", 0, direction="LONG")]
+    outcomes = {1: {5: _outcome(return_pct=2.0, mfe_pct=3.0, mae_pct=-1.0)}}
+    episodios = group_episodes(señales, gap_minutes=30)
+    stats_señal_fade, _ = compute_combo_stats(
+        señales, episodios, outcomes, horizon=5, fade=True
+    )
+    assert stats_señal_fade.mean_favourable == pytest.approx(1.0)
+    assert stats_señal_fade.mean_adverse == pytest.approx(-3.0)
+    assert stats_señal_fade.mean_favourable > 0
+    assert stats_señal_fade.mean_adverse < 0
+
+
+def test_fade_agrupa_episodios_igual_que_sin_fade():
+    """Una racha de un solo símbolo debe seguir colapsando a un único
+    episodio bajo una regla fade -el agrupado de episodios no depende de
+    cómo se calcule el P&L sobre cada señal."""
+    señales = [
+        _senal(1, "BBB", 0),
+        _senal(2, "BBB", 60_000),
+        _senal(3, "BBB", 2 * 60_000),
+    ]
+    outcomes = {
+        1: {5: _outcome(-1.0, 0.5, -1.5)},
+        2: {5: _outcome(-1.0, 0.5, -1.5)},
+        3: {5: _outcome(-1.0, 0.5, -1.5)},
+    }
+    episodios = group_episodes(señales, gap_minutes=30)
+    _, stats_episodio_normal = compute_combo_stats(
+        señales, episodios, outcomes, horizon=5, fade=False
+    )
+    _, stats_episodio_fade = compute_combo_stats(
+        señales, episodios, outcomes, horizon=5, fade=True
+    )
+    assert stats_episodio_normal.n == 1
+    assert stats_episodio_fade.n == 1
+
+
+def test_fade_y_no_fade_son_negativos_exactos_a_nivel_de_episodio():
+    """La regla fade y su gemela no-fade sobre las mismas señales deben
+    producir P&L de episodio que son exactamente negativos entre sí -es la
+    propiedad de consistencia central del fade: no es un cálculo
+    independiente, es la negación limpia del directional existente."""
+    señales = [
+        _senal(1, "AAA", 0, direction="LONG"),
+        _senal(2, "BBB", 0, direction="SHORT"),
+        _senal(3, "BBB", 60_000, direction="SHORT"),
+    ]
+    outcomes = {
+        1: {5: _outcome(return_pct=2.0, mfe_pct=2.5, mae_pct=-0.5)},
+        2: {5: _outcome(return_pct=-1.0, mfe_pct=1.0, mae_pct=-2.0)},
+        3: {5: _outcome(return_pct=3.0, mfe_pct=3.5, mae_pct=-0.2)},
+    }
+    episodios = group_episodes(señales, gap_minutes=30)
+    _, normal = compute_combo_stats(señales, episodios, outcomes, horizon=5, fade=False)
+    _, fade = compute_combo_stats(señales, episodios, outcomes, horizon=5, fade=True)
+    assert fade.n == normal.n
+    assert fade.mean_pnl == pytest.approx(-normal.mean_pnl)
+    assert fade.median_pnl == pytest.approx(-normal.median_pnl)
+
+
 def test_regla_de_direccion_unica_nunca_produce_episodios_mixtos():
     """Por diseño, una regla /LONG o /SHORT solo deja pasar señales de esa
     dirección, así que ningún episodio calificado puede mezclar direcciones
