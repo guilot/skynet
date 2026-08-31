@@ -233,6 +233,76 @@ def test_abrir_una_base_del_esquema_viejo_crea_maintenance_meta_vacia(tmp_path):
         conn.close()
 
 
+def test_migra_desde_v2_anade_state_transitions_y_sube_la_version(tmp_path):
+    """Regresión de la tarea de trayectoria de estados: `state_transitions`
+    es una tabla completamente nueva (registra WATCH+ completo, incluidas
+    las transiciones que retroceden a NORMAL, que `signals` nunca captura).
+    Contra una base construida con el esquema anterior (versión 2, ya con
+    procedencia en `signals` pero sin esta tabla), `open_db` debe crearla y
+    subir `user_version` a 3, sin tocar ninguna fila ya existente."""
+    path = tmp_path / "v2_sin_transiciones.db"
+    conn_vieja = sqlite3.connect(path)
+    conn_vieja.executescript(
+        """
+        CREATE TABLE signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            state TEXT NOT NULL,
+            score REAL NOT NULL,
+            score_momentum REAL NOT NULL,
+            score_demand REAL NOT NULL,
+            score_structure REAL NOT NULL,
+            price REAL,
+            profile_confidence TEXT NOT NULL,
+            config_fingerprint TEXT NOT NULL,
+            code_revision TEXT NOT NULL
+        );
+        """
+    )
+    conn_vieja.execute(
+        """INSERT INTO signals
+           (id, ts, symbol, direction, state, score, score_momentum,
+            score_demand, score_structure, price, profile_confidence,
+            config_fingerprint, code_revision)
+           VALUES (1, 1000, 'AAAUSDT', 'LONG', 'HOT', 70.0, 30.0, 25.0, 15.0,
+                   100.0, 'high', ?, ?)""",
+        ("f" * 64, "abc1234"),
+    )
+    conn_vieja.execute("PRAGMA user_version = 2")
+    conn_vieja.commit()
+    conn_vieja.close()
+
+    conn = open_db(path)
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        assert version == 3
+
+        tablas = {
+            f["name"] for f in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert "state_transitions" in tablas
+
+        columnas = {f["name"] for f in conn.execute("PRAGMA table_info(state_transitions)")}
+        assert columnas == {
+            "id", "ts", "symbol", "prev_state", "new_state", "score", "price",
+            "direction", "escalated", "config_fingerprint", "code_revision",
+        }
+
+        # la fila de `signals` que ya existía en la base vieja sobrevive intacta.
+        fila_vieja = conn.execute(
+            "SELECT symbol, config_fingerprint, code_revision FROM signals WHERE id = 1"
+        ).fetchone()
+        assert fila_vieja["symbol"] == "AAAUSDT"
+        assert fila_vieja["config_fingerprint"] == "f" * 64
+        assert fila_vieja["code_revision"] == "abc1234"
+    finally:
+        conn.close()
+
+
 def test_abrir_dos_veces_la_misma_base_es_idempotente(tmp_path):
     """`open_db` puede llamarse más de una vez sobre la misma base (p. ej.
     tests que reabren, o un proceso reiniciado): la migración no debe

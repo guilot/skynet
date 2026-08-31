@@ -30,7 +30,7 @@ from scanner_volumen.engine.profile import build_profile
 from scanner_volumen.models import Candle, Contract, Ticker
 from scanner_volumen.storage.db import open_db
 from scanner_volumen.storage.repos import (
-    CandleRepo, MaintenanceRepo, ProfileRepo, SignalRepo,
+    CandleRepo, MaintenanceRepo, ProfileRepo, SignalRepo, StateTransitionRepo,
 )
 from scanner_volumen.universe.selector import UniverseSelector
 
@@ -82,7 +82,8 @@ def orq(tmp_path):
     o = Orchestrator(
         cfg=cfg, rest=None, ws=None,
         candle_repo=CandleRepo(conn), profile_repo=ProfileRepo(conn),
-        signal_repo=SignalRepo(conn), supply=SupplyFalso(),
+        signal_repo=SignalRepo(conn), state_transition_repo=StateTransitionRepo(conn),
+        supply=SupplyFalso(),
         bootstrapper=BootstrapperFalso(cfg.profile),
     )
     yield o
@@ -191,6 +192,16 @@ async def test_paso_outcomes_no_propaga_un_fallo_del_tracker():
             raise RuntimeError("Bitget no responde")
 
     await paso_outcomes(TrackerRoto(), ahora=0)  # no lanza
+
+
+async def test_paso_evaluador_no_propaga_un_fallo_de_evaluate(orq, monkeypatch):
+    # Con el registro de transiciones WATCH+ hay muchas mas escrituras; un
+    # fallo transitorio de persistencia no debe tumbar el bucle del evaluador.
+    def evaluate_roto(now_ms):
+        raise RuntimeError("SQLite: disk I/O error")
+
+    monkeypatch.setattr(orq, "evaluate", evaluate_roto)
+    await paso_evaluador(orq, orq.bootstrapper, ahora=14 * DIA)  # no lanza
 
 
 async def test_paso_mantenimiento_delega_en_run_maintenance(orq, maintenance_repo):

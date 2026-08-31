@@ -19,7 +19,9 @@ from scanner_volumen.scoring.score import (
     CLAVES_DEMAND, CLAVES_MOMENTUM, CLAVES_STRUCTURE,
 )
 from scanner_volumen.storage.db import open_db
-from scanner_volumen.storage.repos import CandleRepo, ProfileRepo, SignalRepo
+from scanner_volumen.storage.repos import (
+    CandleRepo, ProfileRepo, SignalRepo, StateTransitionRepo,
+)
 from scanner_volumen.universe.selector import UniverseSelector
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -61,7 +63,8 @@ def orq(tmp_path):
     yield Orchestrator(
         cfg=cfg, rest=None, ws=None,
         candle_repo=CandleRepo(conn), profile_repo=ProfileRepo(conn),
-        signal_repo=SignalRepo(conn), supply=SupplyFalso(),
+        signal_repo=SignalRepo(conn), state_transition_repo=StateTransitionRepo(conn),
+        supply=SupplyFalso(),
         bootstrapper=BootstrapperFalso(cfg.profile),
     )
     conn.close()
@@ -188,7 +191,8 @@ async def test_reproducir_dos_veces_da_el_mismo_resultado(orq, tmp_path):
     otro = Orchestrator(
         cfg=cfg, rest=None, ws=None,
         candle_repo=CandleRepo(conn2), profile_repo=ProfileRepo(conn2),
-        signal_repo=SignalRepo(conn2), supply=SupplyFalso(),
+        signal_repo=SignalRepo(conn2), state_transition_repo=StateTransitionRepo(conn2),
+        supply=SupplyFalso(),
         bootstrapper=BootstrapperFalso(cfg.profile),
     )
     segunda = await reproducir(otro)

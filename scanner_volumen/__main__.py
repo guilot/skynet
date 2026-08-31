@@ -41,7 +41,8 @@ from scanner_volumen.config import load_config
 from scanner_volumen.provenance import get_code_revision
 from scanner_volumen.storage.db import open_db
 from scanner_volumen.storage.repos import (
-    CandleRepo, MaintenanceRepo, ProfileRepo, SignalRepo, SupplyRepo,
+    CandleRepo, MaintenanceRepo, ProfileRepo, SignalRepo, StateTransitionRepo,
+    SupplyRepo,
 )
 from scanner_volumen.universe.selector import UniverseSelector
 from scanner_volumen.universe.supply import SupplyCache
@@ -114,14 +115,21 @@ async def paso_evaluador(orq: Orchestrator, bootstrapper: Bootstrapper, ahora: i
     el progreso del bootstrap. Ver `paso_tickers` sobre por qué está
     extraído como función con nombre (I-5)."""
     orq.state.now_ms = ahora  # I-2(a): "ahora" del exchange, para el dashboard
-    for simbolo in list(orq.reconnected):
-        orq.reconnected.discard(simbolo)
-        await orq.refill_gap(simbolo, ahora)
-    for t in orq.evaluate(ahora):
-        if t.should_alert:
-            log.info("ALERTA %s %s score=%.1f", t.symbol, t.current.value, t.score)
-    hecho, total = bootstrapper.progress()
-    orq.state.bootstrap_done, orq.state.bootstrap_total = hecho, total
+    # Igual que `paso_outcomes`: un fallo transitorio (p. ej. un error de
+    # SQLite al persistir una señal o una transición de estado) no debe tumbar
+    # el bucle del evaluador. Con el registro de transiciones WATCH+ hay muchas
+    # más escrituras por hora, así que el bucle necesita esta red.
+    try:
+        for simbolo in list(orq.reconnected):
+            orq.reconnected.discard(simbolo)
+            await orq.refill_gap(simbolo, ahora)
+        for t in orq.evaluate(ahora):
+            if t.should_alert:
+                log.info("ALERTA %s %s score=%.1f", t.symbol, t.current.value, t.score)
+        hecho, total = bootstrapper.progress()
+        orq.state.bootstrap_done, orq.state.bootstrap_total = hecho, total
+    except Exception as exc:  # noqa: BLE001
+        log.warning("paso del evaluador fallido: %s", exc)
 
 
 async def paso_outcomes(tracker: OutcomeTracker, ahora: int) -> None:
@@ -243,6 +251,7 @@ async def main(argv: list[str] | None = None) -> None:
     candle_repo = CandleRepo(conn)
     profile_repo = ProfileRepo(conn)
     signal_repo = SignalRepo(conn)
+    state_transition_repo = StateTransitionRepo(conn)
     supply_repo = SupplyRepo(conn)
     maintenance_repo = MaintenanceRepo(conn)
 
@@ -253,7 +262,7 @@ async def main(argv: list[str] | None = None) -> None:
         bootstrapper = Bootstrapper(rest, candle_repo, profile_repo, cfg.profile)
         selector = UniverseSelector(cfg.universe)
         orq = Orchestrator(cfg, rest, ws, candle_repo, profile_repo,
-                            signal_repo, supply, bootstrapper,
+                            signal_repo, state_transition_repo, supply, bootstrapper,
                             code_revision=code_revision)
         orq.state.stale_after_ms = int(cfg.dashboard.stale_after_seconds * 1000)
         tracker = OutcomeTracker(

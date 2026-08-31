@@ -10,10 +10,11 @@ from scanner_volumen.app.orchestrator import Orchestrator
 from scanner_volumen.bitget.ws import WsEvent
 from scanner_volumen.config import load_config
 from scanner_volumen.engine.profile import build_profile
-from scanner_volumen.models import Candle, State, Ticker
+from scanner_volumen.models import Candle, Direction, State, Ticker
+from scanner_volumen.scoring.score import ScoreBreakdown
 from scanner_volumen.storage.db import open_db
 from scanner_volumen.storage.repos import (
-    CandleRepo, ProfileRepo, SignalRepo, SupplyRepo,
+    CandleRepo, ProfileRepo, SignalRepo, StateTransitionRepo, SupplyRepo,
 )
 from scanner_volumen.universe.selector import UniverseUpdate
 from pathlib import Path
@@ -108,6 +109,7 @@ def orq(tmp_path):
         candle_repo=CandleRepo(conn),
         profile_repo=ProfileRepo(conn),
         signal_repo=SignalRepo(conn),
+        state_transition_repo=StateTransitionRepo(conn),
         supply=SupplyFalso(),
         bootstrapper=BootstrapperFalso(cfg.profile),
     )
@@ -187,6 +189,95 @@ async def test_un_pump_genera_transicion_y_se_persiste(orq):
     assert snap.state.rank >= State.WATCH.rank
     assert escaladas_a_hot_o_mas >= 1
     assert len(orq.signal_repo.recent(since_ms=0)) == escaladas_a_hot_o_mas
+
+
+# --- trayectoria completa de estados (state_transitions) ---
+#
+# `signals` solo persiste escaladas a HOT+ (`persisted_min_state`, ver
+# `evaluate`); `state_transitions` debe registrar la trayectoria completa
+# de cualquier transición que toque WATCH o superior, incluidas las que
+# retroceden a NORMAL, que `signals` nunca ha podido capturar. Se controla
+# `score_symbol` con un doble de prueba para fijar exactamente en qué tick
+# cae cada transición, en vez de depender de que una curva de pump real
+# cruce cada umbral en el tick exacto esperado.
+
+def _desglose_falso(total):
+    return ScoreBreakdown(total=total, raw_total=total, momentum=total,
+                          demand=0.0, structure=0.0,
+                          direction=Direction.LONG, components={})
+
+
+def _instalar_score_falso(monkeypatch, *puntuaciones):
+    """Sustituye `score_symbol` por un doble que devuelve, en orden, un
+    `ScoreBreakdown` por cada llamada (una por cada `evaluate` de un tick)."""
+    cola = iter(puntuaciones)
+
+    def falso(metrics, cfg):
+        return _desglose_falso(next(cola))
+
+    monkeypatch.setattr("scanner_volumen.app.orchestrator.score_symbol", falso)
+
+
+async def test_normal_a_watch_persiste_una_transicion(orq, monkeypatch):
+    await orq.ensure_profile("AAAUSDT", now_ms=14 * DIA)
+    orq.set_ticker(Ticker("AAAUSDT", 100.0, 1.0, 5e6, 100.0, 0.0001, 0))
+    # 30 -> NORMAL (sin transición: mismo rango que el estado inicial),
+    # 55 -> WATCH (watch=50, hot=65 en config.toml): escalada, pero por
+    # debajo de HOT, así que no debe tocar `signals`.
+    _instalar_score_falso(monkeypatch, 30.0, 55.0)
+
+    for m in range(2):
+        await orq.handle_ws_event(
+            WsEvent(kind="update", symbol="AAAUSDT",
+                    candles=[vela(14 * DIA + m * MINUTO)])
+        )
+        orq.evaluate(now_ms=14 * DIA + m * MINUTO + 59_000)
+
+    filas = orq.state_transition_repo.recent(since_ms=0)
+    assert len(filas) == 1
+    assert filas[0]["prev_state"] == "NORMAL"
+    assert filas[0]["new_state"] == "WATCH"
+    assert filas[0]["score"] == 55.0
+    assert filas[0]["direction"] == "LONG"
+    assert filas[0]["escalated"] == 1
+    assert orq.signal_repo.recent(since_ms=0) == []  # WATCH no es HOT+: signals no se toca
+
+
+async def test_watch_a_hot_persiste_transicion_y_tambien_signal(orq, monkeypatch):
+    """Una escalada a HOT+ sigue escribiendo en `signals` como siempre -las
+    dos tablas son independientes, no una sustituye a la otra."""
+    await orq.ensure_profile("AAAUSDT", now_ms=14 * DIA)
+    orq.set_ticker(Ticker("AAAUSDT", 100.0, 1.0, 5e6, 100.0, 0.0001, 0))
+    _instalar_score_falso(monkeypatch, 30.0, 55.0, 75.0)  # NORMAL, WATCH, HOT
+
+    for m in range(3):
+        await orq.handle_ws_event(
+            WsEvent(kind="update", symbol="AAAUSDT",
+                    candles=[vela(14 * DIA + m * MINUTO)])
+        )
+        orq.evaluate(now_ms=14 * DIA + m * MINUTO + 59_000)
+
+    filas = orq.state_transition_repo.recent(since_ms=0)
+    assert len(filas) == 2
+    por_transicion = {(f["prev_state"], f["new_state"]) for f in filas}
+    assert por_transicion == {("NORMAL", "WATCH"), ("WATCH", "HOT")}
+
+    senales = orq.signal_repo.recent(since_ms=0)
+    assert len(senales) == 1
+    assert senales[0]["state"] == "HOT"
+
+
+def test_toca_watch_o_mas_filtra_transiciones_que_no_llegan_a_watch():
+    """El filtro real: `NORMAL -> NORMAL` no ocurre nunca en la práctica
+    (`StateMachine.update` solo emite `Transition` cuando el estado cambia),
+    pero se comprueba igualmente aquí (I) porque es justo el caso que
+    `state_transitions` debe excluir si alguna vez pudiera ocurrir."""
+    from scanner_volumen.app.orchestrator import _toca_watch_o_mas
+
+    assert _toca_watch_o_mas(State.NORMAL, State.WATCH) is True
+    assert _toca_watch_o_mas(State.WATCH, State.NORMAL) is True
+    assert _toca_watch_o_mas(State.HOT, State.SIGNAL) is True
+    assert _toca_watch_o_mas(State.NORMAL, State.NORMAL) is False
 
 
 async def test_rvol_session_y_vwap_reflejan_la_sesion_completa_no_solo_lo_llegado_por_ws(orq):

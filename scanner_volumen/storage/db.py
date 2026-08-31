@@ -110,6 +110,34 @@ CREATE TABLE IF NOT EXISTS maintenance_meta (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     last_completed_ms INTEGER NOT NULL
 );
+
+-- Trayectoria completa de estados por símbolo (WATCH o superior), incluidas
+-- las transiciones que "mueren" (p. ej. WATCH -> NORMAL) que `signals` nunca
+-- captura porque solo persiste escaladas a HOT+ (ver `Orchestrator.
+-- evaluate`). Solo logging: a diferencia de `signals`, esta tabla no tiene
+-- ningún `..._outcomes` asociado -el análisis posterior calcula los retornos
+-- cruzando estos `ts` con `candles_1m`, no desde aquí-. Ver
+-- `StateTransitionRepo` (storage/repos.py) y el informe de la tarea.
+-- Tabla nueva, igual que `maintenance_meta`: un `CREATE TABLE IF NOT
+-- EXISTS` no toca ninguna tabla ya existente, así que no hace falta ninguna
+-- migración de columnas para que esto sea seguro contra la base de
+-- producción -solo se sube `VERSION_ESQUEMA` para que quede registrado que
+-- el esquema actual la incluye (ver `_migrar_v3_state_transitions`).
+CREATE TABLE IF NOT EXISTS state_transitions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    symbol TEXT NOT NULL,
+    prev_state TEXT NOT NULL,
+    new_state TEXT NOT NULL,
+    score REAL NOT NULL,
+    price REAL,
+    direction TEXT NOT NULL,
+    escalated INTEGER NOT NULL,
+    config_fingerprint TEXT NOT NULL,
+    code_revision TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_state_transitions_ts ON state_transitions(ts);
 """
 
 
@@ -118,7 +146,7 @@ CREATE TABLE IF NOT EXISTS maintenance_meta (
 # tocar porque ya existe. `PRAGMA user_version` es el mecanismo nativo de
 # SQLite para esto -entero simple embebido en el propio fichero, sin tabla
 # adicional que crear ni de la que depender antes de tener esquema-.
-VERSION_ESQUEMA = 2
+VERSION_ESQUEMA = 3
 
 
 def _migrar(conn: sqlite3.Connection) -> None:
@@ -145,6 +173,8 @@ def _migrar(conn: sqlite3.Connection) -> None:
         _migrar_v1_columnas_de_outcome(conn)
     if version_actual < 2:
         _migrar_v2_procedencia_de_signals(conn)
+    if version_actual < 3:
+        _migrar_v3_state_transitions(conn)
     if version_actual < VERSION_ESQUEMA:
         conn.execute(f"PRAGMA user_version = {VERSION_ESQUEMA}")
         conn.commit()
@@ -213,6 +243,18 @@ def _migrar_v2_procedencia_de_signals(conn: sqlite3.Connection) -> None:
             f"DEFAULT '{PRE_PROVENANCE_SENTINEL}'"
         )
     conn.commit()
+
+
+def _migrar_v3_state_transitions(conn: sqlite3.Connection) -> None:
+    """No-op declarado: `state_transitions` es una tabla enteramente nueva
+    (igual que `maintenance_meta`), así que el propio `CREATE TABLE IF NOT
+    EXISTS` de `ESQUEMA` -que corre después de `_migrar`, sin condicionar a
+    la versión- ya la crea contra cualquier base existente sin tocar ninguna
+    columna de una tabla ya existente. Este paso solo existe para que
+    `VERSION_ESQUEMA`/`PRAGMA user_version` reflejen que el esquema actual
+    incluye `state_transitions`, igual que el resto de pasos numerados de
+    `_migrar`."""
+    return
 
 
 def open_db(path: Path) -> sqlite3.Connection:
