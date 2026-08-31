@@ -6,9 +6,11 @@ from scanner_volumen.engine.metrics import SymbolMetrics
 from scanner_volumen.engine.profile import SlotStats, VolumeProfile
 from scanner_volumen.models import Candle, Direction, State
 from scanner_volumen.scoring.score import ScoreBreakdown
+from scanner_volumen.scoring.states import Transition
 from scanner_volumen.storage.db import open_db
 from scanner_volumen.storage.repos import (
-    CandleRepo, MaintenanceRepo, ProfileRepo, SignalRepo, SupplyRepo,
+    CandleRepo, MaintenanceRepo, ProfileRepo, SignalRepo, StateTransitionRepo,
+    SupplyRepo,
 )
 
 MINUTO = 60_000
@@ -351,6 +353,74 @@ def test_all_outcomes_devuelve_todos_los_horizontes_de_todas_las_senales(conn):
     assert len(filas) == 2
     claves = {(f["signal_id"], f["horizon_min"]) for f in filas}
     assert claves == {(sid1, 1), (sid2, 5)}
+
+
+def transicion_de_prueba(**kwargs):
+    base = dict(
+        symbol="AAAUSDT", previous=State.NORMAL, current=State.WATCH,
+        score=55.0, escalated=True, should_alert=False, ts=12_345,
+    )
+    base.update(kwargs)
+    return Transition(**base)
+
+
+def test_state_transition_repo_inserta_y_recupera_con_procedencia(conn):
+    repo = StateTransitionRepo(conn)
+    transicion = transicion_de_prueba()
+    tid = repo.insert(
+        transicion, price=6.72, direction=Direction.LONG,
+        config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA,
+    )
+    assert tid > 0
+
+    filas = repo.recent(since_ms=0)
+    assert len(filas) == 1
+    fila = filas[0]
+    assert fila["ts"] == 12_345
+    assert fila["symbol"] == "AAAUSDT"
+    assert fila["prev_state"] == "NORMAL"
+    assert fila["new_state"] == "WATCH"
+    assert fila["score"] == 55.0
+    assert fila["price"] == 6.72
+    assert fila["direction"] == "LONG"
+    assert fila["escalated"] == 1
+    assert fila["config_fingerprint"] == FP_PRUEBA
+    assert fila["code_revision"] == REV_PRUEBA
+
+
+def test_state_transition_repo_registra_una_bajada_a_normal(conn):
+    """La transición que `signals` nunca captura (solo persiste escaladas a
+    HOT+): WATCH -> NORMAL, con `escalated=False`."""
+    repo = StateTransitionRepo(conn)
+    transicion = transicion_de_prueba(
+        previous=State.WATCH, current=State.NORMAL, score=40.0,
+        escalated=False, ts=99_999,
+    )
+    repo.insert(
+        transicion, price=None, direction=Direction.NEUTRAL,
+        config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA,
+    )
+    fila = repo.recent(since_ms=0)[0]
+    assert fila["prev_state"] == "WATCH"
+    assert fila["new_state"] == "NORMAL"
+    assert fila["escalated"] == 0
+    # el precio nulo (símbolo sin ticker/buffer con precio disponible) se
+    # guarda como NULL, nunca como 0: sería indistinguible de un precio real.
+    assert fila["price"] is None
+    assert fila["direction"] == "NEUTRAL"
+
+
+def test_state_transition_repo_recent_filtra_por_timestamp(conn):
+    repo = StateTransitionRepo(conn)
+    repo.insert(
+        transicion_de_prueba(ts=1000), price=1.0, direction=Direction.LONG,
+        config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA,
+    )
+    repo.insert(
+        transicion_de_prueba(ts=9000), price=1.0, direction=Direction.LONG,
+        config_fingerprint=FP_PRUEBA, code_revision=REV_PRUEBA,
+    )
+    assert len(repo.recent(since_ms=5000)) == 1
 
 
 def test_supply_repo_hace_upsert(conn):

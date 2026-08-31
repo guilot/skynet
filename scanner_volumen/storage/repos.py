@@ -8,8 +8,9 @@ import sqlite3
 
 from scanner_volumen.engine.metrics import SymbolMetrics
 from scanner_volumen.engine.profile import MINUTOS_POR_DIA, SlotStats, VolumeProfile
-from scanner_volumen.models import Candle, State
+from scanner_volumen.models import Candle, Direction, State
 from scanner_volumen.scoring.score import ScoreBreakdown
+from scanner_volumen.scoring.states import Transition
 
 
 class CandleRepo:
@@ -247,6 +248,63 @@ class SignalRepo:
              candles_seen, candles_expected),
         )
         self._conn.commit()
+
+
+class StateTransitionRepo:
+    """Persiste la trayectoria completa de estados (WATCH o superior) de
+    cada símbolo -incluidas las transiciones que retroceden a NORMAL, que
+    `signals` nunca captura porque solo persiste escaladas a HOT+ (ver
+    `Orchestrator.evaluate` y `_persisted_min_state`)-, para poder medir
+    después estrategias del tipo "entra en X, sale en Y" (p. ej. entra en
+    WATCH, sale en HOT) sin look-ahead, cruzando estos `ts` con las velas ya
+    persistidas en `candles_1m`.
+
+    Puramente aditiva y de solo logging (I de la tarea): a diferencia de
+    `signals`, esta tabla no tiene ningún `..._outcomes` asociado -el
+    análisis posterior calcula los retornos desde `candles_1m`, no desde
+    aquí-, y su llamador (`evaluate`) es quien decide qué transiciones
+    califican (`prev_state`/`new_state` WATCH o superior); este repositorio
+    no repite ese filtro, solo persiste lo que se le pasa."""
+
+    _CAMPOS = (
+        "ts", "symbol", "prev_state", "new_state", "score", "price",
+        "direction", "escalated", "config_fingerprint", "code_revision",
+    )
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def insert(
+        self, transition: Transition, price: float | None, direction: Direction,
+        config_fingerprint: str, code_revision: str,
+    ) -> int:
+        """`price`/`direction`/procedencia no los conoce `Transition` -solo
+        `symbol`/`previous`/`current`/`score`/`escalated`/`ts`-, así que el
+        llamador (`evaluate`) los pasa aparte, tomados de la misma foto de
+        métricas y breakdown que usa `SignalRepo.insert` para la señal HOT+,
+        con el mismo `config_fingerprint`/`code_revision`, para que ambas
+        tablas sean comparables entre sí."""
+        valores = (
+            transition.ts, transition.symbol, transition.previous.value,
+            transition.current.value, transition.score, price,
+            direction.value, int(transition.escalated),
+            config_fingerprint, code_revision,
+        )
+        marcadores = ", ".join("?" * len(self._CAMPOS))
+        cur = self._conn.execute(
+            f"INSERT INTO state_transitions ({', '.join(self._CAMPOS)}) "
+            f"VALUES ({marcadores})",
+            valores,
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def recent(self, since_ms: int) -> list[dict]:
+        filas = self._conn.execute(
+            "SELECT * FROM state_transitions WHERE ts >= ? ORDER BY ts DESC",
+            (since_ms,),
+        ).fetchall()
+        return [dict(f) for f in filas]
 
 
 class MaintenanceRepo:

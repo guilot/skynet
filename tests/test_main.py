@@ -30,7 +30,7 @@ from scanner_volumen.engine.profile import build_profile
 from scanner_volumen.models import Candle, Contract, Ticker
 from scanner_volumen.storage.db import open_db
 from scanner_volumen.storage.repos import (
-    CandleRepo, MaintenanceRepo, ProfileRepo, SignalRepo,
+    CandleRepo, MaintenanceRepo, ProfileRepo, SignalRepo, StateTransitionRepo,
 )
 from scanner_volumen.universe.selector import UniverseSelector
 
@@ -82,7 +82,8 @@ def orq(tmp_path):
     o = Orchestrator(
         cfg=cfg, rest=None, ws=None,
         candle_repo=CandleRepo(conn), profile_repo=ProfileRepo(conn),
-        signal_repo=SignalRepo(conn), supply=SupplyFalso(),
+        signal_repo=SignalRepo(conn), state_transition_repo=StateTransitionRepo(conn),
+        supply=SupplyFalso(),
         bootstrapper=BootstrapperFalso(cfg.profile),
     )
     yield o

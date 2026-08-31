@@ -23,7 +23,9 @@ from scanner_volumen.models import State, Ticker
 from scanner_volumen.provenance import UNKNOWN_REVISION, config_fingerprint
 from scanner_volumen.scoring.score import score_symbol
 from scanner_volumen.scoring.states import StateMachine, Transition
-from scanner_volumen.storage.repos import CandleRepo, ProfileRepo, SignalRepo
+from scanner_volumen.storage.repos import (
+    CandleRepo, ProfileRepo, SignalRepo, StateTransitionRepo,
+)
 
 MINUTO_MS = 60_000
 DIA_MS = 1440 * MINUTO_MS
@@ -31,10 +33,26 @@ DIA_MS = 1440 * MINUTO_MS
 log = logging.getLogger(__name__)
 
 
+def _toca_watch_o_mas(previous: State, current: State) -> bool:
+    """True si la transición pasa por WATCH o un estado más severo, en el
+    lado que sea (`previous` o `current`): es el filtro que decide qué
+    transiciones se persisten en `state_transitions`, incluidas las que
+    retroceden a NORMAL, que `signals` nunca captura porque solo persiste
+    escaladas a HOT+ (ver `_persisted_min_state` en `evaluate`).
+
+    `NORMAL -> NORMAL` no ocurre nunca en la práctica -`StateMachine.update`
+    solo emite un `Transition` cuando el estado realmente cambia-, pero la
+    condición se expresa sobre el máximo de los dos rangos para que siga
+    siendo correcta incluso en ese caso imposible, en vez de depender
+    silenciosamente de una garantía que vive en otro módulo."""
+    return max(previous.rank, current.rank) >= State.WATCH.rank
+
+
 class Orchestrator:
     def __init__(
         self, cfg: Config, rest, ws, candle_repo: CandleRepo,
-        profile_repo: ProfileRepo, signal_repo: SignalRepo, supply, bootstrapper,
+        profile_repo: ProfileRepo, signal_repo: SignalRepo,
+        state_transition_repo: StateTransitionRepo, supply, bootstrapper,
         code_revision: str = UNKNOWN_REVISION,
     ) -> None:
         self.cfg = cfg
@@ -43,6 +61,7 @@ class Orchestrator:
         self.candle_repo = candle_repo
         self.profile_repo = profile_repo
         self.signal_repo = signal_repo
+        self.state_transition_repo = state_transition_repo
         self.supply = supply
         self.bootstrapper = bootstrapper
         # Procedencia (ver `provenance.py`): el fingerprint se deriva de
@@ -811,6 +830,18 @@ class Orchestrator:
                 ):
                     self.signal_repo.insert(
                         metricas, desglose, transicion.current,
+                        self._config_fingerprint, self._code_revision,
+                    )
+
+                # trayectoria completa de estados (I: solo logging, ver
+                # `StateTransitionRepo`): independiente del bloque de arriba
+                # -no exige escalado ni HOT+ ni libro validado-, así que una
+                # escalada a HOT+ escribe en las dos tablas y una bajada de
+                # WATCH a NORMAL (que el bloque de arriba nunca alcanza a
+                # ver, porque `escalado` es False) escribe solo en esta.
+                if _toca_watch_o_mas(transicion.previous, transicion.current):
+                    self.state_transition_repo.insert(
+                        transicion, metricas.price, desglose.direction,
                         self._config_fingerprint, self._code_revision,
                     )
 
