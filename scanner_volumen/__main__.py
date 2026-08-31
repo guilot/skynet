@@ -115,14 +115,21 @@ async def paso_evaluador(orq: Orchestrator, bootstrapper: Bootstrapper, ahora: i
     el progreso del bootstrap. Ver `paso_tickers` sobre por qué está
     extraído como función con nombre (I-5)."""
     orq.state.now_ms = ahora  # I-2(a): "ahora" del exchange, para el dashboard
-    for simbolo in list(orq.reconnected):
-        orq.reconnected.discard(simbolo)
-        await orq.refill_gap(simbolo, ahora)
-    for t in orq.evaluate(ahora):
-        if t.should_alert:
-            log.info("ALERTA %s %s score=%.1f", t.symbol, t.current.value, t.score)
-    hecho, total = bootstrapper.progress()
-    orq.state.bootstrap_done, orq.state.bootstrap_total = hecho, total
+    # Igual que `paso_outcomes`: un fallo transitorio (p. ej. un error de
+    # SQLite al persistir una señal o una transición de estado) no debe tumbar
+    # el bucle del evaluador. Con el registro de transiciones WATCH+ hay muchas
+    # más escrituras por hora, así que el bucle necesita esta red.
+    try:
+        for simbolo in list(orq.reconnected):
+            orq.reconnected.discard(simbolo)
+            await orq.refill_gap(simbolo, ahora)
+        for t in orq.evaluate(ahora):
+            if t.should_alert:
+                log.info("ALERTA %s %s score=%.1f", t.symbol, t.current.value, t.score)
+        hecho, total = bootstrapper.progress()
+        orq.state.bootstrap_done, orq.state.bootstrap_total = hecho, total
+    except Exception as exc:  # noqa: BLE001
+        log.warning("paso del evaluador fallido: %s", exc)
 
 
 async def paso_outcomes(tracker: OutcomeTracker, ahora: int) -> None:

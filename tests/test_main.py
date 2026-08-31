@@ -194,6 +194,16 @@ async def test_paso_outcomes_no_propaga_un_fallo_del_tracker():
     await paso_outcomes(TrackerRoto(), ahora=0)  # no lanza
 
 
+async def test_paso_evaluador_no_propaga_un_fallo_de_evaluate(orq, monkeypatch):
+    # Con el registro de transiciones WATCH+ hay muchas mas escrituras; un
+    # fallo transitorio de persistencia no debe tumbar el bucle del evaluador.
+    def evaluate_roto(now_ms):
+        raise RuntimeError("SQLite: disk I/O error")
+
+    monkeypatch.setattr(orq, "evaluate", evaluate_roto)
+    await paso_evaluador(orq, orq.bootstrapper, ahora=14 * DIA)  # no lanza
+
+
 async def test_paso_mantenimiento_delega_en_run_maintenance(orq, maintenance_repo):
     base = 14 * DIA
     await orq.ensure_profile("AAAUSDT", now_ms=base)
