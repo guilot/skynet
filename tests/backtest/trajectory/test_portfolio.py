@@ -79,3 +79,33 @@ def test_limite_de_cinco_concurrentes():
     run = run_trajectory(trans, candles_for, TrajectoryParams(comision_taker=0.0))
     assert run.skipped_max_concurrent == 1
     assert len(run.trades) == 5
+
+
+def test_margen_usa_balance_compuesto_tras_cierre_previo():
+    # A entra en ts=0 y salta directo a EXTREME en ts=1*MIN (dispara los tramos
+    # HOT/SIGNAL/EXTREME de una vez y cierra el 100% con ganancia conocida).
+    # B entra en ts=2*MIN, estrictamente después de que A ya cerró: su margen
+    # debe calcularse sobre el balance ya compuesto con el pnl de A, no sobre
+    # equity_inicial fijo.
+    trans = [
+        _tr(0, State.NORMAL, State.WATCH, 100.0, symbol="A"),
+        _tr(1 * MIN, State.WATCH, State.EXTREME, 110.0, symbol="A"),
+        _tr(2 * MIN, State.NORMAL, State.WATCH, 100.0, symbol="B"),
+    ]
+
+    def candles_for(symbol, since):
+        n = 5 if symbol == "A" else 40
+        return [CandleRow(ts=since + i * MIN, open=100, high=100, low=100, close=100)
+                for i in range(n)]
+
+    params = TrajectoryParams(comision_taker=0.0)
+    run = run_trajectory(trans, candles_for, params)
+
+    trade_a = next(t for t in run.trades if t.outcome.symbol == "A")
+    trade_b = next(t for t in run.trades if t.outcome.symbol == "B")
+
+    assert trade_a.pnl > 0
+    assert trade_a.outcome.close_ts <= 2 * MIN  # A cierra antes de que B entre
+    assert trade_b.margin == pytest.approx(
+        params.fraccion_margen * (params.equity_inicial + trade_a.pnl)
+    )
