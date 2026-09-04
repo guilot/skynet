@@ -4,6 +4,10 @@ Función pura sobre las transiciones y velas de UN símbolo, independiente del
 margen (los `fills` son fracciones del tamaño original). El orden dentro de
 cada vela es: (1) stop, (2) transiciones a su ts, (3) time-stop al close;
 el stop primero es la elección conservadora del spec.
+
+Tras cualquier salida parcial en beneficio (SCALE_HOT/SCALE_SIGNAL cuyo precio
+sea favorable frente a la entrada), el stop del resto de la posición sube a
+break-even (el precio de entrada) y se mantiene ahí.
 """
 from __future__ import annotations
 
@@ -42,6 +46,7 @@ def simulate_position(
     fired_hot = entry_rank >= _HOT      # no se dispara un tramo del nivel de entrada
     fired_signal = entry_rank >= _SIGNAL
     normal_since: int | None = None
+    stop_en_be = False
 
     fills: list[Fill] = []
     restante = 1.0
@@ -71,16 +76,27 @@ def simulate_position(
             if t.new_state.rank > max_rank:
                 max_rank = t.new_state.rank
             # tramos por niveles estrictamente por encima del rank de entrada
+            hubo_parcial = False
             if not fired_hot and max_rank >= _HOT:
                 fired_hot = True
+                hubo_parcial = True
                 restante -= params.tramo_hot
                 fills.append(Fill(ts=t.ts, price=t.price, fraction=params.tramo_hot,
                                   reason=ExitReason.SCALE_HOT))
             if not fired_signal and max_rank >= _SIGNAL:
                 fired_signal = True
+                hubo_parcial = True
                 restante -= params.tramo_signal
                 fills.append(Fill(ts=t.ts, price=t.price, fraction=params.tramo_signal,
                                   reason=ExitReason.SCALE_SIGNAL))
+            # tras cualquier salida parcial en beneficio, el stop del resto sube
+            # a break-even (precio de entrada) y se queda ahí. Aplica desde la
+            # vela siguiente, porque el stop se evalúa al inicio de cada vela.
+            if hubo_parcial and not stop_en_be:
+                en_beneficio = (t.price > entry.price) if es_long else (t.price < entry.price)
+                if en_beneficio:
+                    stop_price = entry.price
+                    stop_en_be = True
             if max_rank >= _EXTREME:
                 cerrar(t.ts, t.price, ExitReason.EXTREME)
                 break

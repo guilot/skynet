@@ -20,6 +20,34 @@ def velas(inicio, precios):
             for i, p in enumerate(precios)]
 
 
+def test_tras_scale_out_en_profit_el_stop_sube_a_be():
+    # LONG entra a 100 (stop original 97.5). Escala a HOT a 110 (en profit) ->
+    # el stop del resto sube a break-even (100). El precio vuelve a 100 sin
+    # llegar nunca a 97.5: con BE el stop salta en 100; sin BE no saltaría.
+    entry = tr(0, State.NORMAL, State.WATCH, 100.0)
+    later = [tr(1 * MIN, State.WATCH, State.HOT, 110.0)]
+    candles = velas(0, [100, 110, 105, 100, 100])
+    out = simulate_position(entry, later, candles, TrajectoryParams())
+    assert out.fills[0].reason == ExitReason.SCALE_HOT and out.fills[0].price == 110.0
+    assert out.fills[1].reason == ExitReason.STOP
+    assert out.fills[1].price == pytest.approx(100.0)  # BE, no 97.5
+    assert out.fills[1].ts == 3 * MIN
+
+
+def test_scale_out_en_perdida_no_mueve_el_stop_a_be():
+    # SHORT entra a 100 (stop original 102.5). Escala a HOT a 101 (en PÉRDIDA
+    # para un short) -> el stop NO debe moverse a BE. Con precio en 101, un BE
+    # erróneo (stop=100) dispararía el stop; el comportamiento correcto no.
+    entry = tr(0, State.NORMAL, State.WATCH, 100.0, direction=Direction.SHORT)
+    later = [tr(1 * MIN, State.WATCH, State.HOT, 101.0, direction=Direction.SHORT)]
+    candles = velas(0, [100, 101, 101])
+    out = simulate_position(entry, later, candles, TrajectoryParams())
+    reasons = [f.reason for f in out.fills]
+    assert ExitReason.STOP not in reasons
+    assert reasons[0] == ExitReason.SCALE_HOT
+    assert out.fills[-1].reason == ExitReason.END_OF_DATA
+
+
 def test_escalera_completa_dispara_los_tres_tramos():
     entry = tr(0, State.NORMAL, State.WATCH, 100.0)
     later = [
