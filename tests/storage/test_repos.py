@@ -423,6 +423,23 @@ def test_state_transition_repo_recent_filtra_por_timestamp(conn):
     assert len(repo.recent(since_ms=5000)) == 1
 
 
+def test_all_transitions_ordena_por_ts_ascendente(conn):
+    repo = StateTransitionRepo(conn)
+    # insertar en orden de ts descendente para probar que se reordena
+    for t in (3000, 1000, 2000):
+        repo.insert(
+            Transition(symbol="BTCUSDT", previous=State.NORMAL,
+                       current=State.WATCH, score=55.0, escalated=True, ts=t,
+                       should_alert=False),
+            price=10.0, direction=Direction.LONG,
+            config_fingerprint="c" * 64, code_revision="rev",
+        )
+    filas = repo.all_transitions()
+    assert [f["ts"] for f in filas] == [1000, 2000, 3000]
+    assert filas[0]["symbol"] == "BTCUSDT"
+    assert filas[0]["direction"] == "LONG"
+
+
 def test_supply_repo_hace_upsert(conn):
     repo = SupplyRepo(conn)
     repo.upsert("BTCUSDT", "bitcoin", 19_800_000, 1.2e12, 1.3e12, updated_ms=0)
