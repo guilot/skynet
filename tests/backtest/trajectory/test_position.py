@@ -98,6 +98,12 @@ def test_timer_normal_se_cancela_al_volver_a_watch():
     assert out.close_ts == 32 * MIN
 
 
+def test_velas_vacias_lanza_value_error():
+    entry = tr(0, State.NORMAL, State.WATCH, 100.0)
+    with pytest.raises(ValueError):
+        simulate_position(entry, [], [], TrajectoryParams())
+
+
 def test_entrada_en_hot_no_dispara_tramo_hot():
     entry = tr(0, State.NORMAL, State.HOT, 100.0)  # entra ya en HOT
     later = [tr(1 * MIN, State.HOT, State.SIGNAL, 110.0)]

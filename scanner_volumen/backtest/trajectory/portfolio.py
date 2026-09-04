@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from scanner_volumen.backtest.trajectory.model import (
     CandleRow, PositionOutcome, TrajectoryParams, TransitionRow,
 )
-from scanner_volumen.backtest.trajectory.position import simulate_position
+from scanner_volumen.backtest.trajectory.position import MIN_MS, simulate_position
 from scanner_volumen.models import Direction, State
 
 _WATCH = State.WATCH.rank
@@ -61,11 +61,13 @@ class TrajectoryRun:
     skipped_neutral: int
     skipped_symbol_open: int
     skipped_max_concurrent: int
+    skipped_sin_velas: int
     equity_inicial: float
     equity_final: float
     ts_min: int | None
     ts_max: int | None
     total_transitions: int
+    max_concurrentes_alcanzado: int
     params: TrajectoryParams
 
 
@@ -83,7 +85,7 @@ def run_trajectory(
     # outcome para ordenar los cierres en el tiempo. Las NEUTRAL no simulan
     # posición (no ocupan slot) pero se cuentan en el bucle de eventos.
     entradas: list[PositionOutcome] = []
-    n_neutral = 0
+    n_neutral = n_sin_velas = 0
     for t in transitions:
         if not es_entrada(t):
             continue
@@ -92,6 +94,14 @@ def run_trajectory(
             continue
         posteriores = [u for u in por_simbolo[t.symbol] if u.ts > t.ts]
         velas = candles_for(t.symbol, t.ts)
+        # retención: candles_1m se poda (~14 días) pero state_transitions no.
+        # Si las velas disponibles del símbolo empiezan bien después de esta
+        # entrada, no hay cobertura real y hay que descartarla (no simular,
+        # no ocupar slot) en lugar de arriesgarse a un precio erróneo o a
+        # que simulate_position reciba una lista vacía.
+        if not velas or velas[0].ts > t.ts + MIN_MS:
+            n_sin_velas += 1
+            continue
         entradas.append(simulate_position(t, posteriores, velas, params))
     entradas.sort(key=lambda o: o.entry_ts)
 
@@ -99,6 +109,7 @@ def run_trajectory(
     abiertos: dict[str, int] = {}  # symbol -> close_ts
     trades: list[ClosedTrade] = []
     n_symbol = n_concurr = 0
+    max_conc = 0
 
     pendientes: dict[str, ClosedTrade] = {}
 
@@ -125,6 +136,7 @@ def run_trajectory(
         trade = settle(out, margin, params)
         abiertos[out.symbol] = out.close_ts
         pendientes[out.symbol] = trade
+        max_conc = max(max_conc, len(abiertos))
 
     # flush de los que quedan abiertos, en orden de cierre
     for sym in sorted(pendientes, key=lambda s: abiertos[s]):
@@ -136,9 +148,10 @@ def run_trajectory(
     return TrajectoryRun(
         trades=tuple(sorted(trades, key=lambda tr: tr.outcome.close_ts)),
         skipped_neutral=n_neutral, skipped_symbol_open=n_symbol,
-        skipped_max_concurrent=n_concurr,
+        skipped_max_concurrent=n_concurr, skipped_sin_velas=n_sin_velas,
         equity_inicial=params.equity_inicial, equity_final=balance,
         ts_min=min(ts_all, default=None), ts_max=max(ts_all, default=None),
         total_transitions=len(transitions),
+        max_concurrentes_alcanzado=max_conc,
         params=params,
     )

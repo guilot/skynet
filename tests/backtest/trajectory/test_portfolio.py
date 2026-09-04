@@ -79,6 +79,31 @@ def test_limite_de_cinco_concurrentes():
     run = run_trajectory(trans, candles_for, TrajectoryParams(comision_taker=0.0))
     assert run.skipped_max_concurrent == 1
     assert len(run.trades) == 5
+    assert run.max_concurrentes_alcanzado == 5  # tope alcanzado, el 6º se descarta
+
+
+def test_descarta_entrada_sin_cobertura_de_velas():
+    # A tiene velas desde antes de su entrada -> simula normalmente.
+    # B entra en ts=0 pero sus velas (tras la poda de retención) solo
+    # empiezan mucho más tarde -> se descarta sin ocupar slot ni simular.
+    trans = [
+        _tr(0, State.NORMAL, State.WATCH, 100.0, symbol="A"),
+        _tr(0, State.NORMAL, State.WATCH, 100.0, symbol="B"),
+    ]
+
+    def candles_for(symbol, since):
+        if symbol == "B":
+            # las velas de B solo cubren mucho después de su entrada (podadas)
+            inicio = since + 1000 * MIN
+        else:
+            inicio = since
+        return [CandleRow(ts=inicio + i * MIN, open=100, high=100, low=100, close=100)
+                for i in range(40)]
+
+    run = run_trajectory(trans, candles_for, TrajectoryParams(comision_taker=0.0))
+    assert run.skipped_sin_velas == 1
+    assert len(run.trades) == 1
+    assert run.trades[0].outcome.symbol == "A"
 
 
 def test_margen_usa_balance_compuesto_tras_cierre_previo():

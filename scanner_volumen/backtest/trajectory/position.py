@@ -26,6 +26,13 @@ def simulate_position(
     candles: list[CandleRow],
     params: TrajectoryParams,
 ) -> PositionOutcome:
+    if not candles:
+        # No debería alcanzarse en producción: run_trajectory filtra antes las
+        # entradas sin cobertura de velas (ver Finding 1 / retención). Este
+        # guard convierte cualquier violación futura del contrato en un error
+        # explícito en vez de un IndexError silencioso más abajo.
+        raise ValueError("simulate_position requiere al menos una vela")
+
     es_long = entry.direction is Direction.LONG
     signo = 1.0 if es_long else -1.0
     stop_price = entry.price * (1 - params.stop_pct * signo)
@@ -114,6 +121,11 @@ def _agrupar_por_ventana(
     por_vela: dict[int, list[TransitionRow]] = {}
     for t in later:
         if t.ts < base or t.ts >= fin:
+            # Vela con hueco en candles_1m (o transición fuera de la ventana
+            # cargada): se descarta en silencio. El riesgo de que esto oculte
+            # transiciones reales queda acotado por el guard de retención de
+            # run_trajectory (Finding 1), que ya excluye del todo las
+            # entradas sin cobertura de velas suficiente.
             continue
         minuto = base + ((t.ts - base) // MIN_MS) * MIN_MS
         por_vela.setdefault(minuto, []).append(t)

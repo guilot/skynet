@@ -5,6 +5,9 @@ from datetime import datetime, timezone
 
 from scanner_volumen.backtest.trajectory.model import ExitReason
 from scanner_volumen.backtest.trajectory.portfolio import TrajectoryRun
+from scanner_volumen.models import State
+
+_SIGNAL_RANK = State.SIGNAL.rank
 
 
 def _fecha(ms: int | None) -> str:
@@ -34,6 +37,7 @@ def format_trajectory_report(run: TrajectoryRun) -> str:
     lineas.append(f"  descartes NEUTRAL:          {run.skipped_neutral}")
     lineas.append(f"  descartes simbolo abierto:  {run.skipped_symbol_open}")
     lineas.append(f"  descartes tope concurrencia:{run.skipped_max_concurrent}")
+    lineas.append(f"  descartes sin velas:        {run.skipped_sin_velas}")
     lineas.append("")
 
     ret = ((run.equity_final / run.equity_inicial) - 1) * 100 if run.equity_inicial else 0.0
@@ -50,6 +54,15 @@ def format_trajectory_report(run: TrajectoryRun) -> str:
     media_p = (sum(t.pnl for t in perdedores) / len(perdedores)) if perdedores else 0.0
     lineas.append(f"Win rate: {win_rate:.1f}%  ({len(ganadores)}/{n})")
     lineas.append(f"Media ganancia: {media_g:+.2f}   Media perdida: {media_p:+.2f}")
+
+    # Cierres por fin de datos: la posición seguía abierta al final de la
+    # ventana. No son salidas reales (stop/time-stop/tramo), así que se
+    # muestran aparte para no contaminar las estadísticas anteriores.
+    fin_de_datos = [t for t in run.trades if t.outcome.fills
+                     and t.outcome.fills[-1].reason == ExitReason.END_OF_DATA]
+    pnl_fin_de_datos = sum(t.pnl for t in fin_de_datos)
+    lineas.append(f"Cerrados por fin de datos (no son salidas reales): "
+                  f"{len(fin_de_datos)} (PnL {pnl_fin_de_datos:+.2f})")
     lineas.append("")
 
     por_motivo: dict[str, float] = {r.value: 0.0 for r in ExitReason}
@@ -59,5 +72,19 @@ def format_trajectory_report(run: TrajectoryRun) -> str:
     lineas.append("PnL por motivo de salida:")
     for motivo, pnl in por_motivo.items():
         lineas.append(f"  {motivo:<12} {pnl:+.2f}")
+    lineas.append("")
+
+    # Resultado central de la tesis: ¿compensa el edge de los pocos símbolos
+    # que escalan (runners) el arrastre de los WATCH que revierten sin llegar
+    # a SIGNAL?
+    runners = [t for t in run.trades if t.outcome.max_rank >= _SIGNAL_RANK]
+    arrastre = [t for t in run.trades if t.outcome.max_rank < _SIGNAL_RANK]
+    pnl_runners = sum(t.pnl for t in runners)
+    pnl_arrastre = sum(t.pnl for t in arrastre)
+    lineas.append(f"Runners (alcanzan SIGNAL+): {len(runners)} trades, "
+                  f"PnL {pnl_runners:+.2f}")
+    lineas.append(f"Arrastre (no pasan de HOT): {len(arrastre)} trades, "
+                  f"PnL {pnl_arrastre:+.2f}")
+    lineas.append(f"Concurrencia máxima: {run.max_concurrentes_alcanzado}")
 
     return "\n".join(lineas)
