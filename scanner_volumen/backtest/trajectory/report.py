@@ -28,7 +28,7 @@ def _drawdown_pct(run: TrajectoryRun) -> float:
 def format_trajectory_report(run: TrajectoryRun) -> str:
     lineas: list[str] = []
     lineas.append("== Backtest de trayectoria ==")
-    lineas.append(f"Ventana: {_fecha(run.ts_min)} -> {_fecha(run.ts_max)} (UTC)")
+    lineas.append(f"Ventana: {_fecha(run.ts_min)} -> {_fecha(run.ts_max)} (UTC) — {run.total_transitions} transiciones")
     lineas.append("")
     lineas.append(f"Trades ejecutados: {len(run.trades)}")
     lineas.append(f"  descartes NEUTRAL:          {run.skipped_neutral}")

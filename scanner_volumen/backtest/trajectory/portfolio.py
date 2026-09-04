@@ -65,6 +65,7 @@ class TrajectoryRun:
     equity_final: float
     ts_min: int | None
     ts_max: int | None
+    total_transitions: int
     params: TrajectoryParams
 
 
@@ -138,5 +139,6 @@ def run_trajectory(
         skipped_max_concurrent=n_concurr,
         equity_inicial=params.equity_inicial, equity_final=balance,
         ts_min=min(ts_all, default=None), ts_max=max(ts_all, default=None),
+        total_transitions=len(transitions),
         params=params,
     )

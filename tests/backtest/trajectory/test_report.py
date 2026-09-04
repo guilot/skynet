@@ -21,9 +21,10 @@ def test_informe_incluye_retorno_y_desglose():
     run = TrajectoryRun(
         trades=trades, skipped_neutral=2, skipped_symbol_open=1,
         skipped_max_concurrent=3, equity_inicial=1000.0, equity_final=1020.0,
-        ts_min=0, ts_max=2000, params=TrajectoryParams(),
+        ts_min=0, ts_max=2000, total_transitions=5, params=TrajectoryParams(),
     )
     texto = format_trajectory_report(run)
     assert "1020" in texto           # equity final
     assert "EXTREME" in texto and "STOP" in texto
     assert "NEUTRAL" in texto or "neutral" in texto
+    assert "5 transiciones" in texto  # transitions count
