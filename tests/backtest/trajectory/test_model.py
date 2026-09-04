@@ -10,7 +10,7 @@ def test_params_por_defecto():
     assert p.apalancamiento == 20.0
     assert p.stop_pct == 0.025
     assert p.max_concurrentes == 5
-    assert p.time_stop_min == 30
+    assert p.stale_min == 10
 
 
 def test_fill_lleva_fraccion_y_motivo():

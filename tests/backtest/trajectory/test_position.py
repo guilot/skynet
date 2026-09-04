@@ -101,29 +101,49 @@ def test_stop_long_con_hueco_rellena_al_open():
     assert out.fills[0].price == pytest.approx(96.0)  # open, no 97.5
 
 
-def test_time_stop_tras_30min_en_normal():
+def test_estancamiento_10min_sin_cambio_sale_en_be():
+    # WATCH sin ninguna transición y precio plano en la entrada: a los 10 min se
+    # arma la salida en BE y cierra en la entrada (high >= entrada).
     entry = tr(0, State.NORMAL, State.WATCH, 100.0)
-    later = [tr(1 * MIN, State.WATCH, State.NORMAL, 100.0)]
-    # precios planos a 100 (no toca stop). NORMAL desde t=1min; salida a 1+30
-    candles = velas(0, [100] * 33)
-    out = simulate_position(entry, later, candles, TrajectoryParams())
+    candles = velas(0, [100] * 12)
+    out = simulate_position(entry, [], candles, TrajectoryParams())
     assert len(out.fills) == 1
-    assert out.fills[0].reason == ExitReason.TIME
-    assert out.fills[0].ts == 31 * MIN  # primera vela con ts >= 1min + 30min
-    assert out.fills[0].price == 100.0
+    assert out.fills[0].reason == ExitReason.STALE_BE
+    assert out.fills[0].ts == 10 * MIN
+    assert out.fills[0].price == pytest.approx(100.0)
 
 
-def test_timer_normal_se_cancela_al_volver_a_watch():
+def test_estancamiento_en_profit_sale_a_mercado():
+    # Estancado pero por encima de la entrada: la salida en BE sale a mercado.
     entry = tr(0, State.NORMAL, State.WATCH, 100.0)
-    later = [
-        tr(1 * MIN, State.WATCH, State.NORMAL, 100.0),
-        tr(10 * MIN, State.NORMAL, State.WATCH, 100.0),  # cancela antes de 31min
-    ]
-    candles = velas(0, [100] * 33)
-    out = simulate_position(entry, later, candles, TrajectoryParams())
-    # sin time-stop: cierra por fin de datos en la última vela
+    candles = velas(0, [100] + [105] * 11)  # sube a 105 y se queda
+    out = simulate_position(entry, [], candles, TrajectoryParams())
+    assert out.fills[0].reason == ExitReason.STALE_BE
+    assert out.fills[0].price == pytest.approx(105.0)  # max(mercado, entrada)
+
+
+def test_estancamiento_bajo_agua_espera_a_be():
+    # Estancado y por debajo de la entrada (sin tocar el stop): NO cierra en BE;
+    # espera a que el precio vuelva a la entrada. Aquí no vuelve -> fin de datos.
+    entry = tr(0, State.NORMAL, State.WATCH, 100.0)
+    candles = velas(0, [100] + [99.0] * 15)  # 99 > stop 97.5, pero < entrada
+    out = simulate_position(entry, [], candles, TrajectoryParams())
+    reasons = [f.reason for f in out.fills]
+    assert ExitReason.STALE_BE not in reasons
     assert out.fills[-1].reason == ExitReason.END_OF_DATA
-    assert out.close_ts == 32 * MIN
+
+
+def test_transicion_reinicia_el_timer_de_estancamiento():
+    # Una transición a los 6 min reinicia el contador: el estancamiento no se
+    # arma a los 10 min desde la entrada, sino a los 6+10=16 (fuera de datos).
+    entry = tr(0, State.NORMAL, State.WATCH, 100.0)
+    later = [tr(6 * MIN, State.WATCH, State.HOT, 100.0)]  # cambio de estado
+    candles = velas(0, [100] * 15)  # datos hasta 14min < 16min
+    out = simulate_position(entry, later, candles, TrajectoryParams())
+    reasons = [f.reason for f in out.fills]
+    assert ExitReason.SCALE_HOT in reasons
+    assert ExitReason.STALE_BE not in reasons
+    assert out.fills[-1].reason == ExitReason.END_OF_DATA
 
 
 def test_velas_vacias_lanza_value_error():

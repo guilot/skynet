@@ -12,7 +12,7 @@ class ExitReason(str, Enum):
     SCALE_SIGNAL = "SCALE_SIGNAL"  # tramo 33% al cruzar >= SIGNAL (regla 4)
     EXTREME = "EXTREME"            # cierre total al cruzar EXTREME (regla 5)
     STOP = "STOP"                  # stop de precio -stop_pct (salida 2)
-    TIME = "TIME"                  # 30 min en NORMAL (salida 1)
+    STALE_BE = "STALE_BE"          # 10 min sin cambio de estado: salida limitada en BE
     END_OF_DATA = "END_OF_DATA"    # abierta al agotarse las velas
 
 
@@ -24,7 +24,7 @@ class TrajectoryParams:
     comision_taker: float = 0.0006
     stop_pct: float = 0.025
     max_concurrentes: int = 5
-    time_stop_min: int = 30
+    stale_min: int = 10
     tramo_hot: float = 0.33
     tramo_signal: float = 0.33
 

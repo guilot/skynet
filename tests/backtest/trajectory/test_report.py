@@ -53,7 +53,7 @@ def test_informe_incluye_runners_vs_arrastre_y_concurrencia():
         # arrastre: no pasa de HOT
         _trade(2000, -20.0, ExitReason.STOP, max_rank=State.HOT.rank),
         # arrastre: entra y sale en WATCH sin escalar
-        _trade(3000, -5.0, ExitReason.TIME, max_rank=State.WATCH.rank),
+        _trade(3000, -5.0, ExitReason.STALE_BE, max_rank=State.WATCH.rank),
     )
     run = _run(trades, max_concurrentes_alcanzado=4)
     texto = format_trajectory_report(run)

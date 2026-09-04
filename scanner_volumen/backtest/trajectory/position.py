@@ -2,12 +2,18 @@
 
 Función pura sobre las transiciones y velas de UN símbolo, independiente del
 margen (los `fills` son fracciones del tamaño original). El orden dentro de
-cada vela es: (1) stop, (2) transiciones a su ts, (3) time-stop al close;
+cada vela es: (1) stop, (2) transiciones a su ts, (3) estancamiento;
 el stop primero es la elección conservadora del spec.
 
 Tras cualquier salida parcial en beneficio (SCALE_HOT/SCALE_SIGNAL cuyo precio
 sea favorable frente a la entrada), el stop del resto de la posición sube a
 break-even (el precio de entrada) y se mantiene ahí.
+
+Si pasan `stale_min` minutos sin ningún cambio de estado (cualquier transición
+reinicia el contador), se arma una salida limitada en break-even: el resto se
+cierra en cuanto el precio vuelve a la entrada -o a mercado si ya está en
+profit-, nunca por debajo de BE; mientras siga bajo agua, solo lo sostiene el
+stop de -stop_pct.
 """
 from __future__ import annotations
 
@@ -21,7 +27,6 @@ MIN_MS = 60_000
 _HOT = State.HOT.rank
 _SIGNAL = State.SIGNAL.rank
 _EXTREME = State.EXTREME.rank
-_NORMAL = State.NORMAL.rank
 
 
 def simulate_position(
@@ -45,13 +50,14 @@ def simulate_position(
     max_rank = entry_rank
     fired_hot = entry_rank >= _HOT      # no se dispara un tramo del nivel de entrada
     fired_signal = entry_rank >= _SIGNAL
-    normal_since: int | None = None
     stop_en_be = False
+    ultimo_cambio_ts = entry.ts         # para el timer de estancamiento
+    be_armado = False
 
     fills: list[Fill] = []
     restante = 1.0
     trans_por_ts = _agrupar_por_ventana(later, candles)
-    time_stop_ms = params.time_stop_min * MIN_MS
+    stale_ms = params.stale_min * MIN_MS
 
     def cerrar(ts: float, price: float, reason: ExitReason) -> None:
         nonlocal restante
@@ -73,6 +79,10 @@ def simulate_position(
 
         # (2) transiciones cuyo ts cae en [c.ts, c.ts + 1min)
         for t in trans_por_ts.get(c.ts, ()):  # orden ascendente garantizado
+            # cualquier transición es un cambio de estado: reinicia el timer de
+            # estancamiento y desarma una salida en BE pendiente.
+            ultimo_cambio_ts = t.ts
+            be_armado = False
             if t.new_state.rank > max_rank:
                 max_rank = t.new_state.rank
             # tramos por niveles estrictamente por encima del rank de entrada
@@ -100,18 +110,24 @@ def simulate_position(
             if max_rank >= _EXTREME:
                 cerrar(t.ts, t.price, ExitReason.EXTREME)
                 break
-            # timer de NORMAL
-            if t.new_state.rank == _NORMAL:
-                normal_since = t.ts
-            elif t.new_state.rank > _NORMAL:
-                normal_since = None
         if restante <= 0:
             break
 
-        # (3) time-stop: 30 min en NORMAL sin nueva transición
-        if normal_since is not None and c.ts >= normal_since + time_stop_ms:
-            cerrar(c.ts, c.close, ExitReason.TIME)
-            break
+        # (3) estancamiento: si pasan stale_min sin cambiar de estado, se arma
+        # una salida limitada en break-even. Cierra el resto en cuanto el precio
+        # toque la entrada (o a mercado si ya está en profit); nunca peor que BE.
+        # Mientras siga bajo agua, espera -sostenido solo por el stop de -stop_pct-.
+        if not be_armado and c.ts - ultimo_cambio_ts >= stale_ms:
+            be_armado = True
+        if be_armado:
+            alcanza_be = (c.high >= entry.price) if es_long else (c.low <= entry.price)
+            if alcanza_be:
+                if es_long:
+                    precio = c.open if c.open >= entry.price else entry.price
+                else:
+                    precio = c.open if c.open <= entry.price else entry.price
+                cerrar(c.ts, precio, ExitReason.STALE_BE)
+                break
 
     if restante > 0:
         ultima = candles[-1]

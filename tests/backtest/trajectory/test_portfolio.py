@@ -28,7 +28,7 @@ def test_settle_long_sin_comision():
 def test_settle_descuenta_comision_entrada_y_salida():
     out = PositionOutcome(
         symbol="X", direction=Direction.LONG, entry_ts=0, entry_price=100.0,
-        fills=(Fill(ts=MIN0, price=100.0, fraction=1.0, reason=ExitReason.TIME),),
+        fills=(Fill(ts=MIN0, price=100.0, fraction=1.0, reason=ExitReason.STALE_BE),),
         max_rank=1, close_ts=MIN0,
     )
     params = TrajectoryParams(comision_taker=0.0006)

@@ -39,7 +39,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--fee", type=float, default=d.comision_taker)
     p.add_argument("--stop-pct", type=float, default=d.stop_pct)
     p.add_argument("--max-concurrent", type=int, default=d.max_concurrentes)
-    p.add_argument("--time-stop-min", type=int, default=d.time_stop_min)
+    p.add_argument("--stale-min", type=int, default=d.stale_min)
     args = p.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> None:
         equity_inicial=args.equity, fraccion_margen=args.margin_frac,
         apalancamiento=args.leverage, comision_taker=args.fee,
         stop_pct=args.stop_pct, max_concurrentes=args.max_concurrent,
-        time_stop_min=args.time_stop_min,
+        stale_min=args.stale_min,
     )
 
     conn = open_readonly(db_path)
