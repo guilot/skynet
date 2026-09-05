@@ -39,7 +39,7 @@ from scanner_volumen.strategy.entries import es_entrada
 from scanner_volumen.strategy.model import (
     CandleRow, ExitIntent, Fill, StrategyParams, TransitionRow,
 )
-from scanner_volumen.strategy.position import PositionRules
+from scanner_volumen.strategy.position import PositionRules, agrupar_por_vela
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +58,7 @@ class BotRunner:
         self.portfolio = portfolio
         self.abiertas: dict[str, PosicionAbierta] = {}
         self.transiciones_vistas = 0
+        self.cierres_tardios = 0
 
     async def on_tick(
         self, transiciones: list[TransitionRow], precio_de: PrecioDe, ahora: int,
@@ -123,6 +124,109 @@ class BotRunner:
         )
         log.info("bot: abre %s %s a %.6g (senal %.6g), margen %.2f",
                  t.symbol, t.direction.value, orden.precio, t.price, margin)
+
+    # --- reconstrucción tras un reinicio ---
+
+    async def reconstruir(
+        self, transiciones_de, velas_de, precio_de: PrecioDe, ahora: int,
+    ) -> None:
+        """Recupera las posiciones que quedaron abiertas en un reinicio.
+
+        Por cada una, replica su historial (transiciones y velas de 1 minuto
+        desde la entrada) a través de un motor nuevo, confirmando cada salida
+        que YA se ejecutó en vivo con el precio real que se obtuvo entonces.
+        Así el motor recupera su estado exacto y la posición sigue como si nada.
+
+        `transiciones_de(symbol, desde_ms)` y `velas_de(symbol, desde_ms)` los
+        inyecta el llamador; se pasan como funciones para que el bot no dependa
+        de los repositorios concretos ni, sobre todo, del backtest.
+        """
+        for fila in self._repo.abiertas(self._cfg.modo):
+            try:
+                await self._reconstruir_una(fila, transiciones_de, velas_de,
+                                            precio_de, ahora)
+            except Exception as exc:  # noqa: BLE001 - una posición rota no impide arrancar
+                log.warning("bot: no se pudo reconstruir %s: %s",
+                            fila["symbol"], exc)
+
+    async def _reconstruir_una(
+        self, fila, transiciones_de, velas_de, precio_de: PrecioDe, ahora: int,
+    ) -> None:
+        symbol = fila["symbol"]
+        entry_ts = fila["entry_ts"]
+        historial = list(transiciones_de(symbol, entry_ts))
+        entrada = next((t for t in historial if t.ts == entry_ts), None)
+        if entrada is None:
+            log.warning("bot: %s abierta sin transición de entrada en la BD; "
+                        "se deja fuera del bot (revisar a mano)", symbol)
+            return
+
+        direccion = Direction(fila["direction"])
+        # el motor se ancla al precio EJECUTADO, igual que al abrir
+        entrada_real = TransitionRow(
+            ts=entry_ts, symbol=symbol, prev_state=entrada.prev_state,
+            new_state=entrada.new_state, price=fila["entry_price"],
+            direction=direccion, score=entrada.score,
+        )
+        pos = PosicionAbierta(
+            id=fila["id"], symbol=symbol, direction=direccion, entry_ts=entry_ts,
+            entry_price=fila["entry_price"],
+            entry_price_senal=fila["entry_price_senal"], margin=fila["margin"],
+            notional=fila["notional"], size=fila["size"],
+            reglas=PositionRules(entrada_real, self._params),
+            pnl_acumulado=-fila["fee_entrada"], fees_acumuladas=fila["fee_entrada"],
+        )
+
+        registrados = {f["reason"]: f for f in self._repo.fills_de(fila["id"])}
+        posteriores = [t for t in historial if t.ts > entry_ts]
+        velas = list(velas_de(symbol, entry_ts))
+        por_vela = agrupar_por_vela(posteriores, velas)
+        precio_ahora = precio_de(symbol)
+
+        for vela in velas:
+            if pos.reglas.cerrada:
+                break
+            for intent in pos.reglas.on_candle(vela, tuple(por_vela.get(vela.ts, ()))):
+                ya = registrados.pop(intent.reason.value, None)
+                if ya is not None:
+                    self._confirmar_registrado(pos, intent, ya)
+                elif precio_ahora is not None and precio_ahora > 0:
+                    # la réplica ve las mechas del minuto; el bot en vivo solo
+                    # veía los precios que observaba. Esta salida debió ocurrir
+                    # y no ocurrió: se ejecuta ahora, tarde, y se contabiliza.
+                    await self._ejecutar(pos, intent, precio_ahora, ahora,
+                                         tardio=True)
+                    self.cierres_tardios += 1
+                    log.warning("bot: cierre tardío de %s por %s tras reinicio",
+                                symbol, intent.reason.value)
+                else:
+                    return  # sin precio no se puede resolver: se reintenta luego
+
+        if pos.reglas.cerrada:
+            self._cerrar(pos, ahora)
+        else:
+            self.abiertas[symbol] = pos
+            log.info("bot: %s reconstruida tras reinicio (restante %.2f)",
+                     symbol, pos.reglas.restante)
+
+    def _confirmar_registrado(self, pos: PosicionAbierta, intent, registrado) -> None:
+        """Confirma al motor una salida que ya se ejecutó en vivo.
+
+        Se usa el `ts` de la INTENCIÓN, no el del fill guardado: el motor casa
+        cada confirmación con su intención por motivo y ts, y el instante en que
+        la orden se ejecutó de verdad puede no coincidir con el de la vela que
+        la disparó. Lo que sí se toma del registro es el PRECIO, que es de lo
+        que dependen las reglas (la subida del stop a break-even se decide con
+        el precio realmente obtenido).
+        """
+        precio = registrado["precio"]
+        pos.reglas.on_fill(Fill(ts=intent.ts, price=precio,
+                                fraction=intent.fraction, reason=intent.reason))
+        signo = 1.0 if pos.direction is Direction.LONG else -1.0
+        cantidad = pos.size * intent.fraction
+        bruto = signo * (precio - pos.entry_price) * cantidad
+        pos.pnl_acumulado += bruto - registrado["comision"]
+        pos.fees_acumuladas += registrado["comision"]
 
     # --- posiciones vivas ---
 

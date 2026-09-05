@@ -314,6 +314,15 @@ class StateTransitionRepo:
             "SELECT * FROM state_transitions ORDER BY ts, id"
         ).fetchall()
 
+    def por_simbolo(self, symbol: str, desde_ms: int) -> list[sqlite3.Row]:
+        """Trayectoria de un símbolo desde un instante, orden cronológico
+        estable. La usa el bot para replicar una posición al reiniciar."""
+        return self._conn.execute(
+            "SELECT * FROM state_transitions WHERE symbol = ? AND ts >= ? "
+            "ORDER BY ts, id",
+            (symbol, desde_ms),
+        ).fetchall()
+
 
 class MaintenanceRepo:
     """Persiste cuándo completó trabajo real por última vez `Orchestrator.
