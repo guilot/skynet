@@ -41,7 +41,7 @@ def test_settle_descuenta_comision_entrada_y_salida():
 MIN = 60_000
 
 
-def _tr(ts, prev, new, price, symbol="A", direction=Direction.LONG, score=55.0):
+def _tr(ts, prev, new, price, symbol="A", direction=Direction.LONG, score=75.0):
     return TransitionRow(ts=ts, symbol=symbol, prev_state=prev, new_state=new,
                          price=price, direction=direction, score=score)
 

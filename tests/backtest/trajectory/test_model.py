@@ -11,6 +11,9 @@ def test_params_por_defecto():
     assert p.stop_pct == 0.025
     assert p.max_concurrentes == 5
     assert p.stale_min == 10
+    assert p.min_score_entrada == 70.0
+    assert p.extreme_run_min == 3.0
+    assert p.freeze_perdidas == 3
 
 
 def test_fill_lleva_fraccion_y_motivo():
