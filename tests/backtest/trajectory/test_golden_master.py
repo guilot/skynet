@@ -41,12 +41,13 @@ def _volcado(run) -> str:
         lineas.append(
             f"{o.symbol} {o.direction.value} entry_ts={o.entry_ts} "
             f"entry_price={o.entry_price:.10g} max_rank={o.max_rank} "
-            f"margin={t.margin:.10f} pnl={t.pnl:.10f}"
+            f"margin={t.margin:.10f} pnl={t.pnl:.10f} fees={t.fees:.10f}"
         )
-        for f in o.fills:
+        for f, pnl in zip(o.fills, t.fill_pnls):
             lineas.append(
                 f"    fill ts={f.ts} price={f.price:.10g} "
-                f"fraction={f.fraction:.10f} reason={f.reason.value}"
+                f"fraction={f.fraction:.10f} reason={f.reason.value} "
+                f"pnl={pnl:.10f}"
             )
     return "\n".join(lineas)
 
