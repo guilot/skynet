@@ -211,12 +211,32 @@ def test_durante_el_run_el_stop_en_be_sigue_activo():
 
 
 def test_extreme_corta_las_transiciones_posteriores_de_la_misma_vela():
-    r = PositionRules(entrada_long(), StrategyParams(extreme_run_min=3))
+    r = PositionRules(entrada_long(), StrategyParams(extreme_run_min=0))
     trans = [
         tr(MIN, State.WATCH, State.EXTREME, 130.0),
-        tr(MIN + 1, State.EXTREME, State.NORMAL, 90.0),  # se ignora
+        tr(MIN + 1, State.EXTREME, State.NORMAL, 90.0),  # se ignora por break
     ]
     intents = r.on_candle(vela(MIN, 130.0), trans)
+    # Con break, la segunda transición no se procesa; sin break, emitiría
+    # un segundo EXTREME. Este test lo detecta.
+    assert [i.reason for i in intents] == [
+        ExitReason.SCALE_HOT, ExitReason.SCALE_SIGNAL, ExitReason.EXTREME]
+    assert len(intents) == 3  # aserción explícita sobre la regresión
+    assert r.max_rank == State.EXTREME.rank
+
+
+def test_durante_el_run_se_ignoran_las_transiciones():
+    r = PositionRules(entrada_long(), StrategyParams(extreme_run_min=10))
+    t = tr(MIN, State.WATCH, State.EXTREME, 130.0)
+    intents = r.on_candle(vela(MIN, 130.0), [t])
+    # primer evento: genera tramos y arma el run
     assert [i.reason for i in intents] == [
         ExitReason.SCALE_HOT, ExitReason.SCALE_SIGNAL]
+    _confirmar(r, intents)
+    # durante el run: una vela con una transición real (por ejemplo, vuelta a NORMAL
+    # a precio que no toca stop en BE). Debe ignorarse: devuelve lista vacía.
+    trans_durante_run = [tr(2 * MIN, State.EXTREME, State.NORMAL, 105.0)]
+    intents_run = r.on_candle(vela(2 * MIN, 105.0), trans_durante_run)
+    assert intents_run == []
+    # max_rank no debe cambiar (sigue siendo EXTREME, no retrocede a NORMAL)
     assert r.max_rank == State.EXTREME.rank
