@@ -107,3 +107,34 @@ def test_el_equity_baja_con_las_perdidas_y_el_margen_con_el(cartera, tmp_path):
     cartera._repo.cerrar(pid, close_ts=60_000, pnl=-150.0, fees=1.0, max_rank=1)
     assert cartera.equity() == pytest.approx(850.0)
     assert cartera.margen() == pytest.approx(17.0)
+
+
+def test_el_desvio_activo_descarta_movimientos_adversos_en_short(tmp_path):
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn)
+    repo.set_equity_inicial(1000.0)
+    cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
+                    desvio_max_entrada=0.005)  # 0.5%
+    cartera = LivePortfolio(StrategyParams(), cfg, repo)
+    # SHORT cuya senal era 100 y el mercado ya bajo a 99 (-1%): perseguir, se rechaza
+    assert cartera.evaluar_entrada(tr(price=100.0, direction=Direction.SHORT),
+                                   abiertos=set(), precio_mercado=99.0) == "desvio"
+    # SHORT cuya senal era 100 y el mercado subio a 101: entrada MEJOR, se acepta
+    assert cartera.evaluar_entrada(tr(price=100.0, direction=Direction.SHORT),
+                                   abiertos=set(), precio_mercado=101.0) is None
+    conn.close()
+
+
+def test_el_orden_de_los_descartes_respeta_la_prioridad(cartera):
+    # NEUTRAL gana sobre score bajo
+    motivo = cartera.evaluar_entrada(
+        tr(direction=Direction.NEUTRAL, score=69.0),
+        abiertos=set(), precio_mercado=100.0)
+    assert motivo == "NEUTRAL"
+
+    # simbolo abierto gana sobre tope concurrencia
+    # El conjunto abiertos tiene 4 pares (B, C, D, E) y A esta en el abierto
+    abiertos = {"A", "B", "C", "D", "E"}  # 5 pares, por lo que tope tambien se cumple
+    motivo = cartera.evaluar_entrada(
+        tr(symbol="A"), abiertos=abiertos, precio_mercado=100.0)
+    assert motivo == "simbolo abierto"
