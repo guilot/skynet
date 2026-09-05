@@ -59,8 +59,19 @@ def test_stop_de_short_usa_el_high():
     r = PositionRules(entry, StrategyParams())
     c = CandleRow(ts=MIN, open=101.0, high=103.0, low=101.0, close=102.0)
     intents = r.on_candle(c)
+    assert len(intents) == 1
     assert intents[0].reason is ExitReason.STOP
+    assert intents[0].fraction == pytest.approx(1.0)
     assert intents[0].precio_referencia == pytest.approx(102.5)
+    assert intents[0].ts == MIN
+
+
+def test_stop_de_short_con_hueco_referencia_el_open():
+    entry = tr(0, State.NORMAL, State.WATCH, 100.0, direction=Direction.SHORT)
+    r = PositionRules(entry, StrategyParams())
+    c = CandleRow(ts=MIN, open=104.0, high=105.0, low=104.0, close=104.5)
+    intents = r.on_candle(c)
+    assert intents[0].precio_referencia == pytest.approx(104.0)
 
 
 def test_confirmar_el_fill_cierra_la_posicion():
