@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from scanner_volumen.backtest.trajectory.model import CandleRow, TransitionRow
+from scanner_volumen.strategy.model import CandleRow, TransitionRow
 from scanner_volumen.models import Direction, State
 from scanner_volumen.storage.repos import CandleRepo, StateTransitionRepo
 

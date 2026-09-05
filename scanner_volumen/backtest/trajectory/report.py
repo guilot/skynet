@@ -3,9 +3,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from scanner_volumen.backtest.trajectory.model import ExitReason
 from scanner_volumen.backtest.trajectory.portfolio import TrajectoryRun
 from scanner_volumen.models import State
+from scanner_volumen.strategy.model import ExitReason
 
 _SIGNAL_RANK = State.SIGNAL.rank
 

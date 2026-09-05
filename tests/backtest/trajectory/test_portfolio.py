@@ -1,10 +1,10 @@
 import pytest
 
-from scanner_volumen.backtest.trajectory.model import (
-    CandleRow, ExitReason, Fill, PositionOutcome, TrajectoryParams, TransitionRow,
-)
 from scanner_volumen.backtest.trajectory.portfolio import run_trajectory, settle
 from scanner_volumen.models import Direction, State
+from scanner_volumen.strategy.model import (
+    CandleRow, ExitReason, Fill, PositionOutcome, StrategyParams, TransitionRow,
+)
 
 MIN0 = 60_000
 
@@ -17,7 +17,7 @@ def test_settle_long_sin_comision():
         fills=(Fill(ts=MIN0, price=110.0, fraction=1.0, reason=ExitReason.EXTREME),),
         max_rank=4, close_ts=MIN0,
     )
-    params = TrajectoryParams(comision_taker=0.0)
+    params = StrategyParams(comision_taker=0.0)
     trade = settle(out, margin=20.0, params=params)
     assert trade.notional == pytest.approx(400.0)
     assert trade.size == pytest.approx(4.0)
@@ -31,7 +31,7 @@ def test_settle_descuenta_comision_entrada_y_salida():
         fills=(Fill(ts=MIN0, price=100.0, fraction=1.0, reason=ExitReason.STALE_BE),),
         max_rank=1, close_ts=MIN0,
     )
-    params = TrajectoryParams(comision_taker=0.0006)
+    params = StrategyParams(comision_taker=0.0006)
     trade = settle(out, margin=20.0, params=params)
     # nocional entrada=400, salida=400 => comisión = 0.0006*400*2 = 0.48
     assert trade.fees == pytest.approx(0.48)
@@ -59,7 +59,7 @@ def test_descarta_neutral_y_respeta_unicidad_por_simbolo():
         return [CandleRow(ts=since + i * MIN, open=100, high=100, low=100, close=100)
                 for i in range(40)]
 
-    run = run_trajectory(trans, candles_for, TrajectoryParams(comision_taker=0.0))
+    run = run_trajectory(trans, candles_for, StrategyParams(comision_taker=0.0))
     assert run.skipped_neutral == 1
     assert run.skipped_symbol_open == 1
     assert len(run.trades) == 1  # solo la primera entrada de B
@@ -77,7 +77,7 @@ def test_filtro_min_score_entrada():
                 for i in range(40)]
 
     run = run_trajectory(trans, candles_for,
-                         TrajectoryParams(comision_taker=0.0, min_score_entrada=55.0))
+                         StrategyParams(comision_taker=0.0, min_score_entrada=55.0))
     assert run.skipped_score_bajo == 1
     assert len(run.trades) == 1
     assert run.trades[0].outcome.symbol == "B"
@@ -99,7 +99,7 @@ def test_congela_par_tras_3_perdidas_en_1h():
         return [CandleRow(ts=since + i * MIN, open=p, high=p, low=p, close=p)
                 for i, p in enumerate(precios)]
 
-    run = run_trajectory(trans, candles_for, TrajectoryParams(comision_taker=0.0))
+    run = run_trajectory(trans, candles_for, StrategyParams(comision_taker=0.0))
     assert len(run.trades) == 3
     assert all(t.pnl < 0 for t in run.trades)
     assert run.skipped_congelado == 1
@@ -117,7 +117,7 @@ def test_freeze_desactivado_no_congela():
                 for i, p in enumerate(precios)]
 
     run = run_trajectory(trans, candles_for,
-                         TrajectoryParams(comision_taker=0.0, freeze_perdidas=0))
+                         StrategyParams(comision_taker=0.0, freeze_perdidas=0))
     assert len(run.trades) == 4
     assert run.skipped_congelado == 0
 
@@ -133,7 +133,7 @@ def test_limite_de_cinco_concurrentes():
         return [CandleRow(ts=since + i * MIN, open=100, high=100, low=100, close=100)
                 for i in range(40)]
 
-    run = run_trajectory(trans, candles_for, TrajectoryParams(comision_taker=0.0))
+    run = run_trajectory(trans, candles_for, StrategyParams(comision_taker=0.0))
     assert run.skipped_max_concurrent == 1
     assert len(run.trades) == 5
     assert run.max_concurrentes_alcanzado == 5  # tope alcanzado, el 6º se descarta
@@ -157,7 +157,7 @@ def test_descarta_entrada_sin_cobertura_de_velas():
         return [CandleRow(ts=inicio + i * MIN, open=100, high=100, low=100, close=100)
                 for i in range(40)]
 
-    run = run_trajectory(trans, candles_for, TrajectoryParams(comision_taker=0.0))
+    run = run_trajectory(trans, candles_for, StrategyParams(comision_taker=0.0))
     assert run.skipped_sin_velas == 1
     assert len(run.trades) == 1
     assert run.trades[0].outcome.symbol == "A"
@@ -180,7 +180,7 @@ def test_margen_usa_balance_compuesto_tras_cierre_previo():
         return [CandleRow(ts=since + i * MIN, open=100, high=100, low=100, close=100)
                 for i in range(n)]
 
-    params = TrajectoryParams(comision_taker=0.0)
+    params = StrategyParams(comision_taker=0.0)
     run = run_trajectory(trans, candles_for, params)
 
     trade_a = next(t for t in run.trades if t.outcome.symbol == "A")

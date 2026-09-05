@@ -1,10 +1,17 @@
-"""Tipos del backtest de trayectoria. Sin lógica: dataclasses y enum."""
+"""Tipos de la estrategia, compartidos por el backtest y el bot en vivo.
+
+Sin lógica: dataclasses y enum. Vive fuera de `backtest/` porque el bot en
+vivo (Fase 2) los consume igual que el backtest, y `strategy` no puede
+depender de `backtest` (ver el spec, invariante de dependencias).
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
 
 from scanner_volumen.models import Direction, State
+
+MIN_MS = 60_000
 
 
 class ExitReason(str, Enum):
@@ -17,7 +24,7 @@ class ExitReason(str, Enum):
 
 
 @dataclass(frozen=True)
-class TrajectoryParams:
+class StrategyParams:
     equity_inicial: float = 1000.0
     fraccion_margen: float = 0.02
     apalancamiento: float = 20.0
@@ -56,10 +63,27 @@ class CandleRow:
 
 @dataclass(frozen=True)
 class Fill:
+    """Una salida ya ejecutada, con el precio REAL obtenido."""
+
     ts: int
     price: float
     fraction: float
     reason: ExitReason
+
+
+@dataclass(frozen=True)
+class ExitIntent:
+    """Una salida que las reglas proponen pero que aún no se ha ejecutado.
+
+    `precio_referencia` es el precio que la regla considera justo (el que el
+    backtest usa tal cual); en vivo el broker devolverá otro y el motor se
+    entera por `PositionRules.on_fill`.
+    """
+
+    ts: int
+    fraction: float
+    reason: ExitReason
+    precio_referencia: float
 
 
 @dataclass(frozen=True)

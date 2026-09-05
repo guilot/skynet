@@ -9,17 +9,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from scanner_volumen.backtest.trajectory.model import (
-    CandleRow, PositionOutcome, TrajectoryParams, TransitionRow,
-)
 from scanner_volumen.backtest.trajectory.position import MIN_MS, simulate_position
-from scanner_volumen.models import Direction, State
-
-_WATCH = State.WATCH.rank
-
-
-def es_entrada(t: TransitionRow) -> bool:
-    return t.prev_state.rank < _WATCH <= t.new_state.rank
+from scanner_volumen.models import Direction
+from scanner_volumen.strategy.entries import FreezeTracker, es_entrada, score_suficiente
+from scanner_volumen.strategy.model import (
+    CandleRow, PositionOutcome, StrategyParams, TransitionRow,
+)
 
 
 @dataclass(frozen=True)
@@ -33,7 +28,7 @@ class ClosedTrade:
     fill_pnls: tuple[float, ...]
 
 
-def settle(outcome: PositionOutcome, margin: float, params: TrajectoryParams) -> ClosedTrade:
+def settle(outcome: PositionOutcome, margin: float, params: StrategyParams) -> ClosedTrade:
     signo = 1.0 if outcome.direction is Direction.LONG else -1.0
     notional = margin * params.apalancamiento
     size = notional / outcome.entry_price
@@ -70,13 +65,13 @@ class TrajectoryRun:
     ts_max: int | None
     total_transitions: int
     max_concurrentes_alcanzado: int
-    params: TrajectoryParams
+    params: StrategyParams
 
 
 def run_trajectory(
     transitions: list[TransitionRow],
     candles_for: Callable[[str, int], list[CandleRow]],
-    params: TrajectoryParams,
+    params: StrategyParams,
 ) -> TrajectoryRun:
     por_simbolo: dict[str, list[TransitionRow]] = {}
     for t in transitions:
@@ -94,7 +89,7 @@ def run_trajectory(
         if t.direction is Direction.NEUTRAL:
             n_neutral += 1
             continue
-        if t.score < params.min_score_entrada:
+        if not score_suficiente(t, params):
             n_score_bajo += 1
             continue
         posteriores = [u for u in por_simbolo[t.symbol] if u.ts > t.ts]
@@ -117,29 +112,7 @@ def run_trajectory(
     max_conc = 0
 
     pendientes: dict[str, ClosedTrade] = {}
-    # congelación por racha de pérdidas: racha[symbol] = close_ts de las pérdidas
-    # consecutivas recientes; congelado_hasta[symbol] = ts hasta el que no se entra.
-    racha: dict[str, list[int]] = {}
-    congelado_hasta: dict[str, int] = {}
-    ventana_ms = int(params.freeze_ventana_horas * 3_600_000)
-    congelar_ms = int(params.freeze_horas * 3_600_000)
-
-    def registrar_resultado(trade: ClosedTrade) -> None:
-        """Actualiza la racha de pérdidas del símbolo al cerrar un trade y, si
-        se cumplen N pérdidas seguidas dentro de la ventana, congela el par."""
-        if params.freeze_perdidas <= 0:
-            return
-        sym = trade.outcome.symbol
-        if trade.pnl < 0:
-            r = racha.setdefault(sym, [])
-            r.append(trade.outcome.close_ts)
-            del r[:-params.freeze_perdidas]  # conserva solo las últimas N
-            if (len(r) >= params.freeze_perdidas
-                    and r[-1] - r[0] <= ventana_ms):
-                congelado_hasta[sym] = trade.outcome.close_ts + congelar_ms
-                r.clear()
-        else:
-            racha[sym] = []  # un no-perdedor rompe la racha
+    freeze = FreezeTracker(params)
 
     def cerrar_hasta(ts: int) -> None:
         nonlocal balance
@@ -151,11 +124,11 @@ def run_trajectory(
             balance += trade.pnl
             trades.append(trade)
             del abiertos[sym]
-            registrar_resultado(trade)
+            freeze.registrar(trade.outcome.symbol, trade.outcome.close_ts, trade.pnl)
 
     for out in entradas:
         cerrar_hasta(out.entry_ts)
-        if congelado_hasta.get(out.symbol, 0) > out.entry_ts:
+        if freeze.congelado(out.symbol, out.entry_ts):
             n_congelado += 1
             continue
         if out.symbol in abiertos:
