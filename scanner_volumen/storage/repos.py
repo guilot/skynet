@@ -306,6 +306,14 @@ class StateTransitionRepo:
         ).fetchall()
         return [dict(f) for f in filas]
 
+    def all_transitions(self) -> list[sqlite3.Row]:
+        """Toda la trayectoria persistida, orden cronológico estable (ts y,
+        a igualdad de ts, orden de inserción). Solo lectura, para el backtest
+        de trayectoria."""
+        return self._conn.execute(
+            "SELECT * FROM state_transitions ORDER BY ts, id"
+        ).fetchall()
+
 
 class MaintenanceRepo:
     """Persiste cuándo completó trabajo real por última vez `Orchestrator.
