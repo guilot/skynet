@@ -38,6 +38,10 @@ class PositionRules:
         signo = 1.0 if self._es_long else -1.0
         self._stop_price = entry.price * (1 - params.stop_pct * signo)
         self._max_rank = entry.new_state.rank
+        entry_rank = entry.new_state.rank
+        self._fired_hot = entry_rank >= _HOT      # no se cobra el tramo del nivel de entrada
+        self._fired_signal = entry_rank >= _SIGNAL
+        self._stop_en_be = False
         # `restante` solo se mueve al confirmar un fill; `comprometido`
         # descuenta además lo ya emitido y pendiente. Un mismo evento puede
         # emitir varias intenciones (WATCH -> EXTREME dispara HOT, SIGNAL y el
@@ -89,6 +93,19 @@ class PositionRules:
             self._emitir(intents, vela.ts, self._comprometido, ExitReason.STOP, precio)
             return intents
 
+        # (2) transiciones cuyo ts cae en esta ventana, en orden ascendente
+        for t in transiciones:
+            if t.new_state.rank > self._max_rank:
+                self._max_rank = t.new_state.rank
+            if not self._fired_hot and self._max_rank >= _HOT:
+                self._fired_hot = True
+                self._emitir(intents, t.ts, self.params.tramo_hot,
+                             ExitReason.SCALE_HOT, t.price)
+            if not self._fired_signal and self._max_rank >= _SIGNAL:
+                self._fired_signal = True
+                self._emitir(intents, t.ts, self.params.tramo_signal,
+                             ExitReason.SCALE_SIGNAL, t.price)
+
         return intents
 
     def on_fill(self, fill: Fill) -> None:
@@ -104,6 +121,18 @@ class PositionRules:
             )
         del self._pendientes[indice]
         self._restante -= fill.fraction
+        # tras cualquier parcial en beneficio, el stop del resto sube a
+        # break-even y se queda ahí. Se juzga con el precio EJECUTADO: con
+        # slippage, una parcial teóricamente ganadora puede salir en pérdida.
+        if (fill.reason in (ExitReason.SCALE_HOT, ExitReason.SCALE_SIGNAL)
+                and not self._stop_en_be):
+            en_beneficio = (
+                (fill.price > self.entry.price) if self._es_long
+                else (fill.price < self.entry.price)
+            )
+            if en_beneficio:
+                self._stop_price = self.entry.price
+                self._stop_en_be = True
 
     # --- interno ---
 

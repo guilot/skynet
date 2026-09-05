@@ -97,3 +97,73 @@ def test_fill_que_no_corresponde_a_ninguna_intencion_falla():
     r = PositionRules(entrada_long(), StrategyParams())
     with pytest.raises(ValueError, match="no corresponde"):
         r.on_fill(Fill(ts=MIN, price=97.5, fraction=1.0, reason=ExitReason.STOP))
+
+
+def _confirmar(r, intents, precio=None):
+    """Ejecuta cada intención al precio de referencia (o a `precio` si se da,
+    para simular slippage) y se la confirma al motor."""
+    for i in intents:
+        r.on_fill(Fill(ts=i.ts, price=precio if precio is not None else i.precio_referencia,
+                       fraction=i.fraction, reason=i.reason))
+
+
+def test_transicion_a_hot_emite_el_tramo():
+    r = PositionRules(entrada_long(), StrategyParams())
+    t = tr(MIN, State.WATCH, State.HOT, 110.0)
+    intents = r.on_candle(vela(MIN, 110.0), [t])
+    assert len(intents) == 1
+    assert intents[0].reason is ExitReason.SCALE_HOT
+    assert intents[0].fraction == pytest.approx(0.33)
+    assert intents[0].precio_referencia == pytest.approx(110.0)
+    assert intents[0].ts == MIN
+    assert r.max_rank == State.HOT.rank
+
+
+def test_salto_a_signal_acumula_los_dos_tramos():
+    r = PositionRules(entrada_long(), StrategyParams())
+    t = tr(MIN, State.WATCH, State.SIGNAL, 120.0)
+    intents = r.on_candle(vela(MIN, 120.0), [t])
+    assert [i.reason for i in intents] == [
+        ExitReason.SCALE_HOT, ExitReason.SCALE_SIGNAL]
+    assert all(i.precio_referencia == pytest.approx(120.0) for i in intents)
+
+
+def test_entrada_ya_en_hot_no_cobra_el_tramo_hot():
+    # los tramos solo se disparan por niveles ESTRICTAMENTE por encima del
+    # rank de entrada
+    entry = tr(0, State.NORMAL, State.HOT, 100.0)
+    r = PositionRules(entry, StrategyParams())
+    intents = r.on_candle(vela(MIN, 110.0), [tr(MIN, State.HOT, State.HOT, 110.0)])
+    assert intents == []
+
+
+def test_parcial_en_beneficio_sube_el_stop_a_be():
+    r = PositionRules(entrada_long(), StrategyParams())
+    intents = r.on_candle(vela(MIN, 110.0), [tr(MIN, State.WATCH, State.HOT, 110.0)])
+    _confirmar(r, intents)
+    # el stop original era 97.5; ahora es 100 (BE): una vela a 100 lo toca
+    siguiente = r.on_candle(vela(2 * MIN, 100.0))
+    assert siguiente[0].reason is ExitReason.STOP
+    assert siguiente[0].precio_referencia == pytest.approx(100.0)
+    assert siguiente[0].fraction == pytest.approx(0.67)
+
+
+def test_parcial_en_perdida_no_sube_el_stop_a_be():
+    # SHORT que escala a HOT a 101: para un short eso es PÉRDIDA
+    entry = tr(0, State.NORMAL, State.WATCH, 100.0, direction=Direction.SHORT)
+    r = PositionRules(entry, StrategyParams())
+    t = tr(MIN, State.WATCH, State.HOT, 101.0, direction=Direction.SHORT)
+    _confirmar(r, r.on_candle(vela(MIN, 101.0), [t]))
+    # con BE erróneo (stop=100) una vela a 101 dispararía el stop; no debe
+    assert r.on_candle(vela(2 * MIN, 101.0)) == []
+
+
+def test_el_be_usa_el_precio_ejecutado_no_el_de_referencia():
+    """El caso que justifica el protocolo de dos fases: la regla dice que la
+    parcial sale a 110 (beneficio), pero el broker la ejecuta a 99 por
+    slippage. Con 99 la parcial fue en PÉRDIDA, así que el stop NO sube a BE."""
+    r = PositionRules(entrada_long(), StrategyParams())
+    intents = r.on_candle(vela(MIN, 110.0), [tr(MIN, State.WATCH, State.HOT, 110.0)])
+    _confirmar(r, intents, precio=99.0)
+    # si el stop hubiera subido a BE (100), esta vela a 100 lo dispararía
+    assert r.on_candle(vela(2 * MIN, 100.0)) == []
