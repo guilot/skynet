@@ -23,3 +23,4 @@ config.local.toml
 .vscode/
 .idea/
 .superpowers/
+.worktrees/
