@@ -39,6 +39,7 @@ def format_trajectory_report(run: TrajectoryRun) -> str:
     lineas.append(f"  descartes tope concurrencia:{run.skipped_max_concurrent}")
     lineas.append(f"  descartes sin velas:        {run.skipped_sin_velas}")
     lineas.append(f"  descartes score bajo:       {run.skipped_score_bajo}")
+    lineas.append(f"  descartes par congelado:    {run.skipped_congelado}")
     lineas.append("")
 
     ret = ((run.equity_final / run.equity_inicial) - 1) * 100 if run.equity_inicial else 0.0
