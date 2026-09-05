@@ -9,6 +9,11 @@ La base de datos (~200 MB) no está versionada. El test se salta si no está.
 Para regenerar el fichero congelado tras un cambio INTENCIONADO de
 comportamiento: `SCANNER_BT_REGENERA=1 .venv/bin/pytest \
 tests/backtest/trajectory/test_golden_master.py`
+
+Solo se acepta un valor verdadero explícito ("1", "true" o "yes", sin
+distinguir mayúsculas) para disparar la regeneración. Cualquier otro string
+no vacío (incluido un residuo como "0" o "false" en el entorno) se trata como
+falso, para que un export olvidado no destruya el golden master en silencio.
 """
 from __future__ import annotations
 
@@ -29,6 +34,19 @@ from scanner_volumen.strategy.model import StrategyParams
 RAIZ = Path(__file__).resolve().parents[3]
 DB = Path(os.environ.get("SCANNER_BT_DB", RAIZ / ".backtest-data" / "scanner.db"))
 CONGELADO = Path(__file__).parent / "golden_trajectory.txt"
+VALORES_VERDADEROS = {"1", "true", "yes"}
+
+
+def _regenera_solicitado() -> bool:
+    """Verdad explícita de `SCANNER_BT_REGENERA`, no verdad de string.
+
+    `os.environ.get(...)` es verdadero para cualquier string no vacío, así
+    que un residuo como `SCANNER_BT_REGENERA=0` en el entorno regeneraría el
+    golden master en silencio. Solo "1", "true" o "yes" (sin distinguir
+    mayúsculas) activan la regeneración.
+    """
+    valor = os.environ.get("SCANNER_BT_REGENERA", "")
+    return valor.strip().lower() in VALORES_VERDADEROS
 
 
 def _volcado(run) -> str:
@@ -70,7 +88,7 @@ def _correr() -> str:
 )
 def test_golden_master_del_backtest():
     actual = _correr()
-    if os.environ.get("SCANNER_BT_REGENERA"):
+    if _regenera_solicitado():
         CONGELADO.write_text(actual, encoding="utf-8")
         pytest.skip("golden master regenerado")
     assert actual == CONGELADO.read_text(encoding="utf-8")

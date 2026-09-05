@@ -29,7 +29,7 @@ def test_strategy_no_importa_backtest():
     for fichero in sorted(RAIZ.rglob("*.py")):
         for modulo in _imports(fichero):
             if modulo.startswith("scanner_volumen.backtest"):
-                ofensores.append(f"{fichero.name} importa {modulo}")
+                ofensores.append(f"{fichero.relative_to(RAIZ)} importa {modulo}")
     assert not ofensores, (
         "strategy/ no puede depender de backtest/ (la flecha va "
         f"backtest -> strategy): {ofensores}"

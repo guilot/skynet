@@ -44,6 +44,17 @@ def test_una_ganancia_rompe_la_racha():
     assert not f.congelado("A", 200_000)
 
 
+def test_un_pnl_de_cero_rompe_la_racha():
+    # la condición de pérdida es estricta (pnl < 0): un pnl == 0 no es una
+    # pérdida y rompe la racha igual que una ganancia, aunque no reste nada
+    f = FreezeTracker(StrategyParams())
+    f.registrar("A", close_ts=0, pnl=-1.0)
+    f.registrar("A", close_ts=60_000, pnl=-1.0)
+    f.registrar("A", close_ts=120_000, pnl=0.0)
+    f.registrar("A", close_ts=180_000, pnl=-1.0)
+    assert not f.congelado("A", 200_000)
+
+
 def test_perdidas_fuera_de_la_ventana_no_congelan():
     f = FreezeTracker(StrategyParams())
     for i in range(3):

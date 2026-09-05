@@ -70,6 +70,19 @@ class PositionRules:
     def max_rank(self) -> int:
         return self._max_rank
 
+    @property
+    def stop_price(self) -> float:
+        """Precio de stop vigente. La Fase 3 lo usa para reflejar en el
+        exchange una orden stop reduce-only que sobreviva a una caída del
+        bot, sin depender de recalcularlo por su cuenta."""
+        return self._stop_price
+
+    @property
+    def stop_en_be(self) -> bool:
+        """True si el stop ya subió a break-even. Le indica al driver que
+        debe mover la orden stop colocada en el exchange en consecuencia."""
+        return self._stop_en_be
+
     # --- eventos ---
 
     def on_candle(
