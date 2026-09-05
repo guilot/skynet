@@ -172,6 +172,28 @@ class BacktestConfig:
 
 
 @dataclass(frozen=True)
+class BotConfig:
+    """Bot de ejecución (spec de la Fase 2).
+
+    `enabled` arranca en False a propósito: encender el bot es una decisión
+    deliberada, no un efecto secundario de desplegar. `modo` es el switch que
+    la Fase 3 usará para pasar a dinero real; hoy solo acepta "paper" en
+    ejecución, aunque "real" se reconoce para que el error sea claro en vez de
+    un KeyError.
+
+    `desvio_max_entrada` es la fracción máxima que el precio ejecutado puede
+    alejarse del precio de la señal antes de descartar la entrada. Nace en 0.0
+    (desactivado): primero se mide cuánto cuesta llegar tarde, y solo después
+    se elige un umbral con datos detrás.
+    """
+
+    enabled: bool
+    modo: str
+    equity_inicial: float
+    desvio_max_entrada: float
+
+
+@dataclass(frozen=True)
 class Config:
     market: MarketConfig
     universe: UniverseConfig
@@ -187,6 +209,7 @@ class Config:
     outcomes: OutcomesConfig
     server: ServerConfig
     backtest: BacktestConfig
+    bot: BotConfig
 
 
 # Los tres bloques del score (MOMENTUM 6 + DEMAND 4 + STRUCTURE 3, ver
@@ -210,6 +233,35 @@ CLAVES_STRUCTURE = ("vwap", "z_return", "market_cap")
 CURVAS_ESPERADAS = frozenset((*CLAVES_MOMENTUM, *CLAVES_DEMAND, *CLAVES_STRUCTURE))
 
 _ESTADOS_VALIDOS = {s.value for s in State}
+
+_MODOS_BOT = ("paper", "real")
+
+
+def _validar_bot(raw_bot: dict) -> None:
+    """Valida el switch del bot al cargar, en un único punto de fallo.
+
+    "real" se reconoce como modo válido pero se rechaza en ejecución: el
+    interruptor de la Fase 3 queda cableado donde va a ir, y no puede
+    encenderse por accidente antes de que exista la ejecución real."""
+    modo = raw_bot["modo"]
+    if modo not in _MODOS_BOT:
+        raise ValueError(
+            f"bot.modo no es válido: {modo!r} (válidos: {list(_MODOS_BOT)})"
+        )
+    if modo == "real":
+        raise ValueError(
+            "bot.modo = 'real' requiere la ejecución contra Bitget, que es la "
+            "Fase 3 y todavía no está implementada. Usa 'paper'."
+        )
+    if raw_bot["equity_inicial"] <= 0:
+        raise ValueError(
+            f"bot.equity_inicial debe ser positivo, llegó {raw_bot['equity_inicial']!r}"
+        )
+    if raw_bot["desvio_max_entrada"] < 0:
+        raise ValueError(
+            "bot.desvio_max_entrada no puede ser negativo, llegó "
+            f"{raw_bot['desvio_max_entrada']!r}"
+        )
 
 
 def _validar_backtest(raw_backtest: dict) -> None:
@@ -268,6 +320,7 @@ def load_config(path: Path) -> Config:
         "orchestrator.persisted_min_state", raw["orchestrator"]["persisted_min_state"]
     )
     _validar_backtest(raw["backtest"])
+    _validar_bot(raw["bot"])
 
     return Config(
         market=MarketConfig(**raw["market"]),
@@ -290,4 +343,5 @@ def load_config(path: Path) -> Config:
         ),
         server=ServerConfig(**raw["server"]),
         backtest=BacktestConfig(**raw["backtest"]),
+        bot=BotConfig(**raw["bot"]),
     )

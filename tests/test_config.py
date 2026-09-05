@@ -186,6 +186,33 @@ def test_falla_si_episode_gap_minutes_no_es_positivo(tmp_path):
         load_config(destino)
 
 
+def test_config_bot_por_defecto():
+    cfg = load_config(CONFIG_PATH)
+    assert cfg.bot.enabled is False          # arranca apagado a propósito
+    assert cfg.bot.modo == "paper"
+    assert cfg.bot.equity_inicial == 1000.0
+    assert cfg.bot.desvio_max_entrada == 0.0  # 0 = desactivado
+
+
+def test_modo_real_no_arranca(tmp_path):
+    # el switch de la Fase 3 está cableado pero no puede encenderse todavía
+    origen = CONFIG_PATH.read_text(encoding="utf-8")
+    destino = tmp_path / "config.toml"
+    destino.write_text(origen.replace('modo = "paper"', 'modo = "real"'),
+                       encoding="utf-8")
+    with pytest.raises(ValueError, match="Fase 3"):
+        load_config(destino)
+
+
+def test_modo_desconocido_falla(tmp_path):
+    origen = CONFIG_PATH.read_text(encoding="utf-8")
+    destino = tmp_path / "config.toml"
+    destino.write_text(origen.replace('modo = "paper"', 'modo = "simulado"'),
+                       encoding="utf-8")
+    with pytest.raises(ValueError, match="bot.modo"):
+        load_config(destino)
+
+
 def test_falla_si_min_episodes_for_significance_es_negativo(tmp_path):
     toml_roto = CONFIG_PATH.read_text().replace(
         "min_episodes_for_significance = 30", "min_episodes_for_significance = -1",
