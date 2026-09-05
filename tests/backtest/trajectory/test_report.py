@@ -1,9 +1,9 @@
-from scanner_volumen.backtest.trajectory.model import (
-    Direction, ExitReason, Fill, PositionOutcome, TrajectoryParams,
-)
 from scanner_volumen.backtest.trajectory.portfolio import ClosedTrade, TrajectoryRun
 from scanner_volumen.backtest.trajectory.report import format_trajectory_report
 from scanner_volumen.models import State
+from scanner_volumen.strategy.model import (
+    Direction, ExitReason, Fill, PositionOutcome, StrategyParams,
+)
 
 
 def _trade(close_ts, pnl, reason, max_rank=1):
@@ -23,7 +23,7 @@ def _run(trades, **overrides):
         skipped_congelado=0,
         equity_inicial=1000.0, equity_final=1020.0,
         ts_min=0, ts_max=2000, total_transitions=5,
-        max_concurrentes_alcanzado=1, params=TrajectoryParams(),
+        max_concurrentes_alcanzado=1, params=StrategyParams(),
     )
     base.update(overrides)
     return TrajectoryRun(**base)

@@ -21,10 +21,10 @@ from scanner_volumen.backtest.db import open_readonly
 from scanner_volumen.backtest.trajectory.loader import (
     load_transitions, make_candle_provider,
 )
-from scanner_volumen.backtest.trajectory.model import TrajectoryParams
 from scanner_volumen.backtest.trajectory.portfolio import run_trajectory
 from scanner_volumen.backtest.trajectory.report import format_trajectory_report
 from scanner_volumen.storage.repos import CandleRepo, StateTransitionRepo
+from scanner_volumen.strategy.model import StrategyParams
 
 RAIZ = Path(__file__).resolve().parents[3]
 DB = Path(os.environ.get("SCANNER_BT_DB", RAIZ / ".backtest-data" / "scanner.db"))
@@ -57,7 +57,7 @@ def _correr() -> str:
     try:
         transitions = load_transitions(StateTransitionRepo(conn))
         provider = make_candle_provider(CandleRepo(conn))
-        run = run_trajectory(transitions, provider, TrajectoryParams())
+        run = run_trajectory(transitions, provider, StrategyParams())
     finally:
         conn.close()
     return _volcado(run)

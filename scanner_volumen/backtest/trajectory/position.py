@@ -21,12 +21,10 @@ mercado, con el stop (ya en BE por las parciales) todavía activo por si reviert
 """
 from __future__ import annotations
 
-from scanner_volumen.backtest.trajectory.model import (
-    CandleRow, ExitReason, Fill, PositionOutcome, TrajectoryParams, TransitionRow,
-)
 from scanner_volumen.models import Direction, State
-
-MIN_MS = 60_000
+from scanner_volumen.strategy.model import (
+    CandleRow, ExitReason, Fill, MIN_MS, PositionOutcome, StrategyParams, TransitionRow,
+)
 
 _HOT = State.HOT.rank
 _SIGNAL = State.SIGNAL.rank
@@ -37,7 +35,7 @@ def simulate_position(
     entry: TransitionRow,
     later: list[TransitionRow],
     candles: list[CandleRow],
-    params: TrajectoryParams,
+    params: StrategyParams,
 ) -> PositionOutcome:
     if not candles:
         # No debería alcanzarse en producción: run_trajectory filtra antes las

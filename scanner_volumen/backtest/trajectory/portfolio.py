@@ -9,11 +9,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from scanner_volumen.backtest.trajectory.model import (
-    CandleRow, PositionOutcome, TrajectoryParams, TransitionRow,
-)
 from scanner_volumen.backtest.trajectory.position import MIN_MS, simulate_position
 from scanner_volumen.models import Direction, State
+from scanner_volumen.strategy.model import (
+    CandleRow, PositionOutcome, StrategyParams, TransitionRow,
+)
 
 _WATCH = State.WATCH.rank
 
@@ -33,7 +33,7 @@ class ClosedTrade:
     fill_pnls: tuple[float, ...]
 
 
-def settle(outcome: PositionOutcome, margin: float, params: TrajectoryParams) -> ClosedTrade:
+def settle(outcome: PositionOutcome, margin: float, params: StrategyParams) -> ClosedTrade:
     signo = 1.0 if outcome.direction is Direction.LONG else -1.0
     notional = margin * params.apalancamiento
     size = notional / outcome.entry_price
@@ -70,13 +70,13 @@ class TrajectoryRun:
     ts_max: int | None
     total_transitions: int
     max_concurrentes_alcanzado: int
-    params: TrajectoryParams
+    params: StrategyParams
 
 
 def run_trajectory(
     transitions: list[TransitionRow],
     candles_for: Callable[[str, int], list[CandleRow]],
-    params: TrajectoryParams,
+    params: StrategyParams,
 ) -> TrajectoryRun:
     por_simbolo: dict[str, list[TransitionRow]] = {}
     for t in transitions:
