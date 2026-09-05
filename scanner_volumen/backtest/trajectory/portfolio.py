@@ -62,6 +62,7 @@ class TrajectoryRun:
     skipped_symbol_open: int
     skipped_max_concurrent: int
     skipped_sin_velas: int
+    skipped_score_bajo: int
     equity_inicial: float
     equity_final: float
     ts_min: int | None
@@ -85,12 +86,15 @@ def run_trajectory(
     # outcome para ordenar los cierres en el tiempo. Las NEUTRAL no simulan
     # posición (no ocupan slot) pero se cuentan en el bucle de eventos.
     entradas: list[PositionOutcome] = []
-    n_neutral = n_sin_velas = 0
+    n_neutral = n_sin_velas = n_score_bajo = 0
     for t in transitions:
         if not es_entrada(t):
             continue
         if t.direction is Direction.NEUTRAL:
             n_neutral += 1
+            continue
+        if t.score < params.min_score_entrada:
+            n_score_bajo += 1
             continue
         posteriores = [u for u in por_simbolo[t.symbol] if u.ts > t.ts]
         velas = candles_for(t.symbol, t.ts)
@@ -149,6 +153,7 @@ def run_trajectory(
         trades=tuple(sorted(trades, key=lambda tr: tr.outcome.close_ts)),
         skipped_neutral=n_neutral, skipped_symbol_open=n_symbol,
         skipped_max_concurrent=n_concurr, skipped_sin_velas=n_sin_velas,
+        skipped_score_bajo=n_score_bajo,
         equity_inicial=params.equity_inicial, equity_final=balance,
         ts_min=min(ts_all, default=None), ts_max=max(ts_all, default=None),
         total_transitions=len(transitions),

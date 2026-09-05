@@ -14,6 +14,7 @@ def load_transitions(repo: StateTransitionRepo) -> list[TransitionRow]:
             ts=f["ts"], symbol=f["symbol"],
             prev_state=State(f["prev_state"]), new_state=State(f["new_state"]),
             price=f["price"], direction=Direction(f["direction"]),
+            score=f["score"],
         )
         for f in repo.all_transitions()
     ]

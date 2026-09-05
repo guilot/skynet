@@ -27,6 +27,7 @@ class TrajectoryParams:
     stale_min: int = 10
     tramo_hot: float = 0.33
     tramo_signal: float = 0.33
+    min_score_entrada: float = 0.0  # score mínimo del cruce a WATCH para entrar
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ class TransitionRow:
     new_state: State
     price: float
     direction: Direction
+    score: float
 
 
 @dataclass(frozen=True)

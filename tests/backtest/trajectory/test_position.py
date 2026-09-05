@@ -9,9 +9,10 @@ from scanner_volumen.models import Direction, State
 MIN = 60_000
 
 
-def tr(ts, prev, new, price, symbol="X", direction=Direction.LONG):
+def tr(ts, prev, new, price, symbol="X", direction=Direction.LONG, score=55.0):
     return TransitionRow(ts=ts, symbol=symbol, prev_state=prev,
-                         new_state=new, price=price, direction=direction)
+                         new_state=new, price=price, direction=direction,
+                         score=score)
 
 
 def velas(inicio, precios):

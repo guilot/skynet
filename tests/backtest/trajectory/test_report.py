@@ -19,7 +19,7 @@ def _trade(close_ts, pnl, reason, max_rank=1):
 def _run(trades, **overrides):
     base = dict(
         trades=trades, skipped_neutral=2, skipped_symbol_open=1,
-        skipped_max_concurrent=3, skipped_sin_velas=0,
+        skipped_max_concurrent=3, skipped_sin_velas=0, skipped_score_bajo=0,
         equity_inicial=1000.0, equity_final=1020.0,
         ts_min=0, ts_max=2000, total_transitions=5,
         max_concurrentes_alcanzado=1, params=TrajectoryParams(),

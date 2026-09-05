@@ -41,9 +41,9 @@ def test_settle_descuenta_comision_entrada_y_salida():
 MIN = 60_000
 
 
-def _tr(ts, prev, new, price, symbol="A", direction=Direction.LONG):
+def _tr(ts, prev, new, price, symbol="A", direction=Direction.LONG, score=55.0):
     return TransitionRow(ts=ts, symbol=symbol, prev_state=prev, new_state=new,
-                         price=price, direction=direction)
+                         price=price, direction=direction, score=score)
 
 
 def test_descarta_neutral_y_respeta_unicidad_por_simbolo():
@@ -63,6 +63,24 @@ def test_descarta_neutral_y_respeta_unicidad_por_simbolo():
     assert run.skipped_neutral == 1
     assert run.skipped_symbol_open == 1
     assert len(run.trades) == 1  # solo la primera entrada de B
+
+
+def test_filtro_min_score_entrada():
+    # dos entradas: una con score 52 (< umbral) y otra con 60 (>= umbral).
+    trans = [
+        _tr(0, State.NORMAL, State.WATCH, 100.0, symbol="A", score=52.0),
+        _tr(1 * MIN, State.NORMAL, State.WATCH, 100.0, symbol="B", score=60.0),
+    ]
+
+    def candles_for(symbol, since):
+        return [CandleRow(ts=since + i * MIN, open=100, high=100, low=100, close=100)
+                for i in range(40)]
+
+    run = run_trajectory(trans, candles_for,
+                         TrajectoryParams(comision_taker=0.0, min_score_entrada=55.0))
+    assert run.skipped_score_bajo == 1
+    assert len(run.trades) == 1
+    assert run.trades[0].outcome.symbol == "B"
 
 
 def test_limite_de_cinco_concurrentes():
