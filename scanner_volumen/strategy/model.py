@@ -95,3 +95,44 @@ class PositionOutcome:
     fills: tuple[Fill, ...]
     max_rank: int
     close_ts: int
+
+
+@dataclass(frozen=True)
+class TradeResumen:
+    """Un trade cerrado, en la forma mínima que el informe necesita.
+
+    La construyen tanto el backtest (desde su `ClosedTrade`) como el bot (desde
+    su base de datos), para que un único formateador sirva a los dos.
+    """
+
+    symbol: str
+    direction: Direction
+    entry_ts: int
+    entry_price: float
+    close_ts: int
+    fills: tuple[Fill, ...]
+    fill_pnls: tuple[float, ...]
+    margin: float
+    pnl: float
+    fees: float
+    max_rank: int
+
+
+@dataclass(frozen=True)
+class ResumenOperativa:
+    """Todo lo que el informe necesita, sin saber quién operó.
+
+    `descartes` es un diccionario ordenado etiqueta -> cuenta: el orden de
+    inserción es el orden de impresión, y cada productor mete las etiquetas que
+    le aplican (el backtest tiene "sin velas", el bot tiene "desvio").
+    """
+
+    titulo: str
+    trades: tuple[TradeResumen, ...]
+    descartes: dict[str, int]
+    equity_inicial: float
+    equity_final: float
+    ts_min: int | None
+    ts_max: int | None
+    total_transiciones: int
+    max_concurrentes_alcanzado: int
