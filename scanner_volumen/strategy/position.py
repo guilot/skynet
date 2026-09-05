@@ -49,6 +49,9 @@ class PositionRules:
         self._restante = 1.0
         self._comprometido = 1.0
         self._pendientes: list[ExitIntent] = []
+        self._corriendo_extreme = False   # tras EXTREME, mantener el resto
+        self._extreme_hold_until = 0
+        self._extreme_run_ms = int(params.extreme_run_min * MIN_MS)
 
     # --- estado observable ---
 
@@ -93,6 +96,15 @@ class PositionRules:
             self._emitir(intents, vela.ts, self._comprometido, ExitReason.STOP, precio)
             return intents
 
+        # run tras EXTREME: mantener el resto hasta extreme_run_min y cerrar a
+        # mercado. Las transiciones se ignoran durante el run; solo el stop
+        # (arriba, ya en BE por las parciales) puede sacar antes.
+        if self._corriendo_extreme:
+            if vela.ts >= self._extreme_hold_until:
+                self._emitir(intents, vela.ts, self._comprometido,
+                             ExitReason.EXTREME, vela.close)
+            return intents
+
         # (2) transiciones cuyo ts cae en esta ventana, en orden ascendente
         for t in transiciones:
             if t.new_state.rank > self._max_rank:
@@ -105,6 +117,15 @@ class PositionRules:
                 self._fired_signal = True
                 self._emitir(intents, t.ts, self.params.tramo_signal,
                              ExitReason.SCALE_SIGNAL, t.price)
+            if self._max_rank >= _EXTREME:
+                if self._extreme_run_ms <= 0:
+                    self._emitir(intents, t.ts, self._comprometido,
+                                 ExitReason.EXTREME, t.price)
+                else:
+                    # deja correr el resto: cierra por timer (o por stop en BE)
+                    self._corriendo_extreme = True
+                    self._extreme_hold_until = t.ts + self._extreme_run_ms
+                break
 
         return intents
 

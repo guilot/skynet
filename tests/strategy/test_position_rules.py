@@ -167,3 +167,56 @@ def test_el_be_usa_el_precio_ejecutado_no_el_de_referencia():
     _confirmar(r, intents, precio=99.0)
     # si el stop hubiera subido a BE (100), esta vela a 100 lo dispararía
     assert r.on_candle(vela(2 * MIN, 100.0)) == []
+
+
+def test_extreme_con_run_cero_cierra_en_el_acto():
+    r = PositionRules(entrada_long(), StrategyParams(extreme_run_min=0))
+    t = tr(MIN, State.WATCH, State.EXTREME, 130.0)
+    intents = r.on_candle(vela(MIN, 130.0), [t])
+    assert [i.reason for i in intents] == [
+        ExitReason.SCALE_HOT, ExitReason.SCALE_SIGNAL, ExitReason.EXTREME]
+    # el cierre por EXTREME cierra SOLO lo que queda tras los dos tramos
+    assert intents[2].fraction == pytest.approx(0.34)
+    assert intents[2].precio_referencia == pytest.approx(130.0)
+    _confirmar(r, intents)
+    assert r.cerrada
+
+
+def test_extreme_con_run_mantiene_y_cierra_a_mercado_al_vencer():
+    r = PositionRules(entrada_long(), StrategyParams(extreme_run_min=3))
+    t = tr(MIN, State.WATCH, State.EXTREME, 130.0)
+    intents = r.on_candle(vela(MIN, 130.0), [t])
+    # solo los tramos: el resto se deja correr
+    assert [i.reason for i in intents] == [
+        ExitReason.SCALE_HOT, ExitReason.SCALE_SIGNAL]
+    _confirmar(r, intents)
+    # durante el run no pasa nada
+    assert r.on_candle(vela(2 * MIN, 135.0)) == []
+    assert r.on_candle(vela(3 * MIN, 140.0)) == []
+    # al vencer (MIN + 3min) cierra a mercado, al close de la vela
+    finales = r.on_candle(CandleRow(ts=4 * MIN, open=141.0, high=142.0,
+                                    low=140.0, close=141.5))
+    assert finales[0].reason is ExitReason.EXTREME
+    assert finales[0].precio_referencia == pytest.approx(141.5)
+    assert finales[0].fraction == pytest.approx(0.34)
+
+
+def test_durante_el_run_el_stop_en_be_sigue_activo():
+    r = PositionRules(entrada_long(), StrategyParams(extreme_run_min=10))
+    t = tr(MIN, State.WATCH, State.EXTREME, 130.0)
+    _confirmar(r, r.on_candle(vela(MIN, 130.0), [t]))  # tramos -> stop en BE (100)
+    intents = r.on_candle(vela(2 * MIN, 100.0))
+    assert intents[0].reason is ExitReason.STOP
+    assert intents[0].precio_referencia == pytest.approx(100.0)
+
+
+def test_extreme_corta_las_transiciones_posteriores_de_la_misma_vela():
+    r = PositionRules(entrada_long(), StrategyParams(extreme_run_min=3))
+    trans = [
+        tr(MIN, State.WATCH, State.EXTREME, 130.0),
+        tr(MIN + 1, State.EXTREME, State.NORMAL, 90.0),  # se ignora
+    ]
+    intents = r.on_candle(vela(MIN, 130.0), trans)
+    assert [i.reason for i in intents] == [
+        ExitReason.SCALE_HOT, ExitReason.SCALE_SIGNAL]
+    assert r.max_rank == State.EXTREME.rank
