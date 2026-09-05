@@ -138,6 +138,46 @@ CREATE TABLE IF NOT EXISTS state_transitions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_state_transitions_ts ON state_transitions(ts);
+
+CREATE TABLE IF NOT EXISTS bot_posiciones (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    modo TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    entry_ts INTEGER NOT NULL,
+    entry_price REAL NOT NULL,
+    entry_price_senal REAL NOT NULL,
+    margin REAL NOT NULL,
+    notional REAL NOT NULL,
+    size REAL NOT NULL,
+    fee_entrada REAL NOT NULL,
+    abierta INTEGER NOT NULL,
+    close_ts INTEGER,
+    pnl REAL,
+    fees REAL,
+    max_rank INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_bot_pos_abierta ON bot_posiciones(modo, abierta);
+
+CREATE TABLE IF NOT EXISTS bot_fills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    posicion_id INTEGER NOT NULL,
+    ts INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    fraction REAL NOT NULL,
+    precio_referencia REAL NOT NULL,
+    precio REAL NOT NULL,
+    comision REAL NOT NULL,
+    tardio INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_bot_fills_pos ON bot_fills(posicion_id);
+
+CREATE TABLE IF NOT EXISTS bot_meta (
+    clave TEXT PRIMARY KEY,
+    valor TEXT NOT NULL
+);
 """
 
 
