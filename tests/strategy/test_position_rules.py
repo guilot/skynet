@@ -290,3 +290,35 @@ def test_una_transicion_desarma_un_be_ya_armado():
     r.on_candle(vela(12 * MIN, 99.0), [tr(12 * MIN, State.WATCH, State.WATCH, 99.0)])
     # aunque el precio vuelva a la entrada, ya no hay salida armada
     assert r.on_candle(vela(13 * MIN, 100.0)) == []
+
+
+def test_estancamiento_en_short_sale_en_be():
+    # SHORT entra a 100 -> stop en 102.5. Precio en 100 durante 10 min
+    # sin cambios es estancamiento; debe emitir STALE_BE a 100.
+    entry = tr(0, State.NORMAL, State.WATCH, 100.0, direction=Direction.SHORT)
+    r = PositionRules(entry, StrategyParams())
+    for i in range(1, 10):
+        assert r.on_candle(vela(i * MIN, 100.0)) == []
+    intents = r.on_candle(vela(10 * MIN, 100.0))
+    assert intents[0].reason is ExitReason.STALE_BE
+    assert intents[0].precio_referencia == pytest.approx(100.0)
+    assert intents[0].ts == 10 * MIN
+
+
+def test_estancamiento_armado_cierra_cuando_el_precio_vuelve_a_be():
+    # LONG entra a 100. Precio en 99 (bajo agua pero por encima del stop 97.5)
+    # durante suficientes velas para armarse en minuto 10. Luego varias velas
+    # más sin cerrar, y finalmente el precio vuelve a 100 y se cierra.
+    r = PositionRules(entrada_long(), StrategyParams())
+    # minutos 1-10: precio en 99, se arma en minuto 10
+    for i in range(1, 11):
+        assert r.on_candle(vela(i * MIN, 99.0)) == []
+    # minutos 11-14: sigue en 99, el armado persiste pero no cierra
+    for i in range(11, 15):
+        assert r.on_candle(vela(i * MIN, 99.0)) == []
+    # minuto 15: el precio vuelve a 100, se cierra ahora
+    intents = r.on_candle(vela(15 * MIN, 100.0))
+    assert len(intents) == 1
+    assert intents[0].reason is ExitReason.STALE_BE
+    assert intents[0].precio_referencia == pytest.approx(100.0)
+    assert intents[0].ts == 15 * MIN
