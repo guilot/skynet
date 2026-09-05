@@ -48,6 +48,10 @@ class PaperBroker:
         self, *, symbol: str, direction: Direction, notional: float,
         precio_mercado: float, ts: int,
     ) -> OrdenEjecutada:
+        if precio_mercado <= 0:
+            raise ValueError(
+                f"precio_mercado debe ser estrictamente positivo, recibido: {precio_mercado}"
+            )
         return OrdenEjecutada(
             ts=ts, precio=precio_mercado, cantidad=notional / precio_mercado,
             comision=self._params.comision_taker * notional,
@@ -57,6 +61,10 @@ class PaperBroker:
         self, *, symbol: str, direction: Direction, cantidad: float,
         precio_mercado: float, ts: int,
     ) -> OrdenEjecutada:
+        if precio_mercado <= 0:
+            raise ValueError(
+                f"precio_mercado debe ser estrictamente positivo, recibido: {precio_mercado}"
+            )
         return OrdenEjecutada(
             ts=ts, precio=precio_mercado, cantidad=cantidad,
             comision=self._params.comision_taker * cantidad * precio_mercado,
