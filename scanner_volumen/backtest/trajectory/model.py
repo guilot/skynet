@@ -28,7 +28,7 @@ class TrajectoryParams:
     tramo_hot: float = 0.33
     tramo_signal: float = 0.33
     min_score_entrada: float = 0.0  # score mínimo del cruce a WATCH para entrar
-    extreme_run_min: float = 0.0    # min a mantener el resto tras EXTREME (0 = cerrar ya)
+    extreme_run_min: float = 3.0    # min a mantener el resto tras EXTREME (0 = cerrar ya)
 
 
 @dataclass(frozen=True)

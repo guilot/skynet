@@ -57,7 +57,8 @@ def test_escalera_completa_dispara_los_tres_tramos():
         tr(3 * MIN, State.SIGNAL, State.EXTREME, 130.0),
     ]
     candles = velas(0, [100, 110, 120, 130, 130])
-    out = simulate_position(entry, later, candles, TrajectoryParams())
+    # extreme_run_min=0: cierre inmediato en EXTREME (esta escalera prueba ese camino)
+    out = simulate_position(entry, later, candles, TrajectoryParams(extreme_run_min=0))
     reasons = [f.reason for f in out.fills]
     assert reasons == [ExitReason.SCALE_HOT, ExitReason.SCALE_SIGNAL, ExitReason.EXTREME]
     assert out.fills[0].price == 110.0 and out.fills[0].fraction == pytest.approx(0.33)
