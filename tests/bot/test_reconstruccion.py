@@ -50,6 +50,8 @@ async def test_reconstruye_el_estado_del_motor_tras_un_reinicio(conn):
                        lambda s: 110.0, ahora=MIN)
     assert bot1.abiertas["A"].reglas.stop_en_be is True
     assert bot1.abiertas["A"].reglas.restante == pytest.approx(0.67)
+    pnl_original = bot1.abiertas["A"].pnl_acumulado
+    fees_originales = bot1.abiertas["A"].fees_acumuladas
 
     # Bot 2: proceso nuevo, mismo disco
     bot2, _ = _nuevo_runner(conn)
@@ -65,6 +67,11 @@ async def test_reconstruye_el_estado_del_motor_tras_un_reinicio(conn):
     assert pos.reglas.restante == pytest.approx(0.67)          # el tramo ya cobrado
     assert pos.reglas.max_rank == State.HOT.rank
     assert bot2.cierres_tardios == 0
+    # el PnL y las comisiones recompuestos deben coincidir EXACTAMENTE con los
+    # de la posición original: es lo que valida que `_confirmar_registrado`
+    # tomó el precio del fill guardado, no el de referencia de la intención.
+    assert pos.pnl_acumulado == pytest.approx(pnl_original)
+    assert pos.fees_acumuladas == pytest.approx(fees_originales)
 
 
 async def test_una_salida_que_en_vivo_no_ocurrio_se_ejecuta_tarde(conn):
@@ -88,6 +95,29 @@ async def test_una_salida_que_en_vivo_no_ocurrio_se_ejecuta_tarde(conn):
     assert fills[-1]["reason"] == ExitReason.STOP.value
     assert fills[-1]["tardio"] == 1
     assert fills[-1]["precio"] == pytest.approx(99.0)  # a mercado, ahora
+
+
+async def test_sin_precio_actual_la_salida_divergente_deja_degradada(conn):
+    # misma mecha que dispara el stop en la réplica, pero esta vez no hay
+    # ningún precio actual con el que resolverla (símbolo sin ticker, feed
+    # caído, etc.): no se puede ejecutar a mercado ni tampoco descartar.
+    bot1, repo = _nuevo_runner(conn)
+    await bot1.on_tick([tr()], lambda s: 100.0, ahora=0)
+
+    bot2, _ = _nuevo_runner(conn)
+    con_mecha = [CandleRow(ts=0, open=100, high=100, low=100, close=100),
+                 CandleRow(ts=MIN, open=100, high=100, low=97.0, close=100)]
+    await bot2.reconstruir(
+        transiciones_de=lambda s, desde: [tr()],
+        velas_de=lambda s, desde: con_mecha,
+        precio_de=lambda s: None, ahora=2 * MIN,
+    )
+    # sigue ocupando su hueco de concurrencia -realmente sigue abierta en la
+    # BD- pero marcada como degradada: el runner no le vuelve a tocar el
+    # motor hasta el siguiente intento de reconstrucción.
+    assert "A" in bot2.abiertas
+    assert bot2.abiertas["A"].degradada is True
+    assert bot2.cierres_tardios == 0
 
 
 async def test_sin_transicion_de_entrada_no_revienta(conn):

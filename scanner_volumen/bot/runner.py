@@ -145,9 +145,8 @@ class BotRunner:
             try:
                 await self._reconstruir_una(fila, transiciones_de, velas_de,
                                             precio_de, ahora)
-            except Exception as exc:  # noqa: BLE001 - una posición rota no impide arrancar
-                log.warning("bot: no se pudo reconstruir %s: %s",
-                            fila["symbol"], exc)
+            except Exception:  # noqa: BLE001 - una posición rota no impide arrancar
+                log.exception("bot: no se pudo reconstruir %s", fila["symbol"])
 
     async def _reconstruir_una(
         self, fila, transiciones_de, velas_de, precio_de: PrecioDe, ahora: int,
@@ -200,7 +199,21 @@ class BotRunner:
                     log.warning("bot: cierre tardío de %s por %s tras reinicio",
                                 symbol, intent.reason.value)
                 else:
-                    return  # sin precio no se puede resolver: se reintenta luego
+                    # no hay precio actual para resolver una salida divergente
+                    # que la réplica propone y en vivo nunca se confirmó: el
+                    # motor se queda con una intención pendiente sin resolver,
+                    # igual que si el broker hubiera fallado a media ejecución
+                    # en caliente. Se marca degradada -no se vuelve a tocar su
+                    # motor- pero se conserva en `abiertas` porque sigue
+                    # realmente abierta en la BD; el próximo reinicio volverá
+                    # a intentar reconstruirla desde cero.
+                    pos.degradada = True
+                    self.abiertas[symbol] = pos
+                    log.warning(
+                        "bot: %s reconstruida como degradada: sin precio para "
+                        "resolver la salida %s tras el reinicio",
+                        symbol, intent.reason.value)
+                    return
 
         if pos.reglas.cerrada:
             self._cerrar(pos, ahora)
@@ -222,11 +235,7 @@ class BotRunner:
         precio = registrado["precio"]
         pos.reglas.on_fill(Fill(ts=intent.ts, price=precio,
                                 fraction=intent.fraction, reason=intent.reason))
-        signo = 1.0 if pos.direction is Direction.LONG else -1.0
-        cantidad = pos.size * intent.fraction
-        bruto = signo * (precio - pos.entry_price) * cantidad
-        pos.pnl_acumulado += bruto - registrado["comision"]
-        pos.fees_acumuladas += registrado["comision"]
+        self._acumular_pnl(pos, precio, intent.fraction, registrado["comision"])
 
     # --- posiciones vivas ---
 
@@ -256,15 +265,29 @@ class BotRunner:
         )
         pos.reglas.on_fill(Fill(ts=intent.ts, price=orden.precio,
                                 fraction=intent.fraction, reason=intent.reason))
-        signo = 1.0 if pos.direction is Direction.LONG else -1.0
-        bruto = signo * (orden.precio - pos.entry_price) * cantidad
-        pos.pnl_acumulado += bruto - orden.comision
-        pos.fees_acumuladas += orden.comision
+        self._acumular_pnl(pos, orden.precio, intent.fraction, orden.comision)
         self._repo.registrar_fill(
             pos.id, ts=intent.ts, reason=intent.reason, fraction=intent.fraction,
             precio_referencia=intent.precio_referencia, precio=orden.precio,
             comision=orden.comision, tardio=tardio,
         )
+
+    def _acumular_pnl(
+        self, pos: PosicionAbierta, precio: float, fraction: float, comision: float,
+    ) -> None:
+        """Suma a la posición el PnL bruto y la comisión de una fracción
+        cerrada a `precio`.
+
+        La comparten `_ejecutar` (una salida que se manda al broker en vivo) y
+        `_confirmar_registrado` (una salida ya ejecutada que se le confirma al
+        motor durante la réplica): es la ruta del dinero, y dos copias que
+        pudieran divergir es justo el riesgo que no se quiere correr aquí.
+        """
+        signo = 1.0 if pos.direction is Direction.LONG else -1.0
+        cantidad = pos.size * fraction
+        bruto = signo * (precio - pos.entry_price) * cantidad
+        pos.pnl_acumulado += bruto - comision
+        pos.fees_acumuladas += comision
 
     def _cerrar(self, pos: PosicionAbierta, ahora: int) -> None:
         self._repo.cerrar(pos.id, close_ts=ahora, pnl=pos.pnl_acumulado,
