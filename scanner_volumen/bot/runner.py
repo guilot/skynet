@@ -13,6 +13,16 @@ diferencia es parte del objetivo de la Fase 2.
 Las salidas se procesan ANTES que las entradas, para que una posición que
 cierra en este mismo tick libere su hueco de concurrencia — igual que hace el
 backtest.
+
+Cada posición se gobierna aislada de las demás: si el broker falla al cerrar
+(un timeout de red, un precio inválido), la excepción no debe tumbar el tick
+entero ni dejar esa posición envenenada. `PositionRules.on_candle` exige que
+toda `ExitIntent` se confirme con `on_fill` antes del siguiente evento, y si
+el fallo ocurre entre medias esa confirmación nunca llega; sin aislamiento, el
+siguiente tick repetiría el `ValueError` de "intenciones sin confirmar" para
+siempre. El runner atrapa el fallo, marca la posición como `degradada` y deja
+de tocar su motor — pero la conserva en `abiertas`, ocupando su hueco, porque
+sigue realmente abierta en la base de datos.
 """
 from __future__ import annotations
 
@@ -59,8 +69,18 @@ class BotRunner:
 
         # (1) gobernar lo que ya está abierto: puede liberar huecos
         for symbol in list(self.abiertas):
-            await self._avanzar(self.abiertas[symbol], por_simbolo.get(symbol, ()),
-                                precio_de, ahora)
+            pos = self.abiertas[symbol]
+            try:
+                await self._avanzar(pos, por_simbolo.get(symbol, ()), precio_de, ahora)
+            except Exception:
+                # aislar el fallo a esta posición: no debe tumbar el tick ni
+                # dejarla envenenada (con una intención sin confirmar que
+                # haría reventar `on_candle` en todos los ticks siguientes).
+                # Se queda en `abiertas` ocupando su hueco -sigue realmente
+                # abierta en la BD- y la recuperará la reconstrucción al
+                # reiniciar (Task 7).
+                log.exception("bot: fallo al gobernar %s; se marca degradada", symbol)
+                pos.degradada = True
 
         # (2) evaluar entradas nuevas
         for t in transiciones:
@@ -109,6 +129,8 @@ class BotRunner:
     async def _avanzar(
         self, pos: PosicionAbierta, transiciones, precio_de: PrecioDe, ahora: int,
     ) -> None:
+        if pos.degradada:
+            return  # rota por un fallo previo del broker; no se vuelve a tocar
         precio = precio_de(pos.symbol)
         if precio is None or precio <= 0:
             return  # sin precio observado no se evalúa nada este tick

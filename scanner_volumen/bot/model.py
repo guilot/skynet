@@ -38,6 +38,12 @@ class PosicionAbierta:
     reglas: PositionRules
     pnl_acumulado: float = 0.0
     fees_acumuladas: float = 0.0
+    # True si un fallo del broker dejó una intención de salida sin confirmar y
+    # el runner tuvo que aislarla para no reventar en el siguiente tick. Sigue
+    # en `abiertas` y ocupa su hueco de concurrencia porque sigue realmente
+    # abierta en la base de datos (`abierta = 1`); es la reconstrucción al
+    # reiniciar (Task 7) la que la recupera, no este proceso en caliente.
+    degradada: bool = False
 
 
 # Etiquetas de descarte del bot, en el orden en que se imprimen. Coinciden con
