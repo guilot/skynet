@@ -240,3 +240,53 @@ def test_durante_el_run_se_ignoran_las_transiciones():
     assert intents_run == []
     # max_rank no debe cambiar (sigue siendo EXTREME, no retrocede a NORMAL)
     assert r.max_rank == State.EXTREME.rank
+
+
+def test_estancamiento_sin_cambios_sale_en_be():
+    r = PositionRules(entrada_long(), StrategyParams())
+    for i in range(1, 10):
+        assert r.on_candle(vela(i * MIN, 100.0)) == []
+    intents = r.on_candle(vela(10 * MIN, 100.0))
+    assert intents[0].reason is ExitReason.STALE_BE
+    assert intents[0].precio_referencia == pytest.approx(100.0)
+    assert intents[0].ts == 10 * MIN
+
+
+def test_estancamiento_en_profit_sale_a_mercado():
+    r = PositionRules(entrada_long(), StrategyParams())
+    for i in range(1, 10):
+        r.on_candle(vela(i * MIN, 105.0))
+    intents = r.on_candle(vela(10 * MIN, 105.0))
+    assert intents[0].reason is ExitReason.STALE_BE
+    assert intents[0].precio_referencia == pytest.approx(105.0)  # max(mercado, entrada)
+
+
+def test_estancamiento_bajo_agua_espera_a_be():
+    # 99 está por encima del stop (97.5) pero por debajo de la entrada:
+    # no se cierra, se espera a que el precio vuelva a BE
+    r = PositionRules(entrada_long(), StrategyParams())
+    for i in range(1, 15):
+        assert r.on_candle(vela(i * MIN, 99.0)) == []
+
+
+def test_una_transicion_reinicia_el_timer_de_estancamiento():
+    r = PositionRules(entrada_long(), StrategyParams())
+    for i in range(1, 6):
+        r.on_candle(vela(i * MIN, 100.0))
+    # transición en el minuto 6: reinicia el contador
+    r.on_candle(vela(6 * MIN, 100.0), [tr(6 * MIN, State.WATCH, State.WATCH, 100.0)])
+    # el minuto 10 ya no estanca (el timer corre desde el 6)
+    for i in range(7, 16):
+        assert r.on_candle(vela(i * MIN, 100.0)) == []
+    assert r.on_candle(vela(16 * MIN, 100.0))[0].reason is ExitReason.STALE_BE
+
+
+def test_una_transicion_desarma_un_be_ya_armado():
+    r = PositionRules(entrada_long(), StrategyParams())
+    # se arma el BE a los 10 min estando bajo agua (no cierra)
+    for i in range(1, 12):
+        r.on_candle(vela(i * MIN, 99.0))
+    # llega una transición: desarma el BE y reinicia el timer
+    r.on_candle(vela(12 * MIN, 99.0), [tr(12 * MIN, State.WATCH, State.WATCH, 99.0)])
+    # aunque el precio vuelva a la entrada, ya no hay salida armada
+    assert r.on_candle(vela(13 * MIN, 100.0)) == []

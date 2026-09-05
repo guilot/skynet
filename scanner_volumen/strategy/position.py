@@ -52,6 +52,9 @@ class PositionRules:
         self._corriendo_extreme = False   # tras EXTREME, mantener el resto
         self._extreme_hold_until = 0
         self._extreme_run_ms = int(params.extreme_run_min * MIN_MS)
+        self._ultimo_cambio_ts = entry.ts   # timer de estancamiento
+        self._be_armado = False
+        self._stale_ms = params.stale_min * MIN_MS
 
     # --- estado observable ---
 
@@ -107,6 +110,10 @@ class PositionRules:
 
         # (2) transiciones cuyo ts cae en esta ventana, en orden ascendente
         for t in transiciones:
+            # cualquier transición es un cambio de estado: reinicia el timer y
+            # desarma una salida en BE pendiente
+            self._ultimo_cambio_ts = t.ts
+            self._be_armado = False
             if t.new_state.rank > self._max_rank:
                 self._max_rank = t.new_state.rank
             if not self._fired_hot and self._max_rank >= _HOT:
@@ -126,6 +133,27 @@ class PositionRules:
                     self._corriendo_extreme = True
                     self._extreme_hold_until = t.ts + self._extreme_run_ms
                 break
+
+        if self._comprometido <= 0 or self._corriendo_extreme:
+            return intents
+
+        # (3) estancamiento: pasados stale_min sin cambio de estado se arma una
+        # salida limitada en break-even. Cierra en cuanto el precio toca la
+        # entrada (o a mercado si ya está en profit); nunca peor que BE.
+        if not self._be_armado and vela.ts - self._ultimo_cambio_ts >= self._stale_ms:
+            self._be_armado = True
+        if self._be_armado:
+            alcanza_be = (
+                (vela.high >= self.entry.price) if self._es_long
+                else (vela.low <= self.entry.price)
+            )
+            if alcanza_be:
+                if self._es_long:
+                    precio = vela.open if vela.open >= self.entry.price else self.entry.price
+                else:
+                    precio = vela.open if vela.open <= self.entry.price else self.entry.price
+                self._emitir(intents, vela.ts, self._comprometido,
+                             ExitReason.STALE_BE, precio)
 
         return intents
 
