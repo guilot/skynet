@@ -41,6 +41,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--max-concurrent", type=int, default=d.max_concurrentes)
     p.add_argument("--stale-min", type=int, default=d.stale_min)
     p.add_argument("--min-score", type=float, default=d.min_score_entrada)
+    p.add_argument("--extreme-run-min", type=float, default=d.extreme_run_min)
     args = p.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -51,6 +52,7 @@ def main(argv: list[str] | None = None) -> None:
         apalancamiento=args.leverage, comision_taker=args.fee,
         stop_pct=args.stop_pct, max_concurrentes=args.max_concurrent,
         stale_min=args.stale_min, min_score_entrada=args.min_score,
+        extreme_run_min=args.extreme_run_min,
     )
 
     conn = open_readonly(db_path)

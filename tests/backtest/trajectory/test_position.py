@@ -147,6 +147,38 @@ def test_transicion_reinicia_el_timer_de_estancamiento():
     assert out.fills[-1].reason == ExitReason.END_OF_DATA
 
 
+def test_extreme_run_mantiene_y_cierra_a_mercado():
+    # con extreme_run_min>0, al llegar a EXTREME NO cierra en el acto: mantiene
+    # el resto y lo cierra a mercado (close) N minutos después.
+    entry = tr(0, State.NORMAL, State.WATCH, 100.0)
+    later = [
+        tr(1 * MIN, State.WATCH, State.HOT, 110.0),
+        tr(2 * MIN, State.HOT, State.SIGNAL, 120.0),
+        tr(3 * MIN, State.SIGNAL, State.EXTREME, 130.0),
+    ]
+    candles = velas(0, [100, 110, 120, 130, 131, 132, 133, 134, 135, 135])
+    out = simulate_position(entry, later, candles, TrajectoryParams(extreme_run_min=5))
+    ext = out.fills[-1]
+    assert ext.reason == ExitReason.EXTREME
+    assert ext.ts == 8 * MIN          # 3min (EXTREME) + 5min de run
+    assert ext.price == pytest.approx(135.0)  # a mercado, no los 130 del cruce
+
+
+def test_extreme_run_respeta_el_stop_en_be():
+    # durante el run tras EXTREME el stop (ya en BE por las parciales) sigue
+    # activo: si el precio se desploma a la entrada, sale en BE, no espera al timer.
+    entry = tr(0, State.NORMAL, State.WATCH, 100.0)
+    later = [
+        tr(1 * MIN, State.WATCH, State.HOT, 110.0),
+        tr(2 * MIN, State.HOT, State.SIGNAL, 120.0),
+        tr(3 * MIN, State.SIGNAL, State.EXTREME, 130.0),
+    ]
+    candles = velas(0, [100, 110, 120, 130, 120, 110, 100, 100])
+    out = simulate_position(entry, later, candles, TrajectoryParams(extreme_run_min=10))
+    assert out.fills[-1].reason == ExitReason.STOP
+    assert out.fills[-1].price == pytest.approx(100.0)  # BE
+
+
 def test_velas_vacias_lanza_value_error():
     entry = tr(0, State.NORMAL, State.WATCH, 100.0)
     with pytest.raises(ValueError):

@@ -14,6 +14,10 @@ reinicia el contador), se arma una salida limitada en break-even: el resto se
 cierra en cuanto el precio vuelve a la entrada -o a mercado si ya está en
 profit-, nunca por debajo de BE; mientras siga bajo agua, solo lo sostiene el
 stop de -stop_pct.
+
+Al llegar a EXTREME: si `extreme_run_min` es 0 se cierra el resto en el acto
+(al precio del cruce); si es >0 se mantiene el resto ese tiempo y se cierra a
+mercado, con el stop (ya en BE por las parciales) todavía activo por si revierte.
 """
 from __future__ import annotations
 
@@ -53,11 +57,14 @@ def simulate_position(
     stop_en_be = False
     ultimo_cambio_ts = entry.ts         # para el timer de estancamiento
     be_armado = False
+    corriendo_extreme = False           # tras EXTREME, mantener el resto extreme_run_min
+    extreme_hold_until = 0
 
     fills: list[Fill] = []
     restante = 1.0
     trans_por_ts = _agrupar_por_ventana(later, candles)
     stale_ms = params.stale_min * MIN_MS
+    extreme_run_ms = int(params.extreme_run_min * MIN_MS)
 
     def cerrar(ts: float, price: float, reason: ExitReason) -> None:
         nonlocal restante
@@ -69,13 +76,22 @@ def simulate_position(
     for c in candles:
         if restante <= 0:
             break
-        # (1) stop dentro de la vela
+        # (1) stop dentro de la vela (sigue activo incluso durante el run tras EXTREME)
         toca_stop = (c.low <= stop_price) if es_long else (c.high >= stop_price)
         if toca_stop:
             paso_al_abrir = (c.open <= stop_price) if es_long else (c.open >= stop_price)
             precio = c.open if paso_al_abrir else stop_price
             cerrar(c.ts, precio, ExitReason.STOP)
             break
+
+        # run tras EXTREME: mantener el resto hasta extreme_run_min y cerrar a
+        # mercado. Las transiciones y el estancamiento se ignoran durante el run;
+        # solo el stop (arriba, en BE tras las parciales) puede sacarnos antes.
+        if corriendo_extreme:
+            if c.ts >= extreme_hold_until:
+                cerrar(c.ts, c.close, ExitReason.EXTREME)
+                break
+            continue
 
         # (2) transiciones cuyo ts cae en [c.ts, c.ts + 1min)
         for t in trans_por_ts.get(c.ts, ()):  # orden ascendente garantizado
@@ -108,10 +124,18 @@ def simulate_position(
                     stop_price = entry.price
                     stop_en_be = True
             if max_rank >= _EXTREME:
-                cerrar(t.ts, t.price, ExitReason.EXTREME)
+                if extreme_run_ms <= 0:
+                    cerrar(t.ts, t.price, ExitReason.EXTREME)
+                else:
+                    # deja correr el resto: cierre por timer (o por stop en BE)
+                    corriendo_extreme = True
+                    extreme_hold_until = t.ts + extreme_run_ms
                 break
         if restante <= 0:
             break
+        if corriendo_extreme:
+            # el run se gestiona al inicio de la siguiente vela (stop + timer)
+            continue
 
         # (3) estancamiento: si pasan stale_min sin cambiar de estado, se arma
         # una salida limitada en break-even. Cierra el resto en cuanto el precio
