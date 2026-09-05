@@ -63,6 +63,7 @@ class TrajectoryRun:
     skipped_max_concurrent: int
     skipped_sin_velas: int
     skipped_score_bajo: int
+    skipped_congelado: int
     equity_inicial: float
     equity_final: float
     ts_min: int | None
@@ -112,10 +113,33 @@ def run_trajectory(
     balance = params.equity_inicial
     abiertos: dict[str, int] = {}  # symbol -> close_ts
     trades: list[ClosedTrade] = []
-    n_symbol = n_concurr = 0
+    n_symbol = n_concurr = n_congelado = 0
     max_conc = 0
 
     pendientes: dict[str, ClosedTrade] = {}
+    # congelación por racha de pérdidas: racha[symbol] = close_ts de las pérdidas
+    # consecutivas recientes; congelado_hasta[symbol] = ts hasta el que no se entra.
+    racha: dict[str, list[int]] = {}
+    congelado_hasta: dict[str, int] = {}
+    ventana_ms = int(params.freeze_ventana_horas * 3_600_000)
+    congelar_ms = int(params.freeze_horas * 3_600_000)
+
+    def registrar_resultado(trade: ClosedTrade) -> None:
+        """Actualiza la racha de pérdidas del símbolo al cerrar un trade y, si
+        se cumplen N pérdidas seguidas dentro de la ventana, congela el par."""
+        if params.freeze_perdidas <= 0:
+            return
+        sym = trade.outcome.symbol
+        if trade.pnl < 0:
+            r = racha.setdefault(sym, [])
+            r.append(trade.outcome.close_ts)
+            del r[:-params.freeze_perdidas]  # conserva solo las últimas N
+            if (len(r) >= params.freeze_perdidas
+                    and r[-1] - r[0] <= ventana_ms):
+                congelado_hasta[sym] = trade.outcome.close_ts + congelar_ms
+                r.clear()
+        else:
+            racha[sym] = []  # un no-perdedor rompe la racha
 
     def cerrar_hasta(ts: int) -> None:
         nonlocal balance
@@ -127,9 +151,13 @@ def run_trajectory(
             balance += trade.pnl
             trades.append(trade)
             del abiertos[sym]
+            registrar_resultado(trade)
 
     for out in entradas:
         cerrar_hasta(out.entry_ts)
+        if congelado_hasta.get(out.symbol, 0) > out.entry_ts:
+            n_congelado += 1
+            continue
         if out.symbol in abiertos:
             n_symbol += 1
             continue
@@ -153,7 +181,7 @@ def run_trajectory(
         trades=tuple(sorted(trades, key=lambda tr: tr.outcome.close_ts)),
         skipped_neutral=n_neutral, skipped_symbol_open=n_symbol,
         skipped_max_concurrent=n_concurr, skipped_sin_velas=n_sin_velas,
-        skipped_score_bajo=n_score_bajo,
+        skipped_score_bajo=n_score_bajo, skipped_congelado=n_congelado,
         equity_inicial=params.equity_inicial, equity_final=balance,
         ts_min=min(ts_all, default=None), ts_max=max(ts_all, default=None),
         total_transitions=len(transitions),

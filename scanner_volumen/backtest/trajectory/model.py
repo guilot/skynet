@@ -29,6 +29,9 @@ class TrajectoryParams:
     tramo_signal: float = 0.33
     min_score_entrada: float = 0.0  # score mínimo del cruce a WATCH para entrar
     extreme_run_min: float = 3.0    # min a mantener el resto tras EXTREME (0 = cerrar ya)
+    freeze_perdidas: int = 3        # nº de pérdidas seguidas por par que congelan (0 = off)
+    freeze_ventana_horas: float = 1.0  # ventana en la que deben caer esas pérdidas
+    freeze_horas: float = 3.0       # cuánto se congela el par tras dispararse
 
 
 @dataclass(frozen=True)

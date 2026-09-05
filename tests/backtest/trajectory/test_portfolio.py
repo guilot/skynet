@@ -83,6 +83,45 @@ def test_filtro_min_score_entrada():
     assert run.trades[0].outcome.symbol == "B"
 
 
+def test_congela_par_tras_3_perdidas_en_1h():
+    # 4 entradas LONG del mismo par que paran en perdida; las 3 primeras caen
+    # en <1h -> la 4ª (dentro de las 3h siguientes) queda congelada.
+    trans = [
+        _tr(0, State.NORMAL, State.WATCH, 100.0, symbol="A"),
+        _tr(10 * MIN, State.NORMAL, State.WATCH, 100.0, symbol="A"),
+        _tr(20 * MIN, State.NORMAL, State.WATCH, 100.0, symbol="A"),
+        _tr(30 * MIN, State.NORMAL, State.WATCH, 100.0, symbol="A"),
+    ]
+
+    def candles_for(symbol, since):
+        # entra a 100 y cae a 97 (bajo el stop 97.5) -> perdida al minuto
+        precios = [100.0] + [97.0] * 12
+        return [CandleRow(ts=since + i * MIN, open=p, high=p, low=p, close=p)
+                for i, p in enumerate(precios)]
+
+    run = run_trajectory(trans, candles_for, TrajectoryParams(comision_taker=0.0))
+    assert len(run.trades) == 3
+    assert all(t.pnl < 0 for t in run.trades)
+    assert run.skipped_congelado == 1
+
+
+def test_freeze_desactivado_no_congela():
+    trans = [
+        _tr(i * 10 * MIN, State.NORMAL, State.WATCH, 100.0, symbol="A")
+        for i in range(4)
+    ]
+
+    def candles_for(symbol, since):
+        precios = [100.0] + [97.0] * 12
+        return [CandleRow(ts=since + i * MIN, open=p, high=p, low=p, close=p)
+                for i, p in enumerate(precios)]
+
+    run = run_trajectory(trans, candles_for,
+                         TrajectoryParams(comision_taker=0.0, freeze_perdidas=0))
+    assert len(run.trades) == 4
+    assert run.skipped_congelado == 0
+
+
 def test_limite_de_cinco_concurrentes():
     # 6 símbolos entran a la vez y ninguno cierra pronto (precios planos)
     trans = [
