@@ -39,3 +39,27 @@ def test_el_mensaje_dice_que_falta():
         resolver_modo(cfg("real"), {})
     mensaje = str(exc.value)
     assert "lectura" in mensaje and "ordenes" in mensaje
+
+
+def test_modo_desconocido_falla_incluso_con_variable_valida():
+    """Defensa en profundidad: si alguien construye un BotConfig con modo
+    inesperado y la variable de entorno ya está puesta a un valor válido,
+    resolver_modo debe fallar, no deslizar a modo real por accidente."""
+    cfg_roto = BotConfig(enabled=True, modo="simulado", equity_inicial=1000.0,
+                         desvio_max_entrada=0.0)
+    with pytest.raises(ValueError, match="bot.modo desconocido"):
+        resolver_modo(cfg_roto, {"SCANNER_BOT_REAL": "ordenes"})
+
+
+def test_lectura_en_mayuscula_no_se_normaliza():
+    """Valores no normalizados de SCANNER_BOT_REAL se rechazan como es debido.
+    Si alguien añadiera un .lower() o .strip() "por comodidad", ampliaría
+    las grafías que abren la puerta al dinero real."""
+    with pytest.raises(ValueError, match="SCANNER_BOT_REAL"):
+        resolver_modo(cfg("real"), {"SCANNER_BOT_REAL": "LECTURA"})
+
+
+def test_lectura_con_espacios_no_se_normaliza():
+    """Espacios alrededor del valor se rechazan como es debido."""
+    with pytest.raises(ValueError, match="SCANNER_BOT_REAL"):
+        resolver_modo(cfg("real"), {"SCANNER_BOT_REAL": " lectura"})
