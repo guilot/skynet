@@ -43,17 +43,35 @@ def velas(inicio, precios):
 
 
 async def test_reconstruye_el_estado_del_motor_tras_un_reinicio(conn):
-    # Bot 1: entra y escala a HOT (cobra el tramo y sube el stop a BE)
+    # Bot 1: entra y escala a HOT (cobra el tramo y sube el stop a BE).
+    # La transición lleva price=110.0 (la señal, usada como precio_referencia
+    # de la intención SCALE_HOT) pero el mercado en ese instante está en
+    # 105.0: el deslizamiento que separa "lo que la regla pedía" de "lo que
+    # de verdad se ejecutó" es deliberado, para que un PnL reconstruido con
+    # el precio equivocado (el de referencia en vez del fill real) se pueda
+    # distinguir del correcto.
     bot1, repo = _nuevo_runner(conn)
     await bot1.on_tick([tr()], lambda s: 100.0, ahora=0)
     await bot1.on_tick([tr(ts=MIN, prev=State.WATCH, new=State.HOT, price=110.0)],
-                       lambda s: 110.0, ahora=MIN)
+                       lambda s: 105.0, ahora=MIN)
     assert bot1.abiertas["A"].reglas.stop_en_be is True
     assert bot1.abiertas["A"].reglas.restante == pytest.approx(0.67)
     pnl_original = bot1.abiertas["A"].pnl_acumulado
     fees_originales = bot1.abiertas["A"].fees_acumuladas
+    # Cálculo a mano: size = notional/entry = (0.02*1000*20)/100 = 4.0;
+    # tramo_hot = 0.33 -> cantidad = 1.32; comision_taker=0.0 en el test.
+    # bruto = (precio_fill - entry) * cantidad = (105 - 100) * 1.32 = 6.6.
+    # Con el precio de referencia (110) en vez del fill real (105) habría
+    # dado (110 - 100) * 1.32 = 13.2: un número distinto, que es justo lo
+    # que esta aserción necesita para poder cazar el bug si algún día
+    # `_confirmar_registrado` usara `intent.precio_referencia`.
+    assert pnl_original == pytest.approx(6.6)
+    assert fees_originales == pytest.approx(0.0)
 
-    # Bot 2: proceso nuevo, mismo disco
+    # Bot 2: proceso nuevo, mismo disco. El historial que se reinyecta trae
+    # la misma transición con price=110.0 (la réplica vuelve a proponer la
+    # intención con esa misma referencia); lo que decide el PnL recuperado es
+    # el precio del FILL ya guardado por bot1 (105.0), no esa referencia.
     bot2, _ = _nuevo_runner(conn)
     historial = [tr(), tr(ts=MIN, prev=State.WATCH, new=State.HOT, price=110.0)]
     await bot2.reconstruir(
@@ -68,8 +86,9 @@ async def test_reconstruye_el_estado_del_motor_tras_un_reinicio(conn):
     assert pos.reglas.max_rank == State.HOT.rank
     assert bot2.cierres_tardios == 0
     # el PnL y las comisiones recompuestos deben coincidir EXACTAMENTE con los
-    # de la posición original: es lo que valida que `_confirmar_registrado`
-    # tomó el precio del fill guardado, no el de referencia de la intención.
+    # de la posición original (6.6, no 13.2): es lo que valida que
+    # `_confirmar_registrado` tomó el precio del fill guardado (105), no el
+    # de referencia de la intención (110).
     assert pos.pnl_acumulado == pytest.approx(pnl_original)
     assert pos.fees_acumuladas == pytest.approx(fees_originales)
 
