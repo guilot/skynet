@@ -218,3 +218,27 @@ async def test_cancelar_stop_ya_ejecutado_no_lanza():
     await broker.cancelar_stop(symbol="BTCUSDT", stop_id="ya-no-existe")
     # No debe lanzar. Se registra igualmente el intento en el doble.
     assert fake.stops_cancelados == [{"symbol": "BTCUSDT", "stop_id": "ya-no-existe"}]
+
+
+async def test_cancelar_stop_que_falla_no_propaga_pero_deja_rastro_en_el_log(caplog):
+    """El hallazgo de la ronda 1: tragarse el error sin registrar nada deja
+    indistinguible "el stop ya se ejecutó" de un fallo real (auth, parámetros
+    mal formados...) durante la cancelación. Debe quedar como mínimo un
+    warning con el símbolo, el stop_id y el error original -sin credenciales,
+    que ya excluye `_pedir` y este código no debe añadir nada por su cuenta."""
+    fake = FakeBitgetPrivate(cancelar_lanza=True)
+    broker, _ = _broker(fake)
+    with caplog.at_level("WARNING"):
+        await broker.cancelar_stop(symbol="BTCUSDT", stop_id="ya-no-existe")
+
+    assert len(caplog.records) == 1
+    registro = caplog.records[0]
+    assert registro.levelname == "WARNING"
+    mensaje = registro.getMessage()
+    assert "BTCUSDT" in mensaje
+    assert "ya-no-existe" in mensaje
+    assert "ASUME" in mensaje  # dejar explícito que es una suposición, no una certeza
+    # No debe filtrar credenciales (aunque este test no las usa, se guarda
+    # la garantía por si el mensaje de error de _pedir cambiara algún día).
+    for secreto in ("clave", "secreto", "frase", "passphrase", "api_key"):
+        assert secreto not in mensaje

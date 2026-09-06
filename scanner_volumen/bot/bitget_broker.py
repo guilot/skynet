@@ -20,12 +20,15 @@ Dos propiedades no negociables, heredadas del spec (§6, §7.2):
 """
 from __future__ import annotations
 
+import logging
 import uuid
 
 from scanner_volumen.bitget.private import BitgetPrivate
 from scanner_volumen.bot.model import OrdenEjecutada
 from scanner_volumen.models import Direction
 from scanner_volumen.strategy.model import StrategyParams
+
+log = logging.getLogger(__name__)
 
 
 def _lado_apertura(direction: Direction) -> str:
@@ -168,10 +171,20 @@ class BitgetBroker:
         posible del lado de "no revienta el cierre normal de una posición
         cuyo stop saltó solo"; el riesgo es que oculte un error genuino
         (por ejemplo, de autenticación) detrás de un `code` que no es
-        realmente "ya no existe". Pendiente de afinar con los códigos de
-        error reales una vez verificado contra la cuenta de simulación.
+        realmente "ya no existe" -de ahí el `log.warning`: si algún día
+        resulta ser lo segundo, aquí queda la traza para encontrarlo-.
+        Discriminar por el código de error real de Bitget es exactamente lo
+        que resolvería esto, y queda pendiente de la tarea que verifica
+        contra la cuenta de simulación.
         """
         try:
             await self._privado.cancelar_stop(symbol=symbol, stop_id=stop_id)
-        except RuntimeError:
-            pass
+        except RuntimeError as exc:
+            log.warning(
+                "bot: cancelar_stop de %s (stop_id=%s): Bitget rechazo la "
+                "cancelacion; se ASUME (no se ha confirmado) que el stop ya no "
+                "existe -ejecutado o cancelado antes- y no se propaga. Si el "
+                "motivo real fuese otro (autenticacion, parametros...) quedaria "
+                "sin mas rastro que este aviso. Error: %s",
+                symbol, stop_id, exc,
+            )
