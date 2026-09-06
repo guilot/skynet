@@ -69,14 +69,21 @@ def create_app(
             }
             for fila in bot_repo.abiertas(modo)
         ]
+        # `limite=20` empuja el recorte a la consulta SQL (ORDER BY ...
+        # DESC LIMIT ?, ver BotRepo.cerradas): sin él, cada sondeo del
+        # panel (cada 5s) traería y reordenaría la tabla `bot_posiciones`
+        # entera solo para descartar casi todo en Python. La consulta ya
+        # devuelve las más recientes primero, así que se expone tal cual
+        # -sin `reversed`- para que el panel muestre el último cierre
+        # arriba.
         cerradas = [
             {"symbol": f["symbol"], "close_ts": f["close_ts"], "pnl": f["pnl"],
              "max_rank": f["max_rank"]}
-            for f in bot_repo.cerradas(modo)[-20:]
+            for f in bot_repo.cerradas(modo, limite=20)
         ]
         return {
             "activo": True, "modo": modo, "equity": bot_repo.equity(modo),
-            "abiertas": abiertas, "cerradas": list(reversed(cerradas)),
+            "abiertas": abiertas, "cerradas": cerradas,
         }
 
     @app.websocket("/ws")

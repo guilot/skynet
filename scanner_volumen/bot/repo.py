@@ -64,12 +64,27 @@ class BotRepo:
         ).fetchall()
         return [dict(f) for f in filas]
 
-    def cerradas(self, modo: str) -> list[dict]:
-        filas = self._conn.execute(
-            "SELECT * FROM bot_posiciones WHERE modo = ? AND abierta = 0 "
-            "ORDER BY close_ts, id",
-            (modo,),
-        ).fetchall()
+    def cerradas(self, modo: str, limite: int | None = None) -> list[dict]:
+        """Sin `limite`: todas las cerradas, ascendente por `close_ts`
+        -el orden que necesita `construir_resumen` para reconstruir el
+        informe y que no se debe alterar-. Con `limite`, en cambio, se pide
+        la página que le interesa a un consumidor tipo dashboard (las N más
+        recientes): ordena DESCENDENTE y aplica `LIMIT` en la propia
+        consulta SQL, para no traer la tabla entera a Python solo para
+        recortarla después -algo que, con la operativa creciendo sin techo
+        en la Fase 3, dejaría de ser gratis-."""
+        if limite is None:
+            filas = self._conn.execute(
+                "SELECT * FROM bot_posiciones WHERE modo = ? AND abierta = 0 "
+                "ORDER BY close_ts, id",
+                (modo,),
+            ).fetchall()
+        else:
+            filas = self._conn.execute(
+                "SELECT * FROM bot_posiciones WHERE modo = ? AND abierta = 0 "
+                "ORDER BY close_ts DESC, id DESC LIMIT ?",
+                (modo, limite),
+            ).fetchall()
         return [dict(f) for f in filas]
 
     # --- fills ---

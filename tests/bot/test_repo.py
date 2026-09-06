@@ -48,6 +48,25 @@ def test_cerrar_saca_la_posicion_de_abiertas(repo):
     assert cerradas[0]["pnl"] == pytest.approx(12.0)
 
 
+def test_cerradas_sin_limite_devuelve_todas_ascendente(repo):
+    for i, symbol in enumerate(["A", "B", "C"]):
+        pid = _abrir(repo, symbol=symbol, ts=i * MIN)
+        repo.cerrar(pid, close_ts=(i + 1) * MIN, pnl=float(i), fees=0.0, max_rank=1)
+    cerradas = repo.cerradas("paper")
+    assert [f["symbol"] for f in cerradas] == ["A", "B", "C"]
+
+
+def test_cerradas_con_limite_devuelve_las_mas_recientes_primero(repo):
+    """El panel del dashboard pide `limite` para no traer el historial
+    completo en cada sondeo (Ronda 1 de Task 10): la consulta debe recortar
+    en SQL, no en Python, y devolver las últimas N en orden descendente."""
+    for i, symbol in enumerate(["A", "B", "C", "D"]):
+        pid = _abrir(repo, symbol=symbol, ts=i * MIN)
+        repo.cerrar(pid, close_ts=(i + 1) * MIN, pnl=float(i), fees=0.0, max_rank=1)
+    cerradas = repo.cerradas("paper", limite=2)
+    assert [f["symbol"] for f in cerradas] == ["D", "C"]
+
+
 def test_fills_se_guardan_y_se_leen_en_orden(repo):
     pid = _abrir(repo)
     repo.registrar_fill(pid, ts=MIN, reason=ExitReason.SCALE_HOT, fraction=0.33,
