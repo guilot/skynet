@@ -76,6 +76,23 @@ async def test_mover_el_stop_cambia_el_precio_y_conserva_uno_solo():
     assert broker.stops_vivos()["A"].precio_disparo == pytest.approx(100.0)
 
 
+async def test_mover_un_stop_con_id_equivocado_revienta():
+    broker = PaperBroker(StrategyParams())
+    await broker.colocar_stop(symbol="A", direction=Direction.LONG,
+                              cantidad=4.0, precio_disparo=97.5,
+                              client_oid="oid-1")
+    with pytest.raises(ValueError, match="no hay stop vivo"):
+        await broker.mover_stop(symbol="A", stop_id="id-equivocado",
+                                precio_disparo=100.0)
+
+
+async def test_mover_un_stop_sin_stop_previo_revienta():
+    broker = PaperBroker(StrategyParams())
+    with pytest.raises(ValueError, match="no hay stop vivo"):
+        await broker.mover_stop(symbol="A", stop_id="lo-que-sea",
+                                precio_disparo=100.0)
+
+
 async def test_cancelar_el_stop_lo_elimina():
     broker = PaperBroker(StrategyParams())
     sid = await broker.colocar_stop(symbol="A", direction=Direction.LONG,

@@ -135,17 +135,31 @@ class PaperBroker:
 
         En un exchange real mover un stop es cancelar el viejo y colocar
         otro -no hay una orden "editar"-, así que el `stop_id` cambia. Aquí
-        se refleja lo mismo: se conserva un único stop vivo por símbolo."""
+        se refleja lo mismo: se conserva un único stop vivo por símbolo.
+
+        Exige que exista un stop vivo para `symbol` y que su `stop_id`
+        coincida con el recibido; si no, lanza `ValueError` en vez de crear
+        uno nuevo. A diferencia de `cancelar_stop` -donde no encontrar el
+        stop es normal, porque ya saltó-, aquí un `stop_id` que no coincide
+        es un error de programación del llamador (un identificador obsoleto
+        o equivocado): en papel eso no rompe nada porque no hay dinero real
+        de por medio, así que preferimos que salte aquí, en los tests, a que
+        se descubra contra Bitget con una posición abierta."""
         if precio_disparo <= 0:
             raise ValueError(
                 f"precio_disparo debe ser estrictamente positivo, recibido: {precio_disparo}"
             )
         anterior = self._stops.get(symbol)
-        cantidad = anterior.cantidad if anterior is not None else 0.0
+        if anterior is None or anterior.stop_id != stop_id:
+            encontrado = anterior.stop_id if anterior is not None else None
+            raise ValueError(
+                f"no hay stop vivo para {symbol!r} con stop_id={stop_id!r} "
+                f"(encontrado: {encontrado!r})"
+            )
         nuevo_id = str(uuid.uuid4())
         self._stops[symbol] = StopVivo(
             stop_id=nuevo_id, symbol=symbol, precio_disparo=precio_disparo,
-            cantidad=cantidad,
+            cantidad=anterior.cantidad,
         )
         return nuevo_id
 
