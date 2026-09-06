@@ -306,12 +306,29 @@ class StateTransitionRepo:
         ).fetchall()
         return [dict(f) for f in filas]
 
-    def all_transitions(self) -> list[sqlite3.Row]:
+    def all_transitions(
+        self, desde_ms: int | None = None, hasta_ms: int | None = None,
+    ) -> list[sqlite3.Row]:
         """Toda la trayectoria persistida, orden cronológico estable (ts y,
         a igualdad de ts, orden de inserción). Solo lectura, para el backtest
-        de trayectoria."""
+        de trayectoria.
+
+        `desde_ms`/`hasta_ms` acotan la ventana (ambos inclusive) para poder
+        comparar el backtest con una corrida del bot en vivo que solo cubre
+        unas semanas concretas; sin flags (el caso de siempre, incluido el
+        golden master) el comportamiento es idéntico al de antes de que
+        existieran."""
+        condiciones: list[str] = []
+        parametros: list[int] = []
+        if desde_ms is not None:
+            condiciones.append("ts >= ?")
+            parametros.append(desde_ms)
+        if hasta_ms is not None:
+            condiciones.append("ts <= ?")
+            parametros.append(hasta_ms)
+        where = f" WHERE {' AND '.join(condiciones)}" if condiciones else ""
         return self._conn.execute(
-            "SELECT * FROM state_transitions ORDER BY ts, id"
+            f"SELECT * FROM state_transitions{where} ORDER BY ts, id", parametros
         ).fetchall()
 
     def por_simbolo(self, symbol: str, desde_ms: int) -> list[sqlite3.Row]:

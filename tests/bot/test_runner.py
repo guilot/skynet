@@ -16,7 +16,7 @@ MIN = 60_000
 def bot(tmp_path):
     conn = open_db(tmp_path / "scanner.db")
     repo = BotRepo(conn)
-    repo.set_equity_inicial(1000.0)
+    repo.set_equity_inicial("paper", 1000.0)
     cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
                     desvio_max_entrada=0.0)
     params = StrategyParams(comision_taker=0.0)
@@ -160,7 +160,7 @@ class _BrokerQueFallaAlCerrar:
 async def test_fallo_del_broker_al_cerrar_degrada_la_posicion_sin_reventar(tmp_path):
     conn = open_db(tmp_path / "scanner.db")
     repo = BotRepo(conn)
-    repo.set_equity_inicial(1000.0)
+    repo.set_equity_inicial("paper", 1000.0)
     cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
                     desvio_max_entrada=0.0)
     params = StrategyParams(comision_taker=0.0)
@@ -176,6 +176,9 @@ async def test_fallo_del_broker_al_cerrar_degrada_la_posicion_sin_reventar(tmp_p
     pos = runner.abiertas["A"]
     assert pos.degradada is True
     assert repo.abiertas("paper")[0]["symbol"] == "A"  # sigue abierta=1 en la BD
+    # F: el flag debe quedar persistido, no solo en el objeto en RAM -si no,
+    # una posición degradada desaparece del informe sin dejar rastro.
+    assert repo.abiertas("paper")[0]["degradada"] == 1
 
     # un tick posterior no debe reventar: antes de este arreglo, PositionRules
     # lanzaba ValueError por la intencion sin confirmar en cada tick siguiente
@@ -183,3 +186,101 @@ async def test_fallo_del_broker_al_cerrar_degrada_la_posicion_sin_reventar(tmp_p
     assert runner.abiertas["A"].degradada is True
 
     conn.close()
+
+
+async def test_una_transicion_sin_precio_de_senal_no_abre_ni_revienta(bot):
+    # D: un símbolo sin vela en curso produce TransitionRow.price=None. La
+    # ruta viva debe descartarla en silencio -abrir con
+    # entry_price_senal=None reventaría contra el NOT NULL de la columna y
+    # abortaría el resto del tick.
+    runner, repo = bot
+    await runner.on_tick([tr(price=None)], precios({"A": 100.0}), ahora=0)
+    assert runner.abiertas == {}
+    assert repo.abiertas("paper") == []
+
+
+async def test_una_transicion_con_precio_no_positivo_no_abre(bot):
+    runner, repo = bot
+    await runner.on_tick([tr(price=0.0)], precios({"A": 100.0}), ahora=0)
+    assert runner.abiertas == {}
+    assert repo.abiertas("paper") == []
+
+
+async def test_el_stop_persiste_el_nivel_vigente_como_precio_regla(bot):
+    # B: el desvío de salida debe medirse contra el stop vigente, no contra
+    # el propio precio de relleno de la vela sintética (que siempre
+    # coincidiría, dando desvío cero por construcción).
+    runner, repo = bot
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+    pid = runner.abiertas["A"].id
+    # cae por debajo del stop (100 * 0.975 = 97.5) pero el bot solo observa
+    # 97.0: el desvío real es 97.5 -> 97.0.
+    await runner.on_tick([], precios({"A": 97.0}), ahora=MIN)
+    fills = repo.fills_de(pid)
+    assert [f["reason"] for f in fills] == [ExitReason.STOP.value]
+    assert fills[0]["precio"] == pytest.approx(97.0)
+    assert fills[0]["precio_regla"] == pytest.approx(97.5)
+
+
+async def test_el_stale_be_persiste_el_precio_de_entrada_como_precio_regla(bot):
+    # STALE_BE promete no salir por debajo de break-even: el nivel de
+    # referencia es `entry_price`, no el precio de la transición ni el de
+    # relleno -aquí deliberadamente distinto (105) para que la aserción
+    # distinga un precio_regla correcto de uno que colara el de relleno.
+    runner, repo = bot
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+    pid = runner.abiertas["A"].id
+    # stale_min = 10 min por defecto: sin cambios de estado, se arma la
+    # salida en BE. El precio ya subió a 105 (mejor que BE) al vencer.
+    await runner.on_tick([], precios({"A": 105.0}), ahora=10 * MIN)
+    fills = repo.fills_de(pid)
+    assert [f["reason"] for f in fills] == [ExitReason.STALE_BE.value]
+    assert fills[0]["precio"] == pytest.approx(105.0)
+    assert fills[0]["precio_regla"] == pytest.approx(100.0)  # entry_price, no 105
+
+
+async def test_los_tramos_de_escalada_persisten_el_precio_de_la_transicion(bot):
+    # SCALE_HOT/SCALE_SIGNAL: el nivel de referencia es el precio de la
+    # transición que disparó el tramo (`intent.precio_referencia`), no el
+    # precio al que el bot de verdad ejecutó ese tramo.
+    runner, repo = bot
+    await runner.on_tick([tr(new=State.WATCH)], precios({"A": 100.0}), ahora=0)
+    pid = runner.abiertas["A"].id
+    # la señal decía 120 pero el bot solo observa 118 al actuar
+    await runner.on_tick(
+        [tr(ts=MIN, prev=State.WATCH, new=State.SIGNAL, price=120.0)],
+        precios({"A": 118.0}), ahora=MIN)
+    fills = {f["reason"]: f for f in repo.fills_de(pid)}
+    assert fills[ExitReason.SCALE_HOT.value]["precio_regla"] == pytest.approx(120.0)
+    assert fills[ExitReason.SCALE_HOT.value]["precio"] == pytest.approx(118.0)
+    assert fills[ExitReason.SCALE_SIGNAL.value]["precio_regla"] == pytest.approx(120.0)
+
+
+async def test_el_extreme_por_temporizador_no_lleva_precio_regla(bot):
+    # EXTREME por temporizador cierra a mercado adrede: aquí el cero SÍ es
+    # correcto, así que no hay nivel prometido que persistir.
+    runner, repo = bot
+    await runner.on_tick([tr(new=State.WATCH)], precios({"A": 100.0}), ahora=0)
+    pid = runner.abiertas["A"].id
+    await runner.on_tick(
+        [tr(ts=MIN, prev=State.WATCH, new=State.EXTREME, price=130.0)],
+        precios({"A": 130.0}), ahora=MIN)
+    # extreme_run_min = 3 por defecto: aun corre. Se cierra al vencer.
+    await runner.on_tick([], precios({"A": 130.0}), ahora=5 * MIN)
+    fills = {f["reason"]: f for f in repo.fills_de(pid)}
+    assert fills[ExitReason.EXTREME.value]["precio_regla"] is None
+
+
+async def test_los_contadores_del_informe_se_persisten(bot):
+    # A: transiciones vistas y concurrencia máxima deben sobrevivir a un
+    # reinicio -viven en `bot_contadores`, no solo en atributos en RAM.
+    runner, repo = bot
+    simbolos = ["A", "B", "C"]
+    await runner.on_tick(
+        [tr(symbol=s) for s in simbolos], precios({s: 100.0 for s in simbolos}),
+        ahora=0,
+    )
+    await runner.on_tick([], precios({s: 100.0 for s in simbolos}), ahora=MIN)
+    contadores = repo.contadores("paper")
+    assert contadores["transiciones"] == 3  # el segundo tick no trajo ninguna
+    assert contadores["max_concurrentes"] == 3

@@ -1,8 +1,10 @@
+import pytest
+
 from scanner_volumen.models import Direction, State
 from scanner_volumen.strategy.model import (
     ExitReason, Fill, ResumenOperativa, TradeResumen,
 )
-from scanner_volumen.strategy.report import format_resumen
+from scanner_volumen.strategy.report import _drawdown_pct, format_resumen
 
 MIN = 60_000
 
@@ -67,3 +69,29 @@ def test_pnl_por_motivo_lista_todos_los_motivos():
 def test_cierres_por_fin_de_datos_se_separan():
     salida = format_resumen(_resumen([_trade(reason=ExitReason.END_OF_DATA, pnl=2.0)]))
     assert "Cerrados por fin de datos (no son salidas reales): 1 (PnL +2.00)" in salida
+
+
+def test_drawdown_pct_mide_la_peor_caida_desde_el_pico():
+    # equity_inicial=1000 -> +100 (pico 1100) -> -220 (880, caida del 20% del
+    # pico) -> +50 (930, sigue por debajo del pico: la peor caida no mejora).
+    trades = [
+        _trade(symbol="A", pnl=100.0),
+        TradeResumen(
+            symbol="B", direction=Direction.LONG, entry_ts=MIN,
+            entry_price=100.0, close_ts=2 * MIN,
+            fills=(Fill(ts=2 * MIN, price=90.0, fraction=1.0, reason=ExitReason.STOP),),
+            fill_pnls=(-220.0,), margin=20.0, pnl=-220.0, fees=0.5, max_rank=1,
+        ),
+        TradeResumen(
+            symbol="C", direction=Direction.LONG, entry_ts=2 * MIN,
+            entry_price=100.0, close_ts=3 * MIN,
+            fills=(Fill(ts=3 * MIN, price=110.0, fraction=1.0, reason=ExitReason.EXTREME),),
+            fill_pnls=(50.0,), margin=20.0, pnl=50.0, fees=0.5, max_rank=1,
+        ),
+    ]
+    resumen = _resumen(trades)
+    assert _drawdown_pct(resumen) == pytest.approx(-20.0)
+
+
+def test_drawdown_pct_es_cero_sin_trades():
+    assert _drawdown_pct(_resumen([])) == pytest.approx(0.0)

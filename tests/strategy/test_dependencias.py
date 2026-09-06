@@ -15,6 +15,12 @@ PAQUETES = {
     "bot": Path(__file__).resolve().parents[2] / "scanner_volumen" / "bot",
 }
 
+# Umbral real de ficheros .py por paquete (contados a mano: 5 en strategy/,
+# 8 en bot/), no un ">= 1" simbólico: si el paquete perdiera ficheros de
+# golpe (p. ej. se movieran de sitio) el umbral debe notarlo, no limitarse a
+# comprobar que queda alguno.
+UMBRAL_MINIMO_FICHEROS = {"strategy": 5, "bot": 8}
+
 
 def _imports(fichero: Path) -> list[str]:
     arbol = ast.parse(fichero.read_text(encoding="utf-8"), filename=str(fichero))
@@ -46,5 +52,8 @@ def test_hay_ficheros_que_comprobar():
     # si los paquetes se movieran de sitio, los tests anteriores pasarían en vacío
     for nombre, raiz in PAQUETES.items():
         ficheros = list(raiz.rglob("*.py"))
-        assert ficheros, f"no hay ficheros Python en {nombre}/"
-        assert len(ficheros) >= 1, f"muy pocos ficheros en {nombre}/ para verificar la barrera"
+        umbral = UMBRAL_MINIMO_FICHEROS[nombre]
+        assert len(ficheros) >= umbral, (
+            f"solo {len(ficheros)} ficheros en {nombre}/ (se esperaban al "
+            f"menos {umbral}); revisa si el paquete se movió de sitio"
+        )

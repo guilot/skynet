@@ -258,6 +258,23 @@ async def test_paso_evaluador_pasa_las_transiciones_al_bot(orq, monkeypatch):
     assert recibidas[0].direction is not None  # enriquecida: Transition no la lleva
 
 
+async def test_un_fallo_del_bot_no_impide_actualizar_el_progreso_del_bootstrap(orq):
+    """E: antes de este arreglo, `bot.on_tick` corría dentro del mismo
+    `try` que envuelve a `bootstrapper.progress()` -una excepción del bot se
+    tragaba la actualización del progreso de ESE tick. El bot debe tener su
+    propio aislamiento, independiente del resto del paso."""
+    class BotRoto:
+        async def on_tick(self, transiciones, precio_de, ahora):
+            raise RuntimeError("fallo simulado del bot")
+
+    orq.state.bootstrap_done = orq.state.bootstrap_total = 0
+    await paso_evaluador(orq, orq.bootstrapper, ahora=14 * DIA, bot=BotRoto())
+
+    # BootstrapperFalso.progress() siempre devuelve (1, 1): si el fallo del
+    # bot hubiera tumbado el resto del paso, esto seguiría en (0, 0).
+    assert (orq.state.bootstrap_done, orq.state.bootstrap_total) == (1, 1)
+
+
 async def test_paso_mantenimiento_delega_en_run_maintenance(orq, maintenance_repo):
     base = 14 * DIA
     await orq.ensure_profile("AAAUSDT", now_ms=base)

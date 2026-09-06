@@ -158,7 +158,10 @@ async def paso_evaluador(
             if t.should_alert:
                 log.info("ALERTA %s %s score=%.1f", t.symbol, t.current.value, t.score)
         if bot is not None:
-            await bot.on_tick(orq.transiciones_evaluadas, _precio_de(orq), ahora)
+            try:
+                await bot.on_tick(orq.transiciones_evaluadas, _precio_de(orq), ahora)
+            except Exception:
+                log.exception("bot: fallo aislado en on_tick")
         hecho, total = bootstrapper.progress()
         orq.state.bootstrap_done, orq.state.bootstrap_total = hecho, total
     except Exception as exc:  # noqa: BLE001
@@ -307,10 +310,18 @@ async def main(argv: list[str] | None = None) -> None:
             bot_repo = BotRepo(conn)
             # fija el capital la primera vez y respeta el ya guardado en
             # arranques posteriores: el saldo es un valor vivo, no se
-            # reinicia en cada despliegue.
+            # reinicia en cada despliegue. Segmentado por modo (C): el día
+            # que exista operativa `real`, no debe arrancar sobre el capital
+            # del `paper`.
             bot_repo.set_equity_inicial(
-                bot_repo.equity_inicial(defecto=cfg.bot.equity_inicial)
+                cfg.bot.modo,
+                bot_repo.equity_inicial(cfg.bot.modo, defecto=cfg.bot.equity_inicial),
             )
+            # igual patrón para `arrancado_ms`: sin él, la "Ventana" del
+            # informe se deriva del primer trade en vez del arranque real, y
+            # un bot que lleva días corriendo antes de operar por primera vez
+            # publicaría una ventana mucho más corta de la real.
+            bot_repo.set_arrancado_ms(bot_repo.arrancado_ms(defecto=ahora_ms()))
             params = StrategyParams()
             bot = BotRunner(params, cfg.bot, bot_repo, PaperBroker(params),
                             LivePortfolio(params, cfg.bot, bot_repo))

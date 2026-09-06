@@ -26,7 +26,7 @@ def _nuevo_runner(conn):
 @pytest.fixture
 def conn(tmp_path):
     c = open_db(tmp_path / "scanner.db")
-    BotRepo(c).set_equity_inicial(1000.0)
+    BotRepo(c).set_equity_inicial("paper", 1000.0)
     yield c
     c.close()
 

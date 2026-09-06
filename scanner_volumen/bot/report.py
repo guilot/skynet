@@ -37,7 +37,7 @@ def _bps(referencia: float, obtenido: float, direction: Direction,
 def construir_resumen(
     repo: BotRepo, modo: str, equity_inicial: float,
     descartes: dict[str, int] | None = None, total_transiciones: int = 0,
-    max_concurrentes: int = 0,
+    max_concurrentes: int = 0, arrancado_ms: int | None = None,
 ) -> ResumenOperativa:
     cerradas = repo.cerradas(modo)
     trades: list[TradeResumen] = []
@@ -65,10 +65,14 @@ def construir_resumen(
     ts = [t.entry_ts for t in trades] + [t.close_ts for t in trades]
     equity_final = equity_inicial + sum(t.pnl for t in trades)
     etiquetas = descartes or dict.fromkeys(ETIQUETAS_DESCARTE, 0)
+    # `arrancado_ms`, si se conoce, manda sobre el primer trade: un bot que
+    # lleva catorce días corriendo y opera el primero no tiene una "Ventana"
+    # de un día -y sin ventana real no hay con qué comparar al backtest-.
+    ts_min = arrancado_ms if arrancado_ms is not None else min(ts, default=None)
     return ResumenOperativa(
         titulo=f"Bot en {modo}", trades=tuple(trades), descartes=etiquetas,
         equity_inicial=equity_inicial, equity_final=equity_final,
-        ts_min=min(ts, default=None), ts_max=max(ts, default=None),
+        ts_min=ts_min, ts_max=max(ts, default=None),
         total_transiciones=total_transiciones,
         max_concurrentes_alcanzado=max_concurrentes,
     )
@@ -78,8 +82,14 @@ def format_bloque_ejecucion(
     repo: BotRepo, modo: str, descartes: dict[str, int], cierres_tardios: int,
 ) -> str:
     cerradas = repo.cerradas(modo)
+    abiertas = repo.abiertas(modo)
     entradas: list[float] = []
     salidas: dict[str, list[float]] = {}
+    # fills sin `precio_regla` (motivos como EXTREME, que cierran a mercado
+    # al vencer el temporizador): no hay nivel prometido contra el que medir,
+    # así que se cuentan aparte y NUNCA se promedian con el resto -que nadie
+    # pueda leer un "+0.0 bps" ahí como si fuera una medición real.
+    sin_referencia: dict[str, int] = {}
     tardios_guardados = 0
 
     for fila in cerradas:
@@ -89,10 +99,13 @@ def format_bloque_ejecucion(
         if d is not None:
             entradas.append(d)
         for f in repo.fills_de(fila["id"]):
-            s = _bps(f["precio_referencia"], f["precio"], direction,
-                     es_entrada=False)
-            if s is not None:
-                salidas.setdefault(f["reason"], []).append(s)
+            precio_regla = f["precio_regla"]
+            if precio_regla is None:
+                sin_referencia[f["reason"]] = sin_referencia.get(f["reason"], 0) + 1
+            else:
+                s = _bps(precio_regla, f["precio"], direction, es_entrada=False)
+                if s is not None:
+                    salidas.setdefault(f["reason"], []).append(s)
             tardios_guardados += int(f["tardio"])
 
     # Un fill tardío no espera a que su posición cierre para contar: una
@@ -100,11 +113,16 @@ def format_bloque_ejecucion(
     # tan real como una en una ya cerrada. Si solo mirásemos `cerradas`, ese
     # cierre tardío quedaría invisible en el informe hasta que la posición
     # terminara de cerrarse.
-    for fila in repo.abiertas(modo):
+    for fila in abiertas:
         for f in repo.fills_de(fila["id"]):
             tardios_guardados += int(f["tardio"])
 
+    degradadas = sum(1 for fila in abiertas if fila.get("degradada"))
+
     lineas = ["== Ejecucion =="]
+    lineas.append(
+        f"Posiciones abiertas: {len(abiertas)} (degradadas: {degradadas})"
+    )
     if entradas:
         lineas.append(
             f"Desvio de entrada: medio {sum(entradas)/len(entradas):+.1f} bps   "
@@ -121,6 +139,12 @@ def format_bloque_ejecucion(
             )
     else:
         lineas.append("  sin datos (n=0)")
+    if sin_referencia:
+        lineas.append(
+            "Salidas a mercado sin nivel de referencia (no promediadas):"
+        )
+        for motivo, n in sin_referencia.items():
+            lineas.append(f"  {motivo:<12} n={n}")
     lineas.append(f"Entradas descartadas por desvio: {descartes.get('desvio', 0)}")
     lineas.append(
         f"Cierres tardios por reinicio: {max(cierres_tardios, tardios_guardados)}"
@@ -132,9 +156,10 @@ def format_informe_bot(
     repo: BotRepo, modo: str, equity_inicial: float,
     descartes: dict[str, int] | None = None, cierres_tardios: int = 0,
     total_transiciones: int = 0, max_concurrentes: int = 0,
+    arrancado_ms: int | None = None,
 ) -> str:
     etiquetas = descartes or dict.fromkeys(ETIQUETAS_DESCARTE, 0)
     resumen = construir_resumen(repo, modo, equity_inicial, etiquetas,
-                                total_transiciones, max_concurrentes)
+                                total_transiciones, max_concurrentes, arrancado_ms)
     return (format_resumen(resumen) + "\n\n"
             + format_bloque_ejecucion(repo, modo, etiquetas, cierres_tardios))

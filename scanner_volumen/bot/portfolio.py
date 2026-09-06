@@ -53,6 +53,9 @@ class LivePortfolio:
         motivo = self._motivo_de_descarte(t, abiertos, precio_mercado)
         if motivo is not None:
             self.descartes[motivo] += 1
+            # el contador en RAM se reinicia con el proceso; el persistido es
+            # el que de verdad alimenta el informe entre arranques.
+            self._repo.incrementar_contador(self._cfg.modo, motivo)
         return motivo
 
     def _motivo_de_descarte(

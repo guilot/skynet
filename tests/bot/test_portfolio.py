@@ -14,7 +14,7 @@ HORA = 3_600_000
 def cartera(tmp_path):
     conn = open_db(tmp_path / "scanner.db")
     repo = BotRepo(conn)
-    repo.set_equity_inicial(1000.0)
+    repo.set_equity_inicial("paper", 1000.0)
     cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
                     desvio_max_entrada=0.0)
     yield LivePortfolio(StrategyParams(), cfg, repo)
@@ -75,7 +75,7 @@ def test_el_desvio_desactivado_nunca_descarta(cartera):
 def test_el_desvio_activo_descarta_movimientos_adversos(tmp_path):
     conn = open_db(tmp_path / "scanner.db")
     repo = BotRepo(conn)
-    repo.set_equity_inicial(1000.0)
+    repo.set_equity_inicial("paper", 1000.0)
     cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
                     desvio_max_entrada=0.005)  # 0.5%
     cartera = LivePortfolio(StrategyParams(), cfg, repo)
@@ -88,7 +88,7 @@ def test_el_desvio_activo_descarta_movimientos_adversos(tmp_path):
 def test_el_desvio_activo_permite_movimientos_favorables(tmp_path):
     conn = open_db(tmp_path / "scanner.db")
     repo = BotRepo(conn)
-    repo.set_equity_inicial(1000.0)
+    repo.set_equity_inicial("paper", 1000.0)
     cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
                     desvio_max_entrada=0.005)
     cartera = LivePortfolio(StrategyParams(), cfg, repo)
@@ -112,7 +112,7 @@ def test_el_equity_baja_con_las_perdidas_y_el_margen_con_el(cartera, tmp_path):
 def test_el_desvio_activo_descarta_movimientos_adversos_en_short(tmp_path):
     conn = open_db(tmp_path / "scanner.db")
     repo = BotRepo(conn)
-    repo.set_equity_inicial(1000.0)
+    repo.set_equity_inicial("paper", 1000.0)
     cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
                     desvio_max_entrada=0.005)  # 0.5%
     cartera = LivePortfolio(StrategyParams(), cfg, repo)
@@ -122,6 +122,41 @@ def test_el_desvio_activo_descarta_movimientos_adversos_en_short(tmp_path):
     # SHORT cuya senal era 100 y el mercado subio a 101: entrada MEJOR, se acepta
     assert cartera.evaluar_entrada(tr(price=100.0, direction=Direction.SHORT),
                                    abiertos=set(), precio_mercado=101.0) is None
+    conn.close()
+
+
+def test_el_descarte_se_persiste_ademas_de_contarse_en_ram(tmp_path):
+    # A.3: el contador en RAM (`descartes`) se reinicia con el proceso; el
+    # persistido (`bot_contadores`) es el que de verdad alimenta el informe
+    # entre arranques.
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn)
+    repo.set_equity_inicial("paper", 1000.0)
+    cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    cartera = LivePortfolio(StrategyParams(), cfg, repo)
+
+    cartera.evaluar_entrada(tr(direction=Direction.NEUTRAL), abiertos=set(),
+                            precio_mercado=100.0)
+    cartera.evaluar_entrada(tr(direction=Direction.NEUTRAL), abiertos=set(),
+                            precio_mercado=100.0)
+    cartera.evaluar_entrada(tr(score=69.0), abiertos=set(), precio_mercado=100.0)
+
+    assert cartera.descartes["NEUTRAL"] == 2
+    assert repo.contadores("paper") == {"NEUTRAL": 2, "score bajo": 1}
+    conn.close()
+
+
+def test_una_entrada_valida_no_persiste_contador(tmp_path):
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn)
+    repo.set_equity_inicial("paper", 1000.0)
+    cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    cartera = LivePortfolio(StrategyParams(), cfg, repo)
+
+    assert cartera.evaluar_entrada(tr(), abiertos=set(), precio_mercado=100.0) is None
+    assert repo.contadores("paper") == {}
     conn.close()
 
 

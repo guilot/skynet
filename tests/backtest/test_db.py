@@ -2,8 +2,7 @@ import sqlite3
 
 import pytest
 
-from scanner_volumen.storage.db import open_readonly
-from scanner_volumen.storage.db import open_db
+from scanner_volumen.storage.db import open_db, open_readonly
 from scanner_volumen.storage.repos import CandleRepo
 from scanner_volumen.models import Candle
 

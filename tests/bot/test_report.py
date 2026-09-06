@@ -8,24 +8,35 @@ from scanner_volumen.strategy.model import ExitReason
 from scanner_volumen.strategy.report import format_resumen
 
 MIN = 60_000
+_SIN_PASAR = object()  # sentinel: distingue "no se pasó precio_regla" de "se pasó None"
 
 
 @pytest.fixture
 def repo(tmp_path):
     conn = open_db(tmp_path / "scanner.db")
     r = BotRepo(conn)
-    r.set_equity_inicial(1000.0)
+    r.set_equity_inicial("paper", 1000.0)
     yield r
     conn.close()
 
 
 def _trade(repo, symbol="A", senal=100.0, ejecutado=100.0, salida_ref=110.0,
-           salida=110.0, pnl=10.0, direction=Direction.LONG):
+           salida=110.0, pnl=10.0, direction=Direction.LONG,
+           reason=ExitReason.STOP, precio_regla=_SIN_PASAR):
+    """`reason=STOP` por defecto porque SÍ tiene un nivel prometido contra el
+    que medir (a diferencia de EXTREME, que cierra a mercado adrede y por
+    tanto no se promedia -ver `test_una_salida_sin_precio_regla_no_se_
+    promedia`). `precio_regla`, si no se pasa, es `salida_ref`: en estos
+    tests "lo que la regla pedía" y "la referencia de la intención" son el
+    mismo número, salvo que el test pida explícitamente `None`."""
+    if precio_regla is _SIN_PASAR:
+        precio_regla = salida_ref
     pid = repo.abrir(modo="paper", symbol=symbol, direction=direction,
                      entry_ts=0, entry_price=ejecutado, entry_price_senal=senal,
                      margin=20.0, notional=400.0, size=4.0, fee_entrada=0.0)
-    repo.registrar_fill(pid, ts=MIN, reason=ExitReason.EXTREME, fraction=1.0,
-                        precio_referencia=salida_ref, precio=salida, comision=0.0)
+    repo.registrar_fill(pid, ts=MIN, reason=reason, fraction=1.0,
+                        precio_referencia=salida_ref, precio=salida, comision=0.0,
+                        precio_regla=precio_regla)
     repo.cerrar(pid, close_ts=MIN, pnl=pnl, fees=0.0, max_rank=4)
     return pid
 
@@ -57,7 +68,7 @@ def test_el_desvio_de_salida_se_desglosa_por_motivo(repo):
     # bps = (110 - 109) / 110 * 10000 = 90.909... -> "+90.9 bps"
     _trade(repo, salida_ref=110.0, salida=109.0)
     bloque = format_bloque_ejecucion(repo, "paper", descartes={}, cierres_tardios=0)
-    assert "EXTREME" in bloque
+    assert "STOP" in bloque
     assert "+90.9 bps" in bloque
 
 
@@ -80,8 +91,21 @@ def test_el_desvio_de_salida_en_short_sufre_si_se_recompra_por_encima(repo):
     # Con la formula de LONG (invertida) daria -100.0 bps.
     _trade(repo, salida_ref=100.0, salida=101.0, direction=Direction.SHORT)
     bloque = format_bloque_ejecucion(repo, "paper", descartes={}, cierres_tardios=0)
-    assert "EXTREME" in bloque
+    assert "STOP" in bloque
     assert "+100.0 bps" in bloque
+
+
+def test_una_salida_sin_precio_regla_no_se_promedia(repo):
+    # EXTREME por temporizador cierra a mercado adrede: no hay nivel
+    # prometido contra el que medir, así que el "+0.0 bps" que daría medirlo
+    # contra su propia referencia no debe aparecer como si fuera un dato
+    # medido -se lista aparte, sin promediarse con el resto de motivos.
+    _trade(repo, salida_ref=110.0, salida=100.0, reason=ExitReason.EXTREME,
+          precio_regla=None)
+    bloque = format_bloque_ejecucion(repo, "paper", descartes={}, cierres_tardios=0)
+    assert "Desvio de salida por motivo:\n  sin datos (n=0)" in bloque
+    assert "Salidas a mercado sin nivel de referencia (no promediadas):" in bloque
+    assert "EXTREME      n=1" in bloque
 
 
 def test_el_bloque_publica_los_contadores(repo):

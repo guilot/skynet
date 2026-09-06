@@ -37,13 +37,40 @@ from scanner_volumen.config import BotConfig
 from scanner_volumen.models import Direction
 from scanner_volumen.strategy.entries import es_entrada
 from scanner_volumen.strategy.model import (
-    CandleRow, ExitIntent, Fill, StrategyParams, TransitionRow,
+    CandleRow, ExitIntent, ExitReason, Fill, StrategyParams, TransitionRow,
 )
 from scanner_volumen.strategy.position import PositionRules, agrupar_por_vela
 
 log = logging.getLogger(__name__)
 
 PrecioDe = Callable[[str], float | None]
+
+
+def _precio_regla_de(
+    pos: PosicionAbierta, intent: ExitIntent, stop_vigente: float,
+) -> float | None:
+    """El nivel que la regla prometía para esta salida -no el precio con el
+    que el bot rellena su propia vela sintética, que siempre coincidiría con
+    el fill y daría desvío cero por construcción, mida lo que mida.
+
+    `stop_vigente` es el nivel de `pos.reglas.stop_price` capturado por el
+    llamador ANTES de la llamada a `on_candle` que produjo `intent`: para
+    cuando este código corre, `on_candle` ya pudo haber movido el stop a
+    break-even, y lo que hay que medir es contra qué nivel se disparó la
+    salida, no contra el nivel que dejó a su paso.
+    """
+    if intent.reason is ExitReason.STOP:
+        return stop_vigente
+    if intent.reason is ExitReason.STALE_BE:
+        # la regla promete no salir por debajo de break-even
+        return pos.entry_price
+    if intent.reason in (ExitReason.SCALE_HOT, ExitReason.SCALE_SIGNAL):
+        # el precio de la transición que disparó el tramo: un nivel con
+        # significado, a diferencia del precio de relleno de la vela.
+        return intent.precio_referencia
+    # EXTREME (cierre a mercado al vencer el temporizador) y END_OF_DATA: no
+    # hay nivel prometido contra el que medir, y aquí el cero SÍ es correcto.
+    return None
 
 
 class BotRunner:
@@ -64,6 +91,7 @@ class BotRunner:
         self, transiciones: list[TransitionRow], precio_de: PrecioDe, ahora: int,
     ) -> None:
         self.transiciones_vistas += len(transiciones)
+        self._repo.incrementar_contador(self._cfg.modo, "transiciones", len(transiciones))
         por_simbolo: dict[str, list[TransitionRow]] = {}
         for t in transiciones:
             por_simbolo.setdefault(t.symbol, []).append(t)
@@ -82,10 +110,15 @@ class BotRunner:
                 # reiniciar (Task 7).
                 log.exception("bot: fallo al gobernar %s; se marca degradada", symbol)
                 pos.degradada = True
+                self._repo.marcar_degradada(pos.id)
 
         # (2) evaluar entradas nuevas
         for t in transiciones:
             if not es_entrada(t):
+                continue
+            if t.price is None or t.price <= 0:
+                # sin precio de señal (símbolo sin vela en curso) no hay con
+                # qué abrir: `repo.abrir` exige `entry_price_senal NOT NULL`.
                 continue
             precio = precio_de(t.symbol)
             if precio is None or precio <= 0:
@@ -121,6 +154,9 @@ class BotRunner:
             margin=margin, notional=notional, size=orden.cantidad,
             reglas=PositionRules(entrada_real, self._params),
             pnl_acumulado=-orden.comision, fees_acumuladas=orden.comision,
+        )
+        self._repo.fijar_maximo(
+            self._cfg.modo, "max_concurrentes", len(self.abiertas)
         )
         log.info("bot: abre %s %s a %.6g (senal %.6g), margen %.2f",
                  t.symbol, t.direction.value, orden.precio, t.price, margin)
@@ -185,6 +221,7 @@ class BotRunner:
         for vela in velas:
             if pos.reglas.cerrada:
                 break
+            stop_vigente = pos.reglas.stop_price
             for intent in pos.reglas.on_candle(vela, tuple(por_vela.get(vela.ts, ()))):
                 ya = registrados.pop(intent.reason.value, None)
                 if ya is not None:
@@ -194,7 +231,7 @@ class BotRunner:
                     # veía los precios que observaba. Esta salida debió ocurrir
                     # y no ocurrió: se ejecuta ahora, tarde, y se contabiliza.
                     await self._ejecutar(pos, intent, precio_ahora, ahora,
-                                         tardio=True)
+                                         stop_vigente, tardio=True)
                     self.cierres_tardios += 1
                     log.warning("bot: cierre tardío de %s por %s tras reinicio",
                                 symbol, intent.reason.value)
@@ -209,6 +246,7 @@ class BotRunner:
                     # a intentar reconstruirla desde cero.
                     pos.degradada = True
                     self.abiertas[symbol] = pos
+                    self._repo.marcar_degradada(pos.id)
                     log.warning(
                         "bot: %s reconstruida como degradada: sin precio para "
                         "resolver la salida %s tras el reinicio",
@@ -249,14 +287,18 @@ class BotRunner:
             return  # sin precio observado no se evalúa nada este tick
         vela = CandleRow(ts=ahora, open=precio, high=precio, low=precio,
                          close=precio)
+        # el stop vigente ANTES de que este `on_candle` pueda moverlo a
+        # break-even: es el nivel contra el que se dispara cualquier STOP que
+        # salga de esta misma llamada (ver `_precio_regla_de`).
+        stop_vigente = pos.reglas.stop_price
         for intent in pos.reglas.on_candle(vela, tuple(transiciones)):
-            await self._ejecutar(pos, intent, precio, ahora)
+            await self._ejecutar(pos, intent, precio, ahora, stop_vigente)
         if pos.reglas.cerrada:
             self._cerrar(pos, ahora)
 
     async def _ejecutar(
         self, pos: PosicionAbierta, intent: ExitIntent, precio: float, ahora: int,
-        tardio: bool = False,
+        stop_vigente: float, tardio: bool = False,
     ) -> None:
         cantidad = pos.size * intent.fraction
         orden = await self._broker.cerrar(
@@ -270,6 +312,7 @@ class BotRunner:
             pos.id, ts=intent.ts, reason=intent.reason, fraction=intent.fraction,
             precio_referencia=intent.precio_referencia, precio=orden.precio,
             comision=orden.comision, tardio=tardio,
+            precio_regla=_precio_regla_de(pos, intent, stop_vigente),
         )
 
     def _acumular_pnl(

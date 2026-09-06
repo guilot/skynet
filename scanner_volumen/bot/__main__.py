@@ -9,6 +9,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from scanner_volumen.bot.model import ETIQUETAS_DESCARTE
 from scanner_volumen.bot.repo import BotRepo
 from scanner_volumen.bot.report import format_informe_bot
 from scanner_volumen.config import load_config
@@ -34,8 +35,15 @@ def main(argv: list[str] | None = None) -> None:
     conn = open_readonly(db_path)
     try:
         repo = BotRepo(conn)
+        contadores = repo.contadores(args.modo)
+        descartes = {etq: contadores.get(etq, 0) for etq in ETIQUETAS_DESCARTE}
         print(format_informe_bot(
-            repo, args.modo, repo.equity_inicial(defecto=cfg.bot.equity_inicial)
+            repo, args.modo,
+            repo.equity_inicial(args.modo, defecto=cfg.bot.equity_inicial),
+            descartes=descartes,
+            total_transiciones=contadores.get("transiciones", 0),
+            max_concurrentes=contadores.get("max_concurrentes", 0),
+            arrancado_ms=repo.arrancado_ms(),
         ))
     finally:
         conn.close()

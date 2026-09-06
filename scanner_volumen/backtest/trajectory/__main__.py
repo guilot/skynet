@@ -33,6 +33,16 @@ def main(argv: list[str] | None = None) -> None:
     )
     p.add_argument("--db", type=Path, default=None)
     p.add_argument("--config", type=Path, default=Path("config.toml"))
+    p.add_argument(
+        "--desde", type=int, default=None,
+        help="ts en ms desde el que acotar la ventana (inclusive); sin este "
+             "flag, toda la base -comportamiento idéntico al de siempre-.",
+    )
+    p.add_argument(
+        "--hasta", type=int, default=None,
+        help="ts en ms hasta el que acotar la ventana (inclusive); sin este "
+             "flag, toda la base -comportamiento idéntico al de siempre-.",
+    )
     p.add_argument("--equity", type=float, default=d.equity_inicial)
     p.add_argument("--margin-frac", type=float, default=d.fraccion_margen)
     p.add_argument("--leverage", type=float, default=d.apalancamiento)
@@ -63,7 +73,7 @@ def main(argv: list[str] | None = None) -> None:
 
     conn = open_readonly(db_path)
     try:
-        transitions = load_transitions(StateTransitionRepo(conn))
+        transitions = load_transitions(StateTransitionRepo(conn), args.desde, args.hasta)
         provider = make_candle_provider(CandleRepo(conn))
         run = run_trajectory(transitions, provider, params)
     finally:

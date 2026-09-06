@@ -166,7 +166,7 @@ def test_api_bot_publica_equity_y_abiertas(tmp_path):
     conn = open_db(tmp_path / "scanner.db")
     signal_repo = SignalRepo(conn)
     bot_repo = BotRepo(conn)
-    bot_repo.set_equity_inicial(1000.0)
+    bot_repo.set_equity_inicial("paper", 1000.0)
     bot_repo.abrir(
         modo="paper", symbol="AAAUSDT", direction=Direction.LONG, entry_ts=0,
         entry_price=100.0, entry_price_senal=100.0, margin=20.0,
@@ -204,7 +204,7 @@ def test_api_bot_recorta_cerradas_a_veinte_mas_recientes(tmp_path):
     conn = open_db(tmp_path / "scanner.db")
     signal_repo = SignalRepo(conn)
     bot_repo = BotRepo(conn)
-    bot_repo.set_equity_inicial(1000.0)
+    bot_repo.set_equity_inicial("paper", 1000.0)
     for i in range(25):
         pid = bot_repo.abrir(
             modo="paper", symbol=f"S{i}USDT", direction=Direction.LONG,

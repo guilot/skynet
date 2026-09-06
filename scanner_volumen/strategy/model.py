@@ -99,7 +99,11 @@ class PositionOutcome:
 
 @dataclass(frozen=True)
 class TradeResumen:
-    """Un trade cerrado, en la forma mínima que el informe necesita.
+    """Un trade cerrado: los campos que `format_resumen` agrega (`pnl`,
+    `close_ts`, `fills`, `fill_pnls`, `max_rank`) más los que no usa pero que
+    un listado por trade sí necesitará (`symbol`, `direction`, `entry_ts`,
+    `entry_price`, `margin`, `fees`) -no es la forma mínima del informe
+    agregado, es la forma completa de un trade.
 
     La construyen tanto el backtest (desde su `ClosedTrade`) como el bot (desde
     su base de datos), para que un único formateador sirva a los dos.
