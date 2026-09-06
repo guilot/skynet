@@ -36,3 +36,40 @@ def test_main_corre_end_to_end(tmp_path, capsys):
     salida = capsys.readouterr().out
     assert "Backtest de trayectoria" in salida
     assert "Equity:" in salida
+
+
+def test_main_admite_desde_y_hasta_para_acotar_la_ventana(tmp_path, capsys):
+    # G: sin los flags, el comportamiento es idéntico al de siempre (lo
+    # verifica el golden master); con ellos, una entrada fuera de la
+    # ventana no debe contarse como trade.
+    db = tmp_path / "scanner.db"
+    conn = open_db(db)
+    st = StateTransitionRepo(conn)
+    cr = CandleRepo(conn)
+    for ts, prev, new, price in [
+        (0, State.NORMAL, State.WATCH, 100.0),
+        (1 * MIN, State.WATCH, State.EXTREME, 130.0),
+        # una segunda entrada, muy posterior, que --hasta debe excluir
+        (100 * MIN, State.NORMAL, State.WATCH, 100.0),
+        (101 * MIN, State.WATCH, State.EXTREME, 130.0),
+    ]:
+        st.insert(
+            Transition(symbol="BTCUSDT", previous=prev, current=new, score=95.0,
+                       escalated=True, ts=ts, should_alert=False),
+            price=price, direction=Direction.LONG,
+            config_fingerprint="c" * 64, code_revision="rev",
+        )
+    cr.save_many("BTCUSDT", [
+        Candle(ts=i * MIN, open=100 + i, high=100 + i, low=100 + i, close=100 + i,
+               base_vol=1, quote_vol=1)
+        for i in range(5)
+    ] + [
+        Candle(ts=(100 + i) * MIN, open=100 + i, high=100 + i, low=100 + i,
+               close=100 + i, base_vol=1, quote_vol=1)
+        for i in range(5)
+    ])
+    conn.close()
+
+    main(["--db", str(db), "--fee", "0", "--hasta", str(50 * MIN)])
+    salida = capsys.readouterr().out
+    assert "Trades ejecutados: 1" in salida

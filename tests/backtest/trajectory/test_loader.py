@@ -32,6 +32,25 @@ def test_load_transitions_mapea_a_enums(conn):
     assert filas[0].price == 10.0
 
 
+def test_load_transitions_acota_la_ventana(conn):
+    # G: acotar la ventana del backtest para poder compararla con la del bot
+    # en vivo, que solo cubre unas semanas concretas.
+    repo = StateTransitionRepo(conn)
+    for ts in (1000, 2000, 3000):
+        repo.insert(
+            Transition(symbol="BTCUSDT", previous=State.NORMAL,
+                       current=State.WATCH, score=55.0, escalated=True, ts=ts,
+                       should_alert=False),
+            price=10.0, direction=Direction.LONG,
+            config_fingerprint="c" * 64, code_revision="rev",
+        )
+    assert [f.ts for f in load_transitions(repo, desde_ms=2000)] == [2000, 3000]
+    assert [f.ts for f in load_transitions(repo, hasta_ms=2000)] == [1000, 2000]
+    assert [f.ts for f in load_transitions(repo, desde_ms=1500, hasta_ms=2500)] == [2000]
+    # sin flags, el comportamiento es idéntico al de siempre: toda la base.
+    assert [f.ts for f in load_transitions(repo)] == [1000, 2000, 3000]
+
+
 def test_candle_provider_devuelve_candlerows(conn):
     CandleRepo(conn).save_many("BTCUSDT", [
         Candle(ts=1000, open=1, high=2, low=0.5, close=1.5,

@@ -15,7 +15,7 @@ from __future__ import annotations
 from scanner_volumen.strategy.model import (
     CandleRow, ExitReason, Fill, MIN_MS, PositionOutcome, StrategyParams, TransitionRow,
 )
-from scanner_volumen.strategy.position import PositionRules
+from scanner_volumen.strategy.position import PositionRules, agrupar_por_vela
 
 __all__ = ["MIN_MS", "simulate_position"]
 
@@ -34,7 +34,7 @@ def simulate_position(
         raise ValueError("simulate_position requiere al menos una vela")
 
     rules = PositionRules(entry, params)
-    por_vela = _agrupar_por_ventana(later, candles)
+    por_vela = agrupar_por_vela(later, candles)
     fills: list[Fill] = []
 
     for c in candles:
@@ -57,26 +57,3 @@ def simulate_position(
         entry_price=entry.price, fills=tuple(fills), max_rank=rules.max_rank,
         close_ts=fills[-1].ts,
     )
-
-
-def _agrupar_por_ventana(
-    later: list[TransitionRow], candles: list[CandleRow]
-) -> dict[int, list[TransitionRow]]:
-    """Asigna cada transición a la vela cuyo minuto [ts, ts+1min) la contiene.
-    Transiciones sin vela contenedora (no debería haber con velas contiguas)
-    se ignoran."""
-    if not candles:
-        return {}
-    base = candles[0].ts
-    fin = candles[-1].ts + MIN_MS
-    por_vela: dict[int, list[TransitionRow]] = {}
-    for t in later:
-        if t.ts < base or t.ts >= fin:
-            # Vela con hueco en candles_1m (o transición fuera de la ventana
-            # cargada): se descarta en silencio. El riesgo queda acotado por el
-            # guard de retención de run_trajectory, que ya excluye del todo las
-            # entradas sin cobertura de velas suficiente.
-            continue
-        minuto = base + ((t.ts - base) // MIN_MS) * MIN_MS
-        por_vela.setdefault(minuto, []).append(t)
-    return por_vela

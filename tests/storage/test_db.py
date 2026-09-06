@@ -15,7 +15,7 @@ from scanner_volumen.engine.metrics import SymbolMetrics
 from scanner_volumen.models import Direction, State
 from scanner_volumen.provenance import PRE_PROVENANCE_SENTINEL
 from scanner_volumen.scoring.score import ScoreBreakdown
-from scanner_volumen.storage.db import open_db
+from scanner_volumen.storage.db import VERSION_ESQUEMA, open_db
 from scanner_volumen.storage.repos import MaintenanceRepo, SignalRepo
 
 
@@ -277,7 +277,10 @@ def test_migra_desde_v2_anade_state_transitions_y_sube_la_version(tmp_path):
     conn = open_db(path)
     try:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        assert version == 3
+        # sube hasta la versión actual del esquema (no se detiene en 3: esta
+        # base también carece de las tablas/columnas del bot, añadidas en
+        # migraciones posteriores).
+        assert version == VERSION_ESQUEMA
 
         tablas = {
             f["name"] for f in conn.execute(
@@ -317,3 +320,88 @@ def test_abrir_dos_veces_la_misma_base_es_idempotente(tmp_path):
         assert "candles_seen" in columnas
     finally:
         conn2.close()
+
+
+def test_migra_desde_v3_anade_columnas_del_informe_del_bot(tmp_path):
+    """Regresión de la ola de arreglos del informe del bot: `bot_posiciones`
+    y `bot_fills` ya existían (versión 3, la de `state_transitions`) sin
+    `degradada`/`precio_regla`, dos columnas que este código ya da por
+    hechas -sin la migración, abrir esa base con el código actual dejaría
+    las tablas viejas tal cual, y cualquier acceso a esas columnas rompería
+    en tiempo de ejecución."""
+    path = tmp_path / "v3_sin_informe_bot.db"
+    conn_vieja = sqlite3.connect(path)
+    conn_vieja.executescript(
+        """
+        CREATE TABLE bot_posiciones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            modo TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            entry_ts INTEGER NOT NULL,
+            entry_price REAL NOT NULL,
+            entry_price_senal REAL NOT NULL,
+            margin REAL NOT NULL,
+            notional REAL NOT NULL,
+            size REAL NOT NULL,
+            fee_entrada REAL NOT NULL,
+            abierta INTEGER NOT NULL,
+            close_ts INTEGER,
+            pnl REAL,
+            fees REAL,
+            max_rank INTEGER
+        );
+        CREATE TABLE bot_fills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            posicion_id INTEGER NOT NULL,
+            ts INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            fraction REAL NOT NULL,
+            precio_referencia REAL NOT NULL,
+            precio REAL NOT NULL,
+            comision REAL NOT NULL,
+            tardio INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE bot_meta (
+            clave TEXT PRIMARY KEY,
+            valor TEXT NOT NULL
+        );
+        """
+    )
+    conn_vieja.execute(
+        "INSERT INTO bot_posiciones (modo, symbol, direction, entry_ts, "
+        "entry_price, entry_price_senal, margin, notional, size, "
+        "fee_entrada, abierta) VALUES "
+        "('paper', 'AAAUSDT', 'LONG', 0, 100.0, 100.0, 20.0, 400.0, 4.0, 0.24, 1)"
+    )
+    conn_vieja.execute("PRAGMA user_version = 3")
+    conn_vieja.commit()
+    conn_vieja.close()
+
+    conn = open_db(path)
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        assert version == VERSION_ESQUEMA
+
+        columnas_pos = {f["name"] for f in conn.execute("PRAGMA table_info(bot_posiciones)")}
+        assert "degradada" in columnas_pos
+        columnas_fills = {f["name"] for f in conn.execute("PRAGMA table_info(bot_fills)")}
+        assert "precio_regla" in columnas_fills
+
+        tablas = {
+            f["name"] for f in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert "bot_contadores" in tablas
+
+        # la fila ya existente sobrevive, y "degradada" nace en 0 (sana): una
+        # posición degradada solo pudo escribirse con código que ya conoce
+        # esta columna.
+        fila_vieja = conn.execute(
+            "SELECT symbol, degradada FROM bot_posiciones WHERE symbol = 'AAAUSDT'"
+        ).fetchone()
+        assert fila_vieja["symbol"] == "AAAUSDT"
+        assert fila_vieja["degradada"] == 0
+    finally:
+        conn.close()

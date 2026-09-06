@@ -151,3 +151,9 @@ demand_burst = { max_points = 10, breakpoints = [[1.0, 0], [1.5, 5], [2.5, 10]] 
 z_return     = { max_points = 7,  breakpoints = [[1.0, 0], [2.0, 3], [3.0, 5], [4.5, 7]] }
 market_cap   = { max_points = 5,  breakpoints = [[1_000_000_000, 0], [300_000_000, 2], [80_000_000, 5]] }
 vwap         = { max_points = 8,  breakpoints = [[-20.0, -8], [-2.0, 0], [2.0, 8], [6.0, 8], [10.0, 0], [14.0, -10], [20.0, -25], [35.0, -45]] }
+
+[bot]
+enabled = false          # arranca apagado: encenderlo es una decisión deliberada
+modo = "paper"           # 'paper' | 'real'  <- el switch de la Fase 3
+equity_inicial = 1000.0
+desvio_max_entrada = 0.0 # fracción; 0 = desactivado

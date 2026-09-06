@@ -1,6 +1,6 @@
 """Punto de entrada: `python -m scanner_volumen.backtest [--db PATH]`.
 
-Abre la base en solo-lectura (nunca escribe, ver `backtest/db.py`), calcula
+Abre la base en solo-lectura (nunca escribe, ver `storage/db.py`), calcula
 todas las combinaciones de regla de entrada x horizonte de salida y escribe
 el informe en texto plano a stdout.
 """
@@ -10,10 +10,10 @@ import argparse
 import sys
 from pathlib import Path
 
-from scanner_volumen.backtest.db import open_readonly
 from scanner_volumen.backtest.report import format_report
 from scanner_volumen.backtest.runner import run
 from scanner_volumen.config import load_config
+from scanner_volumen.storage.db import open_readonly
 from scanner_volumen.storage.repos import SignalRepo
 
 

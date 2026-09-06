@@ -207,3 +207,26 @@ class PositionRules:
         intents.append(intent)
         self._pendientes.append(intent)
         self._comprometido -= fraction
+
+
+def agrupar_por_vela(
+    transiciones: Sequence[TransitionRow], velas: Sequence[CandleRow],
+) -> dict[int, list[TransitionRow]]:
+    """Asigna cada transición a la vela cuyo minuto [ts, ts+1min) la contiene.
+
+    La usan los dos drivers: el backtest para recorrer histórico, y el bot para
+    replicar una posición al reiniciar. Las transiciones sin vela contenedora
+    (hueco en el histórico, o fuera de la ventana cargada) se descartan en
+    silencio: quien llama ya se ha asegurado de tener cobertura suficiente.
+    """
+    if not velas:
+        return {}
+    base = velas[0].ts
+    fin = velas[-1].ts + MIN_MS
+    por_vela: dict[int, list[TransitionRow]] = {}
+    for t in transiciones:
+        if t.ts < base or t.ts >= fin:
+            continue
+        minuto = base + ((t.ts - base) // MIN_MS) * MIN_MS
+        por_vela.setdefault(minuto, []).append(t)
+    return por_vela

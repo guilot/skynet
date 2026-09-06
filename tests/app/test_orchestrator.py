@@ -267,6 +267,43 @@ async def test_watch_a_hot_persiste_transicion_y_tambien_signal(orq, monkeypatch
     assert senales[0]["state"] == "HOT"
 
 
+async def test_evaluate_publica_las_transiciones_enriquecidas(orq, monkeypatch):
+    """El bot consume `orq.transiciones_evaluadas`, no el valor de retorno de
+    `evaluate` (que no lleva precio ni dirección) ni una segunda llamada a
+    `evaluate` (que vaciaría `self.dirty` y no es idempotente, ver su
+    comentario en `Orchestrator.__init__`). Debe llevar una fila por cada
+    transición que toca `state_transitions` (WATCH+, mismo filtro que
+    `_toca_watch_o_mas`) y vaciarse al principio de cada `evaluate`, para que
+    no se acumulen entre ticks."""
+    await orq.ensure_profile("AAAUSDT", now_ms=14 * DIA)
+    orq.set_ticker(Ticker("AAAUSDT", 100.0, 1.0, 5e6, 100.0, 0.0001, 0))
+    _instalar_score_falso(monkeypatch, 30.0, 55.0)  # NORMAL, luego WATCH
+
+    await orq.handle_ws_event(
+        WsEvent(kind="update", symbol="AAAUSDT", candles=[vela(14 * DIA)])
+    )
+    orq.evaluate(now_ms=14 * DIA + 59_000)  # 30.0: sin transición
+    assert orq.transiciones_evaluadas == []
+
+    await orq.handle_ws_event(
+        WsEvent(kind="update", symbol="AAAUSDT", candles=[vela(14 * DIA + MINUTO)])
+    )
+    transiciones = orq.evaluate(now_ms=14 * DIA + MINUTO + 59_000)  # 55.0: NORMAL -> WATCH
+
+    publicadas = orq.transiciones_evaluadas
+    assert len(publicadas) == len(transiciones) == 1
+    assert publicadas[0].symbol == "AAAUSDT"
+    assert publicadas[0].prev_state == State.NORMAL
+    assert publicadas[0].new_state == State.WATCH
+    assert publicadas[0].price is not None
+    assert publicadas[0].direction is not None
+    assert publicadas[0].score == 55.0
+
+    # se vacía al principio del siguiente evaluate: no se acumula entre ticks
+    orq.evaluate(now_ms=14 * DIA + 2 * MINUTO + 59_000)
+    assert orq.transiciones_evaluadas == []
+
+
 def test_toca_watch_o_mas_filtra_transiciones_que_no_llegan_a_watch():
     """El filtro real: `NORMAL -> NORMAL` no ocurre nunca en la práctica
     (`StateMachine.update` solo emite `Transition` cuando el estado cambia),

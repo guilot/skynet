@@ -26,6 +26,7 @@ from scanner_volumen.scoring.states import StateMachine, Transition
 from scanner_volumen.storage.repos import (
     CandleRepo, ProfileRepo, SignalRepo, StateTransitionRepo,
 )
+from scanner_volumen.strategy.model import TransitionRow
 
 MINUTO_MS = 60_000
 DIA_MS = 1440 * MINUTO_MS
@@ -152,6 +153,10 @@ class Orchestrator:
         # desde config.toml: el TOML guarda el nombre del estado como texto
         # ("HOT"), aquí se convierte una vez al enum real.
         self._persisted_min_state = State(cfg.orchestrator.persisted_min_state)
+        # Transiciones del último `evaluate`, enriquecidas con precio y
+        # dirección para que el bot pueda consumirlas sin volver a llamar a
+        # `evaluate` -que vacía `self.dirty` y no es idempotente-.
+        self.transiciones_evaluadas: list[TransitionRow] = []
 
     # --- entrada de datos ---
 
@@ -791,6 +796,7 @@ class Orchestrator:
 
     def evaluate(self, now_ms: int) -> list[Transition]:
         transiciones: list[Transition] = []
+        self.transiciones_evaluadas = []
         pendientes, self.dirty = self.dirty, set()
 
         for simbolo in pendientes:
@@ -843,6 +849,14 @@ class Orchestrator:
                     self.state_transition_repo.insert(
                         transicion, metricas.price, desglose.direction,
                         self._config_fingerprint, self._code_revision,
+                    )
+                    self.transiciones_evaluadas.append(
+                        TransitionRow(
+                            ts=transicion.ts, symbol=simbolo,
+                            prev_state=transicion.previous,
+                            new_state=transicion.current, price=metricas.price,
+                            direction=desglose.direction, score=desglose.total,
+                        )
                     )
 
         return transiciones
