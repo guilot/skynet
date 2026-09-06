@@ -153,7 +153,7 @@ market_cap   = { max_points = 5,  breakpoints = [[1_000_000_000, 0], [300_000_00
 vwap         = { max_points = 8,  breakpoints = [[-20.0, -8], [-2.0, 0], [2.0, 8], [6.0, 8], [10.0, 0], [14.0, -10], [20.0, -25], [35.0, -45]] }
 
 [bot]
-enabled = false          # arranca apagado: encenderlo es una decisión deliberada
+enabled = true           # ENCENDIDO en paper desde 2026-09-06 (fase 2)
 modo = "paper"           # 'paper' | 'real'  <- el switch de la Fase 3
 equity_inicial = 1000.0
 desvio_max_entrada = 0.0 # fracción; 0 = desactivado
