@@ -20,8 +20,8 @@ def repo(tmp_path):
 
 
 def _trade(repo, symbol="A", senal=100.0, ejecutado=100.0, salida_ref=110.0,
-           salida=110.0, pnl=10.0):
-    pid = repo.abrir(modo="paper", symbol=symbol, direction=Direction.LONG,
+           salida=110.0, pnl=10.0, direction=Direction.LONG):
+    pid = repo.abrir(modo="paper", symbol=symbol, direction=direction,
                      entry_ts=0, entry_price=ejecutado, entry_price_senal=senal,
                      margin=20.0, notional=400.0, size=4.0, fee_entrada=0.0)
     repo.registrar_fill(pid, ts=MIN, reason=ExitReason.EXTREME, fraction=1.0,
@@ -53,11 +53,35 @@ def test_una_entrada_mejor_que_la_senal_da_desvio_negativo(repo):
 
 
 def test_el_desvio_de_salida_se_desglosa_por_motivo(repo):
-    # vendio a 109 cuando la regla pedia 110: 90.9 bps de coste
+    # LONG: vendio a 109 cuando la regla pedia 110.
+    # bps = (110 - 109) / 110 * 10000 = 90.909... -> "+90.9 bps"
     _trade(repo, salida_ref=110.0, salida=109.0)
     bloque = format_bloque_ejecucion(repo, "paper", descartes={}, cierres_tardios=0)
     assert "EXTREME" in bloque
-    assert "bps" in bloque
+    assert "+90.9 bps" in bloque
+
+
+def test_el_desvio_de_entrada_en_short_sufre_si_se_vende_por_debajo(repo):
+    # SHORT: entrar es vender. La senal pedia 100 y se vendio a 99 (por
+    # debajo): peor para nosotros porque un short quiere abrir a precio alto.
+    # bps = (100 - 99) / 100 * 10000 = 100.0 -> "+100.0 bps".
+    # Si el signo estuviera invertido (se aplicara la formula de LONG), daria
+    # -100.0 bps: un numero claramente distinto, no solo un redondeo.
+    _trade(repo, senal=100.0, ejecutado=99.0, direction=Direction.SHORT)
+    bloque = format_bloque_ejecucion(repo, "paper", descartes={}, cierres_tardios=0)
+    assert "+100.0 bps" in bloque
+
+
+def test_el_desvio_de_salida_en_short_sufre_si_se_recompra_por_encima(repo):
+    # SHORT: salir es recomprar. La regla pedia 100 y se recompro a 101 (por
+    # encima): peor para nosotros porque pagamos mas de lo que la regla
+    # queria para cerrar el short.
+    # bps = (101 - 100) / 100 * 10000 = 100.0 -> "+100.0 bps".
+    # Con la formula de LONG (invertida) daria -100.0 bps.
+    _trade(repo, salida_ref=100.0, salida=101.0, direction=Direction.SHORT)
+    bloque = format_bloque_ejecucion(repo, "paper", descartes={}, cierres_tardios=0)
+    assert "EXTREME" in bloque
+    assert "+100.0 bps" in bloque
 
 
 def test_el_bloque_publica_los_contadores(repo):
@@ -71,3 +95,17 @@ def test_el_bloque_publica_los_contadores(repo):
 def test_sin_trades_no_revienta(repo):
     bloque = format_bloque_ejecucion(repo, "paper", descartes={}, cierres_tardios=0)
     assert "sin datos" in bloque.lower() or "n=0" in bloque
+
+
+def test_un_fill_tardio_en_una_posicion_abierta_tambien_cuenta(repo):
+    # Una salida parcial tardia no cierra el trade: la posicion sigue abierta
+    # (nunca se llama a repo.cerrar). El contador de cierres tardios debe
+    # verla igual, no solo las de posiciones ya cerradas.
+    pid = repo.abrir(modo="paper", symbol="A", direction=Direction.LONG,
+                     entry_ts=0, entry_price=100.0, entry_price_senal=100.0,
+                     margin=20.0, notional=400.0, size=4.0, fee_entrada=0.0)
+    repo.registrar_fill(pid, ts=MIN, reason=ExitReason.SCALE_HOT, fraction=0.33,
+                        precio_referencia=100.0, precio=100.0, comision=0.0,
+                        tardio=True)
+    bloque = format_bloque_ejecucion(repo, "paper", descartes={}, cierres_tardios=0)
+    assert "Cierres tardios por reinicio: 1" in bloque

@@ -95,6 +95,15 @@ def format_bloque_ejecucion(
                 salidas.setdefault(f["reason"], []).append(s)
             tardios_guardados += int(f["tardio"])
 
+    # Un fill tardío no espera a que su posición cierre para contar: una
+    # salida parcial tardía en una posición que sigue abierta (`abiertas`) es
+    # tan real como una en una ya cerrada. Si solo mirásemos `cerradas`, ese
+    # cierre tardío quedaría invisible en el informe hasta que la posición
+    # terminara de cerrarse.
+    for fila in repo.abiertas(modo):
+        for f in repo.fills_de(fila["id"]):
+            tardios_guardados += int(f["tardio"])
+
     lineas = ["== Ejecucion =="]
     if entradas:
         lineas.append(
