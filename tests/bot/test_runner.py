@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 
 from scanner_volumen.bot.broker import PaperBroker, StopVivo
@@ -11,6 +13,18 @@ from scanner_volumen.storage.db import open_db
 from scanner_volumen.strategy.model import ExitReason, StrategyParams, TransitionRow
 
 MIN = 60_000
+
+
+@pytest.fixture(autouse=True)
+def _sin_espera_real_entre_reintentos(monkeypatch):
+    """`_colocar_stop_inicial` espera (`asyncio.sleep`) entre reintentos
+    fallidos (Hallazgo 3, ronda 1 de revisión de la Task 7). Sin este parche,
+    cada test que agota los reintentos sumaría segundos reales a la suite.
+    El test que verifica la propia espera creciente vuelve a parchearla,
+    localmente, para poder inspeccionar las llamadas."""
+    async def _no_esperar(segundos):
+        return None
+    monkeypatch.setattr("scanner_volumen.bot.runner.asyncio.sleep", _no_esperar)
 
 
 @pytest.fixture
@@ -599,3 +613,199 @@ async def test_colocar_stop_se_reintenta_dos_veces_antes_de_cerrar(tmp_path):
     await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
 
     assert broker.intentos_colocar == 3
+
+
+async def test_colocar_stop_espera_creciente_entre_reintentos(tmp_path, monkeypatch):
+    # Hallazgo 3 (ronda 1 de revision): tres intentos seguidos, sin espera,
+    # fallarian los tres por la misma causa contra un exchange rate-limitado
+    # o momentaneamente caido. Se parchea `asyncio.sleep` para registrar las
+    # llamadas en vez de esperar de verdad -esta prueba SI quiere inspeccionar
+    # la propia espera, a diferencia del resto de tests de este fichero, que
+    # la desactivan via el fixture `_sin_espera_real_entre_reintentos`.
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn); repo.set_equity_inicial("paper", 1000.0)
+    cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    params = StrategyParams(comision_taker=0.0)
+    broker = _BrokerQueFallaAlColocarStop(params)
+    runner = BotRunner(params, cfg, repo, broker, LivePortfolio(params, cfg, repo))
+
+    esperas = []
+
+    async def _espera_registrada(segundos):
+        esperas.append(segundos)
+
+    monkeypatch.setattr("scanner_volumen.bot.runner.asyncio.sleep", _espera_registrada)
+
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+
+    # dos esperas entre los 3 intentos -no se espera tras el ultimo, que ya
+    # decide cerrar a mercado-, creciendo con el numero de intento
+    assert len(esperas) == 2
+    assert 0 < esperas[0] < esperas[1]
+    conn.close()
+
+
+class _BrokerQueFallaAlMoverStop:
+    """Coloca el stop sin problema pero revienta al intentar moverlo -como
+    simularia que el stop ya salto en el exchange justo antes de este tick,
+    o un fallo de red al llamar a `mover_stop`."""
+
+    def __init__(self, params: StrategyParams) -> None:
+        self._interno = PaperBroker(params)
+
+    async def abrir(self, **kwargs):
+        return await self._interno.abrir(**kwargs)
+
+    async def cerrar(self, **kwargs):
+        return await self._interno.cerrar(**kwargs)
+
+    async def colocar_stop(self, **kwargs):
+        return await self._interno.colocar_stop(**kwargs)
+
+    async def mover_stop(self, **kwargs):
+        raise ValueError("stop_id ya no corresponde a un stop vivo (simulado)")
+
+    async def cancelar_stop(self, **kwargs):
+        await self._interno.cancelar_stop(**kwargs)
+
+
+async def test_fallo_al_mover_el_stop_no_tumba_el_tick(tmp_path):
+    # Hallazgo 2 (ronda 1 de revision): `mover_stop` SI lanza cuando el
+    # `stop_id` ya no corresponde a un stop vivo (a diferencia de
+    # `cancelar_stop`, que es idempotente). No debe tumbar el tick ni
+    # degradar la posicion -el stop local sigue vigilando.
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn); repo.set_equity_inicial("paper", 1000.0)
+    cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    params = StrategyParams(comision_taker=0.0)
+    broker = _BrokerQueFallaAlMoverStop(params)
+    runner = BotRunner(params, cfg, repo, broker, LivePortfolio(params, cfg, repo))
+
+    await runner.on_tick([tr(new=State.WATCH)], precios({"A": 100.0}), ahora=0)
+    # tramo HOT en beneficio: la regla sube el stop a break-even e intenta
+    # moverlo en el exchange, pero el broker revienta.
+    await runner.on_tick(
+        [tr(ts=MIN, prev=State.WATCH, new=State.HOT, price=110.0)],
+        precios({"A": 110.0}), ahora=MIN)
+
+    pos = runner.abiertas["A"]
+    assert pos.reglas.stop_en_be is True
+    assert pos.degradada is False
+    # el tick siguiente tampoco revienta ni degrada la posicion
+    await runner.on_tick([], precios({"A": 105.0}), ahora=2 * MIN)
+    assert runner.abiertas["A"].degradada is False
+    conn.close()
+
+
+class _BrokerQueFallaAlCancelarStop:
+    """Abre y cierra con normalidad, pero revienta al cancelar el stop -un
+    fallo real de red o del exchange, no el camino idempotente normal en el
+    que el stop ya no existe."""
+
+    def __init__(self, params: StrategyParams) -> None:
+        self._interno = PaperBroker(params)
+
+    async def abrir(self, **kwargs):
+        return await self._interno.abrir(**kwargs)
+
+    async def cerrar(self, **kwargs):
+        return await self._interno.cerrar(**kwargs)
+
+    async def colocar_stop(self, **kwargs):
+        return await self._interno.colocar_stop(**kwargs)
+
+    async def mover_stop(self, **kwargs):
+        return await self._interno.mover_stop(**kwargs)
+
+    async def cancelar_stop(self, **kwargs):
+        raise RuntimeError("fallo de red simulado al cancelar")
+
+
+async def test_fallo_al_cancelar_el_stop_no_impide_cerrar(tmp_path):
+    # Hallazgo 2 (ronda 1 de revision): si cancelar el stop falla de verdad
+    # (no el camino idempotente normal), la posicion debe darse por cerrada
+    # igual -esta cerrada de verdad, con el dinero ya liquidado-, no quedar
+    # `abierta = 1` para siempre por esto.
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn); repo.set_equity_inicial("paper", 1000.0)
+    cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    params = StrategyParams(comision_taker=0.0)
+    broker = _BrokerQueFallaAlCancelarStop(params)
+    runner = BotRunner(params, cfg, repo, broker, LivePortfolio(params, cfg, repo))
+
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+    # cae por debajo del stop: se cierra, pero cancelar el stop en el
+    # exchange falla -no debe impedir dar la posicion por cerrada.
+    await runner.on_tick([], precios({"A": 97.0}), ahora=MIN)
+
+    assert runner.abiertas == {}
+    cerradas = repo.cerradas("paper")
+    assert len(cerradas) == 1
+    assert cerradas[0]["pnl"] == pytest.approx(-12.0)
+    conn.close()
+
+
+class _BrokerQueFallaAlColocarYAlCerrar:
+    """Nunca coloca el stop, y cuando el runner intenta el cierre de
+    emergencia a mercado que deberia sustituirlo, tambien falla -la red no
+    daba para nada."""
+
+    def __init__(self, params: StrategyParams) -> None:
+        self.intentos_colocar = 0
+
+    async def abrir(self, *, symbol, direction, notional, precio_mercado, ts,
+                    client_oid):
+        return OrdenEjecutada(ts=ts, precio=precio_mercado,
+                              cantidad=notional / precio_mercado, comision=0.0)
+
+    async def cerrar(self, **kwargs):
+        raise RuntimeError("fallo de red simulado al cerrar de emergencia")
+
+    async def colocar_stop(self, **kwargs):
+        self.intentos_colocar += 1
+        raise RuntimeError("fallo simulado al colocar el stop")
+
+    async def mover_stop(self, **kwargs):
+        raise AssertionError("no deberia llamarse: el stop nunca se coloco")
+
+    async def cancelar_stop(self, **kwargs):
+        raise AssertionError("no deberia llamarse: el stop nunca se coloco")
+
+
+async def test_si_falla_colocar_y_tambien_el_cierre_de_emergencia_queda_degradada_y_abierta(
+    tmp_path, caplog,
+):
+    # Hallazgo 1 (ronda 1 de revision): si el cierre de emergencia TAMBIEN
+    # falla, la posicion no debe desaparecer ni registrarse como "entrada
+    # descartada" -sigue realmente abierta, apalancada y sin stop, y eso
+    # tiene que quedar clarisimo en el log para que alguien lo mire a mano.
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn); repo.set_equity_inicial("paper", 1000.0)
+    cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    params = StrategyParams(comision_taker=0.0)
+    broker = _BrokerQueFallaAlColocarYAlCerrar(params)
+    runner = BotRunner(params, cfg, repo, broker, LivePortfolio(params, cfg, repo))
+
+    with caplog.at_level(logging.ERROR):
+        await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+
+    assert broker.intentos_colocar == 3
+    # sigue abierta -ni se descarto ni desaparecio- y marcada degradada,
+    # persistido en la base
+    assert "A" in runner.abiertas
+    pos = runner.abiertas["A"]
+    assert pos.degradada is True
+    assert pos.stop_id is None
+    fila = repo.abiertas("paper")[0]
+    assert fila["symbol"] == "A"
+    assert fila["degradada"] == 1
+    # el log dice explicitamente que hace falta mirarlo a mano, no que se
+    # "descarto" la entrada
+    mensajes = " ".join(r.getMessage() for r in caplog.records)
+    assert "intervencion manual" in mensajes.lower()
+    assert "se descarta esta entrada" not in mensajes
+    conn.close()

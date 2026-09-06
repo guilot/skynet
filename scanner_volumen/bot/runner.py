@@ -34,6 +34,7 @@ ambos disparen no es un problema porque todos los cierres son reduce-only.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from uuid import uuid4
@@ -76,6 +77,16 @@ TOLERANCIA_CANTIDAD = 1e-9
 # se cierra la posición a mercado en el acto: una pérdida pequeña y
 # realizada es preferible a una posición apalancada sin ninguna red.
 MAX_INTENTOS_COLOCAR_STOP = 3
+
+# Espera entre reintentos de colocar el stop, en segundos, creciendo
+# linealmente con el número de intento fallido (0.2s tras el 1º, 0.4s tras
+# el 2º, ...). Sin esta espera, los tres intentos salen prácticamente
+# seguidos: contra un exchange fallando por límite de peticiones o por una
+# caída momentánea, los tres fallarían por la misma causa y "reintentar"
+# no habría servido de nada. No se espera tras el ÚLTIMO intento fallido:
+# en ese punto ya se ha decidido cerrar a mercado, y esperar solo alargaría
+# el tiempo que la posición pasa sin ninguna protección.
+ESPERA_REINTENTO_COLOCAR_STOP_S = 0.2
 
 
 def _precio_regla_de(
@@ -160,14 +171,33 @@ class BotRunner:
                 if self.portfolio.evaluar_entrada(t, set(self.abiertas), precio) is None:
                     await self._abrir(t, precio, ahora)
             except Exception:
-                # aislar el fallo a esta entrada: si `broker.abrir` revienta
-                # (orden rechazada, timeout de red) no debe llevarse por
+                # aislar el fallo a esta entrada: no debe llevarse por
                 # delante las entradas de los demás símbolos de este tick.
-                # `_abrir` ya reservó la fila con `confirmada=False` antes de
-                # llamar al broker (ver `bot.repo`), así que ese fallo deja
-                # exactamente la huella que la reconciliación (Task 8) sabe
-                # leer -no hace falta limpiar nada aquí-.
-                log.exception("bot: fallo al abrir %s; se descarta esta entrada", t.symbol)
+                #
+                # OJO: desde que `_abrir` coloca el stop DESPUÉS de
+                # confirmar la apertura (Task 7), no toda excepción que
+                # llega aquí ocurre antes de confirmar. Si `t.symbol` ya
+                # está en `self.abiertas`, la posición se abrió y confirmó
+                # de verdad -no hay nada que "descartar"-; lo más probable
+                # es que fallara colocar el stop y también el cierre de
+                # emergencia que le sigue, y ese camino (`_cerrar_por_fallo_
+                # de_stop`) ya la marcó `degradada` y dejó su propio
+                # `log.error` explícito, así que aquí solo se registra la
+                # traza para depurar. Si NO está en `self.abiertas`, el
+                # fallo sí ocurrió antes de confirmar (o `broker.abrir`
+                # reventó): la fila quedó reservada con `confirmada=False`
+                # (ver `bot.repo`), que es exactamente la huella que la
+                # reconciliación (Task 8) sabe leer -no hace falta limpiar
+                # nada aquí-, y ahí sí es correcto decir que se descarta.
+                if t.symbol in self.abiertas:
+                    log.exception(
+                        "bot: fallo al abrir %s con la posicion ya "
+                        "confirmada y abierta; ver el log de arriba para "
+                        "el detalle (no se descarta nada)", t.symbol)
+                else:
+                    log.exception(
+                        "bot: fallo al abrir %s; se descarta esta entrada",
+                        t.symbol)
 
     # --- entradas ---
 
@@ -244,6 +274,8 @@ class BotRunner:
                     "bot: fallo al colocar el stop de %s (intento %d/%d)",
                     pos.symbol, intento, MAX_INTENTOS_COLOCAR_STOP,
                 )
+                if intento < MAX_INTENTOS_COLOCAR_STOP:
+                    await asyncio.sleep(ESPERA_REINTENTO_COLOCAR_STOP_S * intento)
                 continue
             pos.stop_id = stop_id
             pos.stop_price_colocado = precio_stop
@@ -269,12 +301,39 @@ class BotRunner:
         Se registra como un fill de motivo STOP: en espíritu es exactamente
         eso, un stop protegiendo la posición, solo que ejecutado a mercado
         en vez de por una orden stop del exchange que no llegó a existir.
+
+        Si este cierre de emergencia TAMBIÉN falla -la red ya no daba para
+        colocar el stop, y tampoco da para el cierre a mercado que debía
+        sustituirlo-, la posición queda apalancada, confirmada y sin ningún
+        stop en el exchange: exactamente lo que esta tarea existe para
+        evitar. No hay nada más que este método pueda intentar en el mismo
+        tick, así que no se reintenta aquí -evitaríamos alargar más el
+        tiempo sin protección solo para volver a fallar por la misma
+        causa-. Se marca `degradada` (persistido, como en el resto de
+        caminos) para que `_avanzar` deje de tocar su motor, se mantiene en
+        `abiertas` -sigue realmente abierta, ocupando su hueco- y se grita
+        en el log con toda claridad: esto exige mirar la cuenta a mano.
+        No se relanza la excepción: quien llama (`_abrir`, vía `on_tick`)
+        no debe registrar esto como "se descarta esta entrada" -la entrada
+        se ejecutó y sigue abierta, es justo lo contrario de descartada-.
         """
         cantidad = pos.size * pos.reglas.restante
-        orden = await self._broker.cerrar(
-            symbol=pos.symbol, direction=pos.direction, cantidad=cantidad,
-            precio_mercado=precio, ts=ahora,
-        )
+        try:
+            orden = await self._broker.cerrar(
+                symbol=pos.symbol, direction=pos.direction, cantidad=cantidad,
+                precio_mercado=precio, ts=ahora,
+            )
+        except Exception:
+            pos.degradada = True
+            self._repo.marcar_degradada(pos.id)
+            log.error(
+                "bot: %s: fallo al colocar el stop Y al cerrar la posicion de "
+                "emergencia que debia sustituirlo. POSICION ABIERTA, "
+                "APALANCADA Y SIN NINGUN STOP EN EL EXCHANGE -- requiere "
+                "intervencion manual inmediata.",
+                pos.symbol,
+            )
+            return
         self._acumular_pnl(pos, orden.precio, pos.reglas.restante, orden.comision)
         self._repo.registrar_fill(
             pos.id, ts=ahora, reason=ExitReason.STOP, fraction=pos.reglas.restante,
@@ -413,7 +472,22 @@ class BotRunner:
         self, pos: PosicionAbierta, transiciones, precio_de: PrecioDe, ahora: int,
     ) -> None:
         if pos.degradada:
-            return  # rota por un fallo previo del broker; no se vuelve a tocar
+            # Rota por un fallo previo del broker; no se vuelve a tocar su
+            # motor. Esto incluye el caso de `_cerrar_por_fallo_de_stop`
+            # fallando también (`stop_id is None` y `degradada`): se valoró
+            # que `_sincronizar_stop` reintentara colocar el stop en ese
+            # caso concreto -leer `reglas.stop_price` no mutaría el motor, y
+            # técnicamente sería seguro-, pero se descartó: distinguir esa
+            # causa de degradación de las demás (un fallo a media ejecución
+            # con una intención sin confirmar, donde SÍ sería peligroso
+            # tocar el motor) exigiría una señal nueva más allá de
+            # `degradada`, y un reintento automático silencioso contra un
+            # broker que ya falló cuatro veces seguidas (tres al colocar,
+            # una al cerrar) arriesga enmascarar un problema de fondo (claves
+            # inválidas, margen insuficiente, símbolo deslistado) que un
+            # humano tiene que ver -por eso ese camino termina en un
+            # `log.error` explícito en vez de un reintento silencioso.
+            return
         precio = precio_de(pos.symbol)
         if precio is None or precio <= 0:
             return  # sin precio observado no se evalúa nada este tick
