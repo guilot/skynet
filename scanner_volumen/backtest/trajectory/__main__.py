@@ -10,13 +10,13 @@ import argparse
 import sys
 from pathlib import Path
 
-from scanner_volumen.backtest.db import open_readonly
 from scanner_volumen.backtest.trajectory.loader import (
     load_transitions, make_candle_provider,
 )
 from scanner_volumen.backtest.trajectory.portfolio import run_trajectory
 from scanner_volumen.backtest.trajectory.report import format_trajectory_report
 from scanner_volumen.config import load_config
+from scanner_volumen.storage.db import open_readonly
 from scanner_volumen.storage.repos import CandleRepo, StateTransitionRepo
 from scanner_volumen.strategy.model import StrategyParams
 
