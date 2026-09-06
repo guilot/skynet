@@ -23,7 +23,7 @@ from scanner_volumen.strategy.model import StrategyParams
 class Broker(Protocol):
     async def abrir(
         self, *, symbol: str, direction: Direction, notional: float,
-        precio_mercado: float, ts: int, client_oid: str | None = None,
+        precio_mercado: float, ts: int, client_oid: str,
     ) -> OrdenEjecutada: ...
 
     async def cerrar(
@@ -46,11 +46,16 @@ class PaperBroker:
 
     async def abrir(
         self, *, symbol: str, direction: Direction, notional: float,
-        precio_mercado: float, ts: int, client_oid: str | None = None,
+        precio_mercado: float, ts: int, client_oid: str,
     ) -> OrdenEjecutada:
         """`client_oid` identifica la orden ante un exchange real (ver
-        `BotRunner._abrir`, que reserva la fila con él antes de llamar aquí);
-        el paper no habla con ningún exchange, así que lo acepta y lo ignora."""
+        `BotRunner._abrir`, que reserva la fila con él antes de llamar aquí).
+        Es obligatorio a propósito -no lleva valor por defecto-: un `Broker`
+        sin clave de idempotencia es exactamente el agujero que esta tarea
+        cierra, y dejarla opcional permitiría a un llamador futuro (la Fase
+        3, un test, código de reconciliación) mandar una orden real sin
+        ella. El `PaperBroker` no habla con ningún exchange, así que lo
+        acepta y lo ignora."""
         if precio_mercado <= 0:
             raise ValueError(
                 f"precio_mercado debe ser estrictamente positivo, recibido: {precio_mercado}"

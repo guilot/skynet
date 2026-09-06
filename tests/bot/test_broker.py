@@ -14,7 +14,8 @@ MIN = 60_000
 async def test_abrir_rellena_al_precio_de_mercado():
     broker = PaperBroker(StrategyParams(comision_taker=0.0))
     orden = await broker.abrir(symbol="A", direction=Direction.LONG,
-                               notional=400.0, precio_mercado=100.0, ts=MIN)
+                               notional=400.0, precio_mercado=100.0, ts=MIN,
+                               client_oid="oid-test")
     assert orden.precio == pytest.approx(100.0)
     assert orden.cantidad == pytest.approx(4.0)   # 400 / 100
     assert orden.ts == MIN
@@ -23,7 +24,8 @@ async def test_abrir_rellena_al_precio_de_mercado():
 async def test_abrir_cobra_comision_sobre_el_nocional():
     broker = PaperBroker(StrategyParams(comision_taker=0.0006))
     orden = await broker.abrir(symbol="A", direction=Direction.LONG,
-                               notional=400.0, precio_mercado=100.0, ts=0)
+                               notional=400.0, precio_mercado=100.0, ts=0,
+                               client_oid="oid-test")
     assert orden.comision == pytest.approx(0.24)  # 0.0006 * 400
 
 
@@ -48,7 +50,8 @@ async def test_rechaza_precio_no_positivo(metodo, precio):
     with pytest.raises(ValueError, match="precio_mercado debe ser estrictamente positivo"):
         if metodo == "abrir":
             await broker.abrir(symbol="A", direction=Direction.LONG,
-                               notional=400.0, precio_mercado=precio, ts=MIN)
+                               notional=400.0, precio_mercado=precio, ts=MIN,
+                               client_oid="oid-test")
         else:
             await broker.cerrar(symbol="A", direction=Direction.LONG,
                                 cantidad=2.0, precio_mercado=precio, ts=MIN)

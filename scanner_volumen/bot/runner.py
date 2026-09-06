@@ -129,17 +129,28 @@ class BotRunner:
 
         # (2) evaluar entradas nuevas
         for t in transiciones:
-            if not es_entrada(t):
-                continue
-            if t.price is None or t.price <= 0:
-                # sin precio de señal (símbolo sin vela en curso) no hay con
-                # qué abrir: `repo.abrir` exige `entry_price_senal NOT NULL`.
-                continue
-            precio = precio_de(t.symbol)
-            if precio is None or precio <= 0:
-                continue  # sin precio observado no se entra; no es un descarte
-            if self.portfolio.evaluar_entrada(t, set(self.abiertas), precio) is None:
-                await self._abrir(t, precio, ahora)
+            try:
+                if not es_entrada(t):
+                    continue
+                if t.price is None or t.price <= 0:
+                    # sin precio de señal (símbolo sin vela en curso) no hay
+                    # con qué abrir: `repo.abrir` exige `entry_price_senal
+                    # NOT NULL`.
+                    continue
+                precio = precio_de(t.symbol)
+                if precio is None or precio <= 0:
+                    continue  # sin precio observado no se entra; no es un descarte
+                if self.portfolio.evaluar_entrada(t, set(self.abiertas), precio) is None:
+                    await self._abrir(t, precio, ahora)
+            except Exception:
+                # aislar el fallo a esta entrada: si `broker.abrir` revienta
+                # (orden rechazada, timeout de red) no debe llevarse por
+                # delante las entradas de los demás símbolos de este tick.
+                # `_abrir` ya reservó la fila con `confirmada=False` antes de
+                # llamar al broker (ver `bot.repo`), así que ese fallo deja
+                # exactamente la huella que la reconciliación (Task 8) sabe
+                # leer -no hace falta limpiar nada aquí-.
+                log.exception("bot: fallo al abrir %s; se descarta esta entrada", t.symbol)
 
     # --- entradas ---
 
