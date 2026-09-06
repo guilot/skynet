@@ -204,6 +204,27 @@ async def test_paso_evaluador_no_propaga_un_fallo_de_evaluate(orq, monkeypatch):
     await paso_evaluador(orq, orq.bootstrapper, ahora=14 * DIA)  # no lanza
 
 
+async def test_paso_evaluador_pasa_las_transiciones_al_bot(orq):
+    """Con `bot` distinto de `None`, `paso_evaluador` le pasa
+    `orq.transiciones_evaluadas` -no el valor de retorno de `evaluate`, que
+    no lleva precio ni dirección- junto con la función de precio y el
+    `ahora` del tick. Con `bot=None` (el valor por defecto, `bot.enabled =
+    false` en config.toml) el comportamiento sigue siendo el de los tests de
+    arriba, que no pasan `bot` y siguen pasando sin cambios."""
+    class BotFalso:
+        def __init__(self):
+            self.recibido = None
+
+        async def on_tick(self, transiciones, precio_de, ahora):
+            self.recibido = (list(transiciones), ahora)
+
+    bot = BotFalso()
+    await paso_evaluador(orq, orq.bootstrapper, ahora=123, bot=bot)
+
+    assert bot.recibido is not None
+    assert bot.recibido[1] == 123
+
+
 async def test_paso_mantenimiento_delega_en_run_maintenance(orq, maintenance_repo):
     base = 14 * DIA
     await orq.ensure_profile("AAAUSDT", now_ms=base)
