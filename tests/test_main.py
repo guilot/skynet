@@ -27,7 +27,8 @@ from scanner_volumen.app.state import ScannerState
 from scanner_volumen.bitget.ws import WsEvent
 from scanner_volumen.config import load_config
 from scanner_volumen.engine.profile import build_profile
-from scanner_volumen.models import Candle, Contract, Ticker
+from scanner_volumen.models import Candle, Contract, Direction, Ticker
+from scanner_volumen.scoring.score import ScoreBreakdown
 from scanner_volumen.storage.db import open_db
 from scanner_volumen.storage.repos import (
     CandleRepo, MaintenanceRepo, ProfileRepo, SignalRepo, StateTransitionRepo,
@@ -204,25 +205,57 @@ async def test_paso_evaluador_no_propaga_un_fallo_de_evaluate(orq, monkeypatch):
     await paso_evaluador(orq, orq.bootstrapper, ahora=14 * DIA)  # no lanza
 
 
-async def test_paso_evaluador_pasa_las_transiciones_al_bot(orq):
+async def test_paso_evaluador_pasa_las_transiciones_al_bot(orq, monkeypatch):
     """Con `bot` distinto de `None`, `paso_evaluador` le pasa
-    `orq.transiciones_evaluadas` -no el valor de retorno de `evaluate`, que
-    no lleva precio ni dirección- junto con la función de precio y el
-    `ahora` del tick. Con `bot=None` (el valor por defecto, `bot.enabled =
-    false` en config.toml) el comportamiento sigue siendo el de los tests de
-    arriba, que no pasan `bot` y siguen pasando sin cambios."""
+    `orq.transiciones_evaluadas` -no el valor de retorno de `evaluate()`,
+    que es una lista de `Transition` sin precio ni dirección, con la que el
+    bot no podría operar- junto con la función de precio y el `ahora` del
+    tick.
+
+    Se fuerza una transición NORMAL -> WATCH real (mismo doble de
+    `score_symbol` que usa `tests/app/test_orchestrator.py`) para poder
+    comprobar el CONTENIDO de lo recibido, no solo que se recibió algo: con
+    el fixture `orq` sin ese doble no habría ningún símbolo sucio y tanto
+    `orq.transiciones_evaluadas` como el retorno de `evaluate()` serían
+    listas vacías -en ese caso el test pasaría igual aunque `__main__.py`
+    le entregara al bot el retorno crudo de `evaluate()`, que es justo el
+    cableado incorrecto que esta prueba existe para cazar."""
+    base = 14 * DIA
+    await orq.ensure_profile("AAAUSDT", now_ms=base)
+    orq.set_ticker(Ticker("AAAUSDT", 100.0, 1.0, 5e6, 100.0, 0.0001, ts=base))
+
+    def score_falso(metrics, cfg):
+        return ScoreBreakdown(total=55.0, raw_total=55.0, momentum=55.0,
+                              demand=0.0, structure=0.0,
+                              direction=Direction.LONG, components={})
+
+    monkeypatch.setattr("scanner_volumen.app.orchestrator.score_symbol", score_falso)
+    await orq.handle_ws_event(
+        WsEvent(kind="update", symbol="AAAUSDT", candles=[vela(base)])
+    )
+
     class BotFalso:
         def __init__(self):
             self.recibido = None
 
         async def on_tick(self, transiciones, precio_de, ahora):
-            self.recibido = (list(transiciones), ahora)
+            # sin copiar: se comprueba más abajo que es el MISMO objeto que
+            # `orq.transiciones_evaluadas`, no una lista distinta con el
+            # mismo contenido.
+            self.recibido = (transiciones, ahora)
 
     bot = BotFalso()
-    await paso_evaluador(orq, orq.bootstrapper, ahora=123, bot=bot)
+    await paso_evaluador(orq, orq.bootstrapper, ahora=base + 59_000, bot=bot)
 
     assert bot.recibido is not None
-    assert bot.recibido[1] == 123
+    assert bot.recibido[1] == base + 59_000
+    recibidas = bot.recibido[0]
+    assert recibidas is orq.transiciones_evaluadas  # exactamente esa lista
+    assert len(recibidas) == 1  # la transición NORMAL -> WATCH forzada arriba
+    assert recibidas[0].prev_state.name == "NORMAL"
+    assert recibidas[0].new_state.name == "WATCH"
+    assert recibidas[0].price is not None  # enriquecida: Transition no la lleva
+    assert recibidas[0].direction is not None  # enriquecida: Transition no la lleva
 
 
 async def test_paso_mantenimiento_delega_en_run_maintenance(orq, maintenance_repo):
