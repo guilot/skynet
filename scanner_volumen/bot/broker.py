@@ -23,7 +23,7 @@ from scanner_volumen.strategy.model import StrategyParams
 class Broker(Protocol):
     async def abrir(
         self, *, symbol: str, direction: Direction, notional: float,
-        precio_mercado: float, ts: int,
+        precio_mercado: float, ts: int, client_oid: str | None = None,
     ) -> OrdenEjecutada: ...
 
     async def cerrar(
@@ -46,8 +46,11 @@ class PaperBroker:
 
     async def abrir(
         self, *, symbol: str, direction: Direction, notional: float,
-        precio_mercado: float, ts: int,
+        precio_mercado: float, ts: int, client_oid: str | None = None,
     ) -> OrdenEjecutada:
+        """`client_oid` identifica la orden ante un exchange real (ver
+        `BotRunner._abrir`, que reserva la fila con él antes de llamar aquí);
+        el paper no habla con ningún exchange, así que lo acepta y lo ignora."""
         if precio_mercado <= 0:
             raise ValueError(
                 f"precio_mercado debe ser estrictamente positivo, recibido: {precio_mercado}"

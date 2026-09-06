@@ -296,7 +296,8 @@ class _BrokerParcial:
         self.veces_parcial = veces_parcial
         self.cierres = []
 
-    async def abrir(self, *, symbol, direction, notional, precio_mercado, ts):
+    async def abrir(self, *, symbol, direction, notional, precio_mercado, ts,
+                    client_oid=None):
         return OrdenEjecutada(ts=ts, precio=precio_mercado,
                               cantidad=notional / precio_mercado, comision=0.0)
 
@@ -348,4 +349,35 @@ async def test_si_el_resto_no_se_completa_la_posicion_queda_degradada(tmp_path):
     # no se descuadra el motor en silencio: se marca y se deja para el arranque
     assert "A" in runner.abiertas
     assert runner.abiertas["A"].degradada is True
+    conn.close()
+
+
+async def test_la_fila_se_reserva_antes_de_mandar_la_orden(tmp_path):
+    """Si el proceso muere entre la orden y el registro, la posicion queda
+    huerfana en el exchange. Reservando la fila ANTES, con su client_oid, la
+    reconciliacion puede reconocerla como propia."""
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn); repo.set_equity_inicial("paper", 1000.0)
+    cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    params = StrategyParams(comision_taker=0.0)
+    vistas = {}
+
+    class _BrokerQueMiraLaBase:
+        async def abrir(self, *, symbol, direction, notional, precio_mercado,
+                        ts, client_oid):
+            # en el momento de mandar la orden, la fila ya tiene que existir
+            vistas["fila"] = repo.por_client_oid("paper", client_oid)
+            return OrdenEjecutada(ts=ts, precio=precio_mercado,
+                                  cantidad=notional / precio_mercado, comision=0.0)
+
+        async def cerrar(self, **kw):
+            raise AssertionError("no deberia cerrarse")
+
+    runner = BotRunner(params, cfg, repo, _BrokerQueMiraLaBase(),
+                       LivePortfolio(params, cfg, repo))
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+
+    assert vistas["fila"] is not None, "la fila no existia al mandar la orden"
+    assert vistas["fila"]["symbol"] == "A"
     conn.close()

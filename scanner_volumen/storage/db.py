@@ -156,10 +156,13 @@ CREATE TABLE IF NOT EXISTS bot_posiciones (
     pnl REAL,
     fees REAL,
     max_rank INTEGER,
-    degradada INTEGER NOT NULL DEFAULT 0
+    degradada INTEGER NOT NULL DEFAULT 0,
+    client_oid TEXT,
+    confirmada INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX IF NOT EXISTS idx_bot_pos_abierta ON bot_posiciones(modo, abierta);
+CREATE INDEX IF NOT EXISTS idx_bot_pos_client_oid ON bot_posiciones(modo, client_oid);
 
 CREATE TABLE IF NOT EXISTS bot_fills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -202,7 +205,7 @@ CREATE TABLE IF NOT EXISTS bot_contadores (
 # tocar porque ya existe. `PRAGMA user_version` es el mecanismo nativo de
 # SQLite para esto -entero simple embebido en el propio fichero, sin tabla
 # adicional que crear ni de la que depender antes de tener esquema-.
-VERSION_ESQUEMA = 5
+VERSION_ESQUEMA = 6
 
 
 def _migrar(conn: sqlite3.Connection) -> None:
@@ -235,6 +238,8 @@ def _migrar(conn: sqlite3.Connection) -> None:
         _migrar_v4_bot_tablas(conn)
     if version_actual < 5:
         _migrar_v5_informe_bot(conn)
+    if version_actual < 6:
+        _migrar_v6_client_oid(conn)
     if version_actual < VERSION_ESQUEMA:
         conn.execute(f"PRAGMA user_version = {VERSION_ESQUEMA}")
         conn.commit()
@@ -362,6 +367,49 @@ def _migrar_v5_informe_bot(conn: sqlite3.Connection) -> None:
     columnas_fills = {f["name"] for f in conn.execute("PRAGMA table_info(bot_fills)")}
     if columnas_fills and "precio_regla" not in columnas_fills:
         conn.execute("ALTER TABLE bot_fills ADD COLUMN precio_regla REAL")
+    conn.commit()
+
+
+def _migrar_v6_client_oid(conn: sqlite3.Connection) -> None:
+    """Añade a `bot_posiciones`, ya existente, la clave de idempotencia de la
+    apertura: hoy se manda la orden al broker y DESPUÉS se escribe la fila; si
+    el proceso muere entre ambas cosas, la posición queda abierta en el
+    exchange sin ningún registro local, y la reconciliación (Task 8) la
+    trataría como ajena. A partir de esta migración, `BotRunner._abrir` invierte
+    el orden: genera un `client_oid`, reserva la fila con él ANTES de mandar la
+    orden, y la confirma al recibir la respuesta.
+
+    Lo natural sería reservar la fila con `entry_price` vacío y rellenarlo al
+    confirmar. No se puede: esa columna es `NOT NULL` y SQLite no permite
+    retirar esa restricción con un `ALTER TABLE` -habría que reconstruir la
+    tabla entera, con el riesgo que eso tiene sobre una base de producción que
+    ya lleva datos-. En su lugar, la fila se reserva con el precio de la señal
+    como valor provisional en `entry_price` y `confirmada = 0`; al llegar la
+    respuesta del broker se sobrescribe con el precio ejecutado (y el tamaño
+    real) y se marca `confirmada = 1` (ver `BotRepo.confirmar_apertura`).
+
+    `confirmada = 0` significa exactamente "orden mandada, resultado
+    desconocido": es la huella que deja un proceso que murió entre mandar la
+    orden y registrar su resultado, y es lo que Task 8 tiene que saber leer
+    (ver `BotRepo.reservadas_sin_confirmar`). `ALTER TABLE ... ADD COLUMN ...
+    NOT NULL` exige un `DEFAULT` en SQLite; se usa `1` porque toda fila ya
+    existente antes de esta migración corresponde a una posición cuyo
+    resultado ya se conocía al escribirla (el código anterior escribía la
+    fila con el precio ejecutado en la mano), así que queda confirmada sin
+    tocarla. `client_oid` es nullable: no hay ningún valor de relleno con
+    sentido para una fila ya escrita antes de que este concepto existiera.
+
+    El índice `(modo, client_oid)` vive en `ESQUEMA` (`idx_bot_pos_client_oid`),
+    no aquí: `CREATE INDEX IF NOT EXISTS` no toca ninguna columna de una tabla
+    ya existente, así que es seguro que lo cree siempre `open_db`, igual que
+    el resto de índices del esquema."""
+    columnas = {f["name"] for f in conn.execute("PRAGMA table_info(bot_posiciones)")}
+    if columnas and "client_oid" not in columnas:
+        conn.execute("ALTER TABLE bot_posiciones ADD COLUMN client_oid TEXT")
+    if columnas and "confirmada" not in columnas:
+        conn.execute(
+            "ALTER TABLE bot_posiciones ADD COLUMN confirmada INTEGER NOT NULL DEFAULT 1"
+        )
     conn.commit()
 
 

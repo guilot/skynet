@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from uuid import uuid4
 
 from scanner_volumen.bot.broker import Broker
 from scanner_volumen.bot.model import PosicionAbierta
@@ -145,14 +146,28 @@ class BotRunner:
     async def _abrir(self, t: TransitionRow, precio: float, ahora: int) -> None:
         margin = self.portfolio.margen()
         notional = margin * self._params.apalancamiento
-        orden = await self._broker.abrir(
-            symbol=t.symbol, direction=t.direction, notional=notional,
-            precio_mercado=precio, ts=ahora,
-        )
+        # Orden invertido a propósito (ver módulo `bot.repo`): se genera el
+        # client_oid y se RESERVA la fila antes de mandar la orden. Si el
+        # proceso muere justo después de que el broker acepte la orden, sin
+        # esta reserva la posición queda abierta en el exchange sin ningún
+        # registro local, y la reconciliación (Task 8) la trataría como
+        # ajena. `entry_price`/`size` son provisionales -el precio de la
+        # señal y el nocional a ese precio, porque ambas columnas son `NOT
+        # NULL`- y se sobrescriben con el resultado real en
+        # `confirmar_apertura`, más abajo.
+        client_oid = f"bot-{uuid4().hex}"
         posicion_id = self._repo.abrir(
             modo=self._cfg.modo, symbol=t.symbol, direction=t.direction,
-            entry_ts=ahora, entry_price=orden.precio, entry_price_senal=t.price,
-            margin=margin, notional=notional, size=orden.cantidad,
+            entry_ts=ahora, entry_price=t.price, entry_price_senal=t.price,
+            margin=margin, notional=notional, size=notional / t.price,
+            fee_entrada=0.0, client_oid=client_oid, confirmada=False,
+        )
+        orden = await self._broker.abrir(
+            symbol=t.symbol, direction=t.direction, notional=notional,
+            precio_mercado=precio, ts=ahora, client_oid=client_oid,
+        )
+        self._repo.confirmar_apertura(
+            posicion_id, entry_price=orden.precio, size=orden.cantidad,
             fee_entrada=orden.comision,
         )
         # el motor se ancla al precio EJECUTADO: el stop, el break-even y el

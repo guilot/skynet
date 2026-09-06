@@ -35,22 +35,79 @@ class BotRepo:
         self, *, modo: str, symbol: str, direction: Direction, entry_ts: int,
         entry_price: float, entry_price_senal: float, margin: float,
         notional: float, size: float, fee_entrada: float,
+        client_oid: str | None = None, confirmada: bool = True,
     ) -> int:
         """`fee_entrada` se guarda aparte porque la reconstrucción tras un
         reinicio (Task 7) necesita recomponer el PnL de una posición todavía
         abierta, y la comisión de entrada ya se pagó. Derivarla de los
         parámetros funcionaría en paper, donde es determinista, pero no en la
-        Fase 3, donde la cobra el exchange."""
+        Fase 3, donde la cobra el exchange.
+
+        `client_oid` identifica la orden ante el exchange: es lo que permite
+        a la reconciliación (Task 8) reconocer como propia una posición que
+        el bot mandó pero de la que un proceso muerto a medias no llegó a
+        registrar el resultado (ver `por_client_oid`).
+
+        `confirmada = 0` significa "orden mandada, resultado desconocido":
+        es exactamente la huella que deja ese proceso muerto a medias.
+        `BotRunner._abrir` reserva la fila con `confirmada=False` -y
+        `entry_price`/`size` provisionales, porque ambas columnas son `NOT
+        NULL`- ANTES de mandar la orden, y la cierra con
+        `confirmar_apertura` al recibir la respuesta del broker. El defecto
+        `True` mantiene el comportamiento de los llamadores (paper, tests)
+        que ya conocen el resultado real de la orden en el momento de
+        escribir la fila."""
         cur = self._conn.execute(
             "INSERT INTO bot_posiciones (modo, symbol, direction, entry_ts, "
             "entry_price, entry_price_senal, margin, notional, size, "
-            "fee_entrada, abierta) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            "fee_entrada, client_oid, confirmada, abierta) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
             (modo, symbol, direction.value, entry_ts, entry_price,
-             entry_price_senal, margin, notional, size, fee_entrada),
+             entry_price_senal, margin, notional, size, fee_entrada,
+             client_oid, 1 if confirmada else 0),
         )
         self._conn.commit()
         return int(cur.lastrowid)
+
+    def confirmar_apertura(
+        self, posicion_id: int, *, entry_price: float, size: float,
+        fee_entrada: float,
+    ) -> None:
+        """Cierra la reserva de `abrir(..., confirmada=False)` con el
+        resultado real de la orden: sobrescribe el precio de entrada y el
+        tamaño provisionales (los de la señal) con los que devolvió el
+        broker, y marca `confirmada = 1`."""
+        self._conn.execute(
+            "UPDATE bot_posiciones SET entry_price = ?, size = ?, "
+            "fee_entrada = ?, confirmada = 1 WHERE id = ?",
+            (entry_price, size, fee_entrada, posicion_id),
+        )
+        self._conn.commit()
+
+    def por_client_oid(self, modo: str, client_oid: str) -> dict | None:
+        """La fila reservada con este `client_oid`, dentro de `modo`, o
+        `None` si no existe. Task 8 la usa para reconocer como propia una
+        posición que aparece en el exchange y no en `abiertas()` -el caso
+        exacto de un proceso que murió tras mandar la orden pero antes de
+        confirmar la fila."""
+        fila = self._conn.execute(
+            "SELECT * FROM bot_posiciones WHERE modo = ? AND client_oid = ?",
+            (modo, client_oid),
+        ).fetchone()
+        return dict(fila) if fila is not None else None
+
+    def reservadas_sin_confirmar(self, modo: str) -> list[dict]:
+        """Filas con `confirmada = 0`: la huella de un proceso que murió
+        entre mandar la orden y registrar su resultado. Task 8 las usa en la
+        reconciliación de arranque para decidir si la orden llegó a
+        ejecutarse en el exchange (y entonces hay que completarlas) o no (y
+        entonces se descartan)."""
+        filas = self._conn.execute(
+            "SELECT * FROM bot_posiciones WHERE modo = ? AND confirmada = 0 "
+            "ORDER BY entry_ts, id",
+            (modo,),
+        ).fetchall()
+        return [dict(f) for f in filas]
 
     def cerrar(
         self, posicion_id: int, *, close_ts: int, pnl: float, fees: float,
