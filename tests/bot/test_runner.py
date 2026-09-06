@@ -1,6 +1,6 @@
 import pytest
 
-from scanner_volumen.bot.broker import PaperBroker
+from scanner_volumen.bot.broker import PaperBroker, StopVivo
 from scanner_volumen.bot.model import OrdenEjecutada
 from scanner_volumen.bot.portfolio import LivePortfolio
 from scanner_volumen.bot.repo import BotRepo
@@ -146,7 +146,12 @@ async def test_pnl_short_con_precio_a_favor_es_exacto(bot):
 
 class _BrokerQueFallaAlCerrar:
     """Doble de prueba: abre normal pero revienta al cerrar, como simularia
-    un timeout de red o cualquier otro fallo de la Fase 3 contra el exchange."""
+    un timeout de red o cualquier otro fallo de la Fase 3 contra el exchange.
+
+    Delega el ciclo del stop en el `PaperBroker` interno -no es lo que este
+    doble prueba- para que el nuevo cableado del stop en el runner (colocar
+    al abrir, cancelar al cerrar) no le impida seguir comprobando lo que
+    prueba de verdad: que un fallo al cerrar no revienta el tick."""
 
     def __init__(self, params: StrategyParams) -> None:
         self._interno = PaperBroker(params)
@@ -156,6 +161,15 @@ class _BrokerQueFallaAlCerrar:
 
     async def cerrar(self, **kwargs):
         raise RuntimeError("fallo de red simulado")
+
+    async def colocar_stop(self, **kwargs):
+        return await self._interno.colocar_stop(**kwargs)
+
+    async def mover_stop(self, **kwargs):
+        return await self._interno.mover_stop(**kwargs)
+
+    async def cancelar_stop(self, **kwargs):
+        await self._interno.cancelar_stop(**kwargs)
 
 
 async def test_fallo_del_broker_al_cerrar_degrada_la_posicion_sin_reventar(tmp_path):
@@ -288,10 +302,15 @@ async def test_los_contadores_del_informe_se_persisten(bot):
 
 
 class _BrokerParcial:
-    """Cierra solo una parte de lo pedido, las veces que se le diga."""
+    """Cierra solo una parte de lo pedido, las veces que se le diga.
+
+    El ciclo del stop no es lo que este doble prueba (los fills parciales al
+    cerrar), así que delega colocar/mover/cancelar en un `PaperBroker`
+    interno para que el nuevo cableado en el runner no le afecte."""
 
     def __init__(self, params, fraccion_servida=0.5, veces_parcial=99):
         self._params = params
+        self._interno = PaperBroker(params)
         self.fraccion_servida = fraccion_servida
         self.veces_parcial = veces_parcial
         self.cierres = []
@@ -309,6 +328,15 @@ class _BrokerParcial:
             servida = cantidad
         return OrdenEjecutada(ts=ts, precio=precio_mercado, cantidad=servida,
                               comision=0.0)
+
+    async def colocar_stop(self, **kwargs):
+        return await self._interno.colocar_stop(**kwargs)
+
+    async def mover_stop(self, **kwargs):
+        return await self._interno.mover_stop(**kwargs)
+
+    async def cancelar_stop(self, **kwargs):
+        await self._interno.cancelar_stop(**kwargs)
 
 
 async def test_un_fill_parcial_se_reintenta_hasta_completarse(tmp_path):
@@ -374,6 +402,16 @@ async def test_la_fila_se_reserva_antes_de_mandar_la_orden(tmp_path):
         async def cerrar(self, **kw):
             raise AssertionError("no deberia cerrarse")
 
+        async def colocar_stop(self, **kw):
+            # no es lo que este test comprueba: basta con no reventar
+            return "stop-fake"
+
+        async def mover_stop(self, **kw):
+            return "stop-fake"
+
+        async def cancelar_stop(self, **kw):
+            return None
+
     runner = BotRunner(params, cfg, repo, _BrokerQueMiraLaBase(),
                        LivePortfolio(params, cfg, repo))
     await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
@@ -381,3 +419,183 @@ async def test_la_fila_se_reserva_antes_de_mandar_la_orden(tmp_path):
     assert vistas["fila"] is not None, "la fila no existia al mandar la orden"
     assert vistas["fila"]["symbol"] == "A"
     conn.close()
+
+
+# --- Task 7: el ciclo del stop en el exchange ---
+
+class _BrokerConRegistroDeStops:
+    """Envuelve un `PaperBroker` real -para que el ciclo de vida del stop se
+    comporte como en producción, incluida la validación de `mover_stop`- pero
+    además anota cada llamada, que es lo que estos tests necesitan verificar."""
+
+    def __init__(self, params: StrategyParams) -> None:
+        self._interno = PaperBroker(params)
+        self.stops_colocados: list[StopVivo] = []
+        self.stops_movidos: list[StopVivo] = []
+        self.stops_cancelados: list[str] = []
+
+    async def abrir(self, **kwargs):
+        return await self._interno.abrir(**kwargs)
+
+    async def cerrar(self, **kwargs):
+        return await self._interno.cerrar(**kwargs)
+
+    async def colocar_stop(self, *, symbol, direction, cantidad, precio_disparo,
+                           client_oid):
+        stop_id = await self._interno.colocar_stop(
+            symbol=symbol, direction=direction, cantidad=cantidad,
+            precio_disparo=precio_disparo, client_oid=client_oid,
+        )
+        self.stops_colocados.append(StopVivo(
+            stop_id=stop_id, symbol=symbol, precio_disparo=precio_disparo,
+            cantidad=cantidad,
+        ))
+        return stop_id
+
+    async def mover_stop(self, *, symbol, stop_id, precio_disparo):
+        nuevo_id = await self._interno.mover_stop(
+            symbol=symbol, stop_id=stop_id, precio_disparo=precio_disparo,
+        )
+        self.stops_movidos.append(StopVivo(
+            stop_id=nuevo_id, symbol=symbol, precio_disparo=precio_disparo,
+            cantidad=0.0,
+        ))
+        return nuevo_id
+
+    async def cancelar_stop(self, *, symbol, stop_id):
+        await self._interno.cancelar_stop(symbol=symbol, stop_id=stop_id)
+        self.stops_cancelados.append(stop_id)
+
+
+def _runner_con_registro_de_stops(repo, cfg, params):
+    broker = _BrokerConRegistroDeStops(params)
+    runner = BotRunner(params, cfg, repo, broker, LivePortfolio(params, cfg, repo))
+    return runner, broker
+
+
+async def test_al_abrir_se_coloca_un_stop_en_el_nivel_de_la_regla(tmp_path):
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn); repo.set_equity_inicial("paper", 1000.0)
+    cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    params = StrategyParams(comision_taker=0.0)
+    runner, broker = _runner_con_registro_de_stops(repo, cfg, params)
+
+    # entrada LONG a 100 -> stop en 97.5 (stop_pct = 0.025 por defecto)
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+
+    assert broker.stops_colocados[-1].precio_disparo == pytest.approx(97.5)
+    pos = runner.abiertas["A"]
+    assert pos.stop_id == broker.stops_colocados[-1].stop_id
+    # y queda persistido, no solo en el objeto en RAM
+    assert repo.abiertas("paper")[0]["stop_id"] == pos.stop_id
+    conn.close()
+
+
+async def test_una_parcial_en_beneficio_mueve_el_stop_a_break_even(tmp_path):
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn); repo.set_equity_inicial("paper", 1000.0)
+    cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    params = StrategyParams(comision_taker=0.0)
+    runner, broker = _runner_con_registro_de_stops(repo, cfg, params)
+
+    await runner.on_tick([tr(new=State.WATCH)], precios({"A": 100.0}), ahora=0)
+    stop_inicial_id = broker.stops_colocados[-1].stop_id
+    # tramo HOT en beneficio (110 > 100 de entrada): la regla sube el stop a
+    # break-even (reglas.stop_en_be pasa a True) y el del exchange debe
+    # moverse al precio de entrada
+    await runner.on_tick(
+        [tr(ts=MIN, prev=State.WATCH, new=State.HOT, price=110.0)],
+        precios({"A": 110.0}), ahora=MIN)
+
+    pos = runner.abiertas["A"]
+    assert pos.reglas.stop_en_be is True
+    assert broker.stops_movidos[-1].precio_disparo == pytest.approx(100.0)
+    # el stop_id cambia -mover es cancelar y colocar de nuevo- y el nuevo
+    # valor queda persistido
+    assert pos.stop_id == broker.stops_movidos[-1].stop_id
+    assert pos.stop_id != stop_inicial_id
+    assert repo.abiertas("paper")[0]["stop_id"] == pos.stop_id
+    conn.close()
+
+
+async def test_al_cerrar_se_cancela_el_stop(tmp_path):
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn); repo.set_equity_inicial("paper", 1000.0)
+    cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    params = StrategyParams(comision_taker=0.0)
+    runner, broker = _runner_con_registro_de_stops(repo, cfg, params)
+
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+    sid = broker.stops_colocados[-1].stop_id
+    # cae por debajo del stop (97.5): la regla cierra la posicion entera
+    await runner.on_tick([], precios({"A": 97.0}), ahora=MIN)
+
+    assert runner.abiertas == {}
+    assert broker.stops_cancelados == [sid]
+    conn.close()
+
+
+class _BrokerQueFallaAlColocarStop:
+    """Nunca consigue colocar el stop: simula que el exchange rechaza la
+    orden o que la red falla las tres veces. `mover_stop`/`cancelar_stop` no
+    deberian llegar a llamarse -el stop nunca llego a existir-."""
+
+    def __init__(self, params: StrategyParams) -> None:
+        self._interno = PaperBroker(params)
+        self.intentos_colocar = 0
+
+    async def abrir(self, **kwargs):
+        return await self._interno.abrir(**kwargs)
+
+    async def cerrar(self, **kwargs):
+        return await self._interno.cerrar(**kwargs)
+
+    async def colocar_stop(self, **kwargs):
+        self.intentos_colocar += 1
+        raise RuntimeError("fallo simulado al colocar el stop")
+
+    async def mover_stop(self, **kwargs):
+        raise AssertionError("no deberia llamarse: el stop nunca se coloco")
+
+    async def cancelar_stop(self, **kwargs):
+        raise AssertionError("no deberia llamarse: el stop nunca se coloco")
+
+
+async def test_si_no_se_puede_colocar_el_stop_se_cierra_la_posicion(tmp_path):
+    # una posicion apalancada sin red es peor que una perdida pequena
+    # realizada: si colocar el stop falla incluso tras reintentar, la
+    # posicion se cierra a mercado en el acto.
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn); repo.set_equity_inicial("paper", 1000.0)
+    cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    params = StrategyParams(comision_taker=0.0)
+    broker = _BrokerQueFallaAlColocarStop(params)
+    runner = BotRunner(params, cfg, repo, broker, LivePortfolio(params, cfg, repo))
+
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+
+    assert runner.abiertas == {}
+    cerradas = repo.cerradas("paper")
+    assert len(cerradas) == 1
+    assert cerradas[0]["symbol"] == "A"
+    conn.close()
+
+
+async def test_colocar_stop_se_reintenta_dos_veces_antes_de_cerrar(tmp_path):
+    # documenta la politica de reintentos: intento inicial + 2 reintentos =
+    # 3 intentos en total antes de rendirse.
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn); repo.set_equity_inicial("paper", 1000.0)
+    cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    params = StrategyParams(comision_taker=0.0)
+    broker = _BrokerQueFallaAlColocarStop(params)
+    runner = BotRunner(params, cfg, repo, broker, LivePortfolio(params, cfg, repo))
+
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+
+    assert broker.intentos_colocar == 3

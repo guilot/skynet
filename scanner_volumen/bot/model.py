@@ -44,6 +44,21 @@ class PosicionAbierta:
     # abierta en la base de datos (`abierta = 1`); es la reconstrucción al
     # reiniciar (Task 7) la que la recupera, no este proceso en caliente.
     degradada: bool = False
+    # Identificador del stop vigente en el exchange (o su simulacro en
+    # paper), o `None` si todavía no se ha colocado ninguno -o si el intento
+    # de colocarlo agotó los reintentos y la posición se cerró a mercado
+    # antes de que existiera-. `mover_stop` lo sustituye por uno nuevo cada
+    # vez que se mueve (en un exchange real mover un stop es cancelar el
+    # viejo y colocar otro, ver `bot.broker`), así que este campo siempre
+    # apunta al stop realmente vivo, no al primero que se colocó.
+    stop_id: str | None = None
+    # El nivel de `reglas.stop_price` en el momento en que `stop_id` se
+    # colocó o se movió por última vez. El runner lo compara en cada tick
+    # contra `reglas.stop_price` para detectar que la regla movió el stop
+    # (hoy, únicamente la subida a break-even) y reflejarlo en el exchange;
+    # sin guardarlo aquí no habría forma de distinguir "la regla lo movió
+    # este tick" de "sigue igual que siempre".
+    stop_price_colocado: float | None = None
 
 
 # Etiquetas de descarte del bot, en el orden en que se imprimen. Coinciden con

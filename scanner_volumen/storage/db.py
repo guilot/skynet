@@ -158,7 +158,8 @@ CREATE TABLE IF NOT EXISTS bot_posiciones (
     max_rank INTEGER,
     degradada INTEGER NOT NULL DEFAULT 0,
     client_oid TEXT,
-    confirmada INTEGER NOT NULL DEFAULT 1
+    confirmada INTEGER NOT NULL DEFAULT 1,
+    stop_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_bot_pos_abierta ON bot_posiciones(modo, abierta);
@@ -205,7 +206,7 @@ CREATE TABLE IF NOT EXISTS bot_contadores (
 # tocar porque ya existe. `PRAGMA user_version` es el mecanismo nativo de
 # SQLite para esto -entero simple embebido en el propio fichero, sin tabla
 # adicional que crear ni de la que depender antes de tener esquema-.
-VERSION_ESQUEMA = 6
+VERSION_ESQUEMA = 7
 
 
 def _migrar(conn: sqlite3.Connection) -> None:
@@ -240,6 +241,8 @@ def _migrar(conn: sqlite3.Connection) -> None:
         _migrar_v5_informe_bot(conn)
     if version_actual < 6:
         _migrar_v6_client_oid(conn)
+    if version_actual < 7:
+        _migrar_v7_stop_id(conn)
     if version_actual < VERSION_ESQUEMA:
         conn.execute(f"PRAGMA user_version = {VERSION_ESQUEMA}")
         conn.commit()
@@ -410,6 +413,31 @@ def _migrar_v6_client_oid(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE bot_posiciones ADD COLUMN confirmada INTEGER NOT NULL DEFAULT 1"
         )
+    conn.commit()
+
+
+def _migrar_v7_stop_id(conn: sqlite3.Connection) -> None:
+    """Añade a `bot_posiciones`, ya existente, el identificador del stop
+    vigente en el exchange: hasta esta migración nadie lo colocaba, así que
+    la Task 7 empieza a cablear el ciclo (colocar al abrir, mover a
+    break-even, cancelar al cerrar) y necesita dónde persistirlo -sin esto,
+    un reinicio del bot perdería el `stop_id` de toda posición que siguiera
+    abierta y no podría cancelarlo ni moverlo nunca más.
+
+    `ALTER TABLE ... ADD COLUMN` no exige `DEFAULT` para una columna
+    nullable, y `stop_id` lo es: no hay ningún valor de relleno con sentido
+    para una fila abierta antes de que este concepto existiera -esas
+    posiciones, si siguen abiertas cuando se despliegue este código, se
+    quedan sin stop en el exchange hasta que el bot las gobierne de nuevo,
+    igual que ya les pasaba antes de esta tarea.
+
+    Guarda de `PRAGMA table_info`, mismo patrón que `_migrar_v6_client_oid`:
+    si la tabla no existe (base nueva) o si la columna ya está (un
+    `open_db` repetido, o una base creada por el `CREATE TABLE IF NOT
+    EXISTS` de `ESQUEMA`, que ya la incluye), no hay nada que hacer."""
+    columnas = {f["name"] for f in conn.execute("PRAGMA table_info(bot_posiciones)")}
+    if columnas and "stop_id" not in columnas:
+        conn.execute("ALTER TABLE bot_posiciones ADD COLUMN stop_id TEXT")
     conn.commit()
 
 

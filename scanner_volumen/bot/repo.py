@@ -131,6 +131,20 @@ class BotRepo:
         )
         self._conn.commit()
 
+    def fijar_stop_id(self, posicion_id: int, stop_id: str | None) -> None:
+        """Persiste el `stop_id` del stop vigente en el exchange para esta
+        posición: al colocarlo por primera vez y cada vez que se mueve (un
+        `stop_id` nuevo, porque mover un stop es cancelar el viejo y colocar
+        otro). Sin esto, un reinicio del bot perdería el identificador y no
+        podría ni moverlo ni cancelarlo nunca más -la garantía central de
+        esta fase (el stop sobrevive a una caída del proceso) no sirve de
+        nada si el proceso, al volver, no sabe cuál es."""
+        self._conn.execute(
+            "UPDATE bot_posiciones SET stop_id = ? WHERE id = ?",
+            (stop_id, posicion_id),
+        )
+        self._conn.commit()
+
     def abiertas(self, modo: str) -> list[dict]:
         filas = self._conn.execute(
             "SELECT * FROM bot_posiciones WHERE modo = ? AND abierta = 1 "

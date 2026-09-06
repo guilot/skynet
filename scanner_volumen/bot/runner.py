@@ -23,6 +23,14 @@ siguiente tick repetiría el `ValueError` de "intenciones sin confirmar" para
 siempre. El runner atrapa el fallo, marca la posición como `degradada` y deja
 de tocar su motor — pero la conserva en `abiertas`, ocupando su hueco, porque
 sigue realmente abierta en la base de datos.
+
+El stop en el exchange (Task 7) es la garantía central de la Fase 3: al
+confirmar la apertura se coloca en `reglas.stop_price`, se mueve cuando la
+regla lo sube a break-even, y se cancela al cerrar por cualquier motivo. El
+stop LOCAL (el que `PositionRules.on_candle` sigue evaluando en cada tick)
+no se desactiva por tener uno en el exchange -reacciona antes y cubre el
+caso de que la orden remota se haya cancelado sin que nos enteremos-; que
+ambos disparen no es un problema porque todos los cierres son reduce-only.
 """
 from __future__ import annotations
 
@@ -59,6 +67,15 @@ MAX_INTENTOS_CIERRE = 3
 # pequeño para cantidades típicas (1-100000 unidades) sin ser tan
 # estricto que rechace redondeos reales.
 TOLERANCIA_CANTIDAD = 1e-9
+
+# Intentos para colocar el stop en el exchange al confirmar una apertura:
+# el inicial más dos reintentos. Es la decisión de diseño central de esta
+# tarea -operar apalancado sin que el exchange tenga un stop puesto es
+# exactamente el riesgo que esta fase existe para eliminar: si el proceso
+# muere con la posición abierta, nada la protege-. Agotados los reintentos
+# se cierra la posición a mercado en el acto: una pérdida pequeña y
+# realizada es preferible a una posición apalancada sin ninguna red.
+MAX_INTENTOS_COLOCAR_STOP = 3
 
 
 def _precio_regla_de(
@@ -200,6 +217,71 @@ class BotRunner:
         )
         log.info("bot: abre %s %s a %.6g (senal %.6g), margen %.2f",
                  t.symbol, t.direction.value, orden.precio, t.price, margin)
+        # el stop del exchange es la garantía central de esta fase: si el
+        # proceso muere con la posición abierta, tiene que seguir protegida
+        # sin depender de que este código vuelva a arrancar.
+        await self._colocar_stop_inicial(self.abiertas[t.symbol], precio, ahora)
+
+    async def _colocar_stop_inicial(
+        self, pos: PosicionAbierta, precio: float, ahora: int,
+    ) -> None:
+        """Coloca en el exchange el stop que la regla ya calculó al abrir
+        (`pos.reglas.stop_price`), con la política de reintentos definida en
+        `MAX_INTENTOS_COLOCAR_STOP`. Si los agota, cierra la posición a
+        mercado: preferimos una pérdida pequeña y realizada a una posición
+        apalancada sin ninguna red que la proteja si el proceso muere.
+        """
+        precio_stop = pos.reglas.stop_price
+        for intento in range(1, MAX_INTENTOS_COLOCAR_STOP + 1):
+            try:
+                stop_id = await self._broker.colocar_stop(
+                    symbol=pos.symbol, direction=pos.direction,
+                    cantidad=pos.size, precio_disparo=precio_stop,
+                    client_oid=f"stop-{uuid4().hex}",
+                )
+            except Exception:
+                log.exception(
+                    "bot: fallo al colocar el stop de %s (intento %d/%d)",
+                    pos.symbol, intento, MAX_INTENTOS_COLOCAR_STOP,
+                )
+                continue
+            pos.stop_id = stop_id
+            pos.stop_price_colocado = precio_stop
+            self._repo.fijar_stop_id(pos.id, stop_id)
+            return
+
+        log.error(
+            "bot: no se pudo colocar el stop de %s tras %d intentos; se "
+            "cierra la posicion a mercado -una perdida pequena y realizada "
+            "es preferible a una posicion apalancada sin proteccion",
+            pos.symbol, MAX_INTENTOS_COLOCAR_STOP,
+        )
+        await self._cerrar_por_fallo_de_stop(pos, precio, ahora)
+
+    async def _cerrar_por_fallo_de_stop(
+        self, pos: PosicionAbierta, precio: float, ahora: int,
+    ) -> None:
+        """Cierra la posición entera a mercado porque no se pudo colocar su
+        stop en el exchange. No pasa por el motor de reglas -no hay ninguna
+        `ExitIntent` que confirmar; es una decisión operativa del runner
+        ante un fallo de infraestructura, no una salida que la estrategia
+        propusiera-, igual que el cierre por fin de datos del backtest.
+        Se registra como un fill de motivo STOP: en espíritu es exactamente
+        eso, un stop protegiendo la posición, solo que ejecutado a mercado
+        en vez de por una orden stop del exchange que no llegó a existir.
+        """
+        cantidad = pos.size * pos.reglas.restante
+        orden = await self._broker.cerrar(
+            symbol=pos.symbol, direction=pos.direction, cantidad=cantidad,
+            precio_mercado=precio, ts=ahora,
+        )
+        self._acumular_pnl(pos, orden.precio, pos.reglas.restante, orden.comision)
+        self._repo.registrar_fill(
+            pos.id, ts=ahora, reason=ExitReason.STOP, fraction=pos.reglas.restante,
+            precio_referencia=precio, precio=orden.precio, comision=orden.comision,
+            precio_regla=pos.reglas.stop_price,
+        )
+        await self._cerrar(pos, ahora)
 
     # --- reconstrucción tras un reinicio ---
 
@@ -243,13 +325,23 @@ class BotRunner:
             new_state=entrada.new_state, price=fila["entry_price"],
             direction=direccion, score=entrada.score,
         )
+        reglas = PositionRules(entrada_real, self._params)
         pos = PosicionAbierta(
             id=fila["id"], symbol=symbol, direction=direccion, entry_ts=entry_ts,
             entry_price=fila["entry_price"],
             entry_price_senal=fila["entry_price_senal"], margin=fila["margin"],
-            notional=fila["notional"], size=fila["size"],
-            reglas=PositionRules(entrada_real, self._params),
+            notional=fila["notional"], size=fila["size"], reglas=reglas,
             pnl_acumulado=-fila["fee_entrada"], fees_acumuladas=fila["fee_entrada"],
+            # el `stop_id` de antes del reinicio, si lo hay -una base migrada
+            # desde antes de esta tarea no tiene ninguno-. `stop_price_colocado`
+            # se ancla al nivel inicial, no al que tenga la regla tras la
+            # réplica que sigue abajo: si esa réplica confirma una parcial en
+            # beneficio, la regla sube a break-even DURANTE la réplica, y el
+            # primer `_avanzar` en caliente tiene que notar ese desajuste
+            # contra lo que de verdad hay puesto en el exchange y moverlo -que
+            # es exactamente el mismo mecanismo que usa un tick normal, no uno
+            # especial para el reinicio.
+            stop_id=fila["stop_id"], stop_price_colocado=reglas.stop_price,
         )
 
         registrados = {f["reason"]: f for f in self._repo.fills_de(fila["id"])}
@@ -294,7 +386,7 @@ class BotRunner:
                     return
 
         if pos.reglas.cerrada:
-            self._cerrar(pos, ahora)
+            await self._cerrar(pos, ahora)
         else:
             self.abiertas[symbol] = pos
             log.info("bot: %s reconstruida tras reinicio (restante %.2f)",
@@ -334,7 +426,55 @@ class BotRunner:
         for intent in pos.reglas.on_candle(vela, tuple(transiciones)):
             await self._ejecutar(pos, intent, precio, ahora, stop_vigente)
         if pos.reglas.cerrada:
-            self._cerrar(pos, ahora)
+            await self._cerrar(pos, ahora)
+        else:
+            # el stop local (el que evalúa `on_candle` arriba) sigue
+            # activo a propósito -no se desactiva por tener uno en el
+            # exchange-: reacciona antes y cubre el caso de que la orden
+            # remota se haya cancelado sin que nos enteremos. Que ambos
+            # disparen no es un problema porque todos los cierres son
+            # reduce-only.
+            await self._sincronizar_stop(pos, ahora)
+
+    async def _sincronizar_stop(self, pos: PosicionAbierta, ahora: int) -> None:
+        """Refleja en el exchange un movimiento del stop de la regla.
+
+        Hoy el único caso es la subida a break-even (`reglas.stop_en_be`):
+        en cuanto una parcial en beneficio la dispara, `reglas.stop_price`
+        cambia de valor y se queda ahí para siempre, así que comparar contra
+        el último valor colocado (`pos.stop_price_colocado`) basta para
+        detectarlo sin necesitar mirar `stop_en_be` directamente.
+
+        Si no hay ningún stop colocado (`pos.stop_id is None`, porque
+        colocarlo falló y ya se decidió cerrar la posición, o porque una
+        base vieja no lo conoce) no hay nada que mover.
+
+        `mover_stop` SÍ lanza si `stop_id` ya no corresponde a un stop vivo
+        -a diferencia de `cancelar_stop`, que es idempotente-: eso puede
+        pasar si el stop ya saltó en el exchange justo antes de este tick.
+        No es un fallo que deba tumbar el tick ni degradar la posición -el
+        stop local sigue vigilando, y el próximo `_avanzar` volverá a
+        intentarlo si la posición sigue abierta-, así que se registra y se
+        sigue sin reintentar aquí.
+        """
+        if pos.stop_id is None:
+            return
+        nuevo_precio = pos.reglas.stop_price
+        if nuevo_precio == pos.stop_price_colocado:
+            return
+        try:
+            nuevo_id = await self._broker.mover_stop(
+                symbol=pos.symbol, stop_id=pos.stop_id, precio_disparo=nuevo_precio,
+            )
+        except Exception:
+            log.exception(
+                "bot: fallo al mover el stop de %s a %.6g; se reintentará en "
+                "el siguiente tick", pos.symbol, nuevo_precio,
+            )
+            return
+        pos.stop_id = nuevo_id
+        pos.stop_price_colocado = nuevo_precio
+        self._repo.fijar_stop_id(pos.id, nuevo_id)
 
     async def _ejecutar(
         self, pos: PosicionAbierta, intent: ExitIntent, precio: float, ahora: int,
@@ -425,10 +565,32 @@ class BotRunner:
         pos.pnl_acumulado += bruto - comision
         pos.fees_acumuladas += comision
 
-    def _cerrar(self, pos: PosicionAbierta, ahora: int) -> None:
+    async def _cerrar(self, pos: PosicionAbierta, ahora: int) -> None:
+        await self._cancelar_stop(pos)
         self._repo.cerrar(pos.id, close_ts=ahora, pnl=pos.pnl_acumulado,
                           fees=pos.fees_acumuladas, max_rank=pos.reglas.max_rank)
         self.portfolio.registrar_cierre(pos.symbol, ahora, pos.pnl_acumulado)
         self.abiertas.pop(pos.symbol, None)
         log.info("bot: cierra %s pnl %.2f (equity %.2f)",
                  pos.symbol, pos.pnl_acumulado, self.portfolio.equity())
+
+    async def _cancelar_stop(self, pos: PosicionAbierta) -> None:
+        """Cancela el stop del exchange al cerrar la posición, por cualquier
+        motivo -incluido que haya sido el propio stop el que la cerró-.
+
+        `cancelar_stop` es idempotente por contrato del broker: no lanza si
+        el stop ya no existe, que es el caso normal cuando fue él mismo
+        quien disparó el cierre. Si aun así falla (un fallo real de red o
+        del exchange), se registra pero no impide dar la posición por
+        cerrada -está cerrada de verdad, con el dinero ya liquidado; dejarla
+        `abierta = 1` en la base de datos por esto la dejaría atascada para
+        siempre, ocupando su hueco de concurrencia sin que nada la vuelva a
+        gobernar. Un stop huérfano en el exchange, si llega a pasar, es lo
+        que la reconciliación de arranque tiene que encontrar y limpiar.
+        """
+        if pos.stop_id is None:
+            return  # nunca se colocó, o ya se limpió (no hay nada que cancelar)
+        try:
+            await self._broker.cancelar_stop(symbol=pos.symbol, stop_id=pos.stop_id)
+        except Exception:
+            log.exception("bot: fallo al cancelar el stop de %s al cerrar", pos.symbol)
