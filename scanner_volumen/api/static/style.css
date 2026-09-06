@@ -35,3 +35,10 @@ tr.obsoleta td:nth-child(2)::after { content: " ⏱"; color: #d29922; }
 #detalle dl { display: grid; grid-template-columns: 1fr auto; gap: .2rem .8rem;
   margin: .5rem 0 0; }
 #detalle dt { color: #8b949e; } #detalle dd { margin: 0; text-align: right; }
+
+#bot { margin-top: 1.5rem; }
+#bot h2 { font-size: .95rem; letter-spacing: .1em; margin: 0 0 .5rem;
+  display: flex; gap: .6rem; align-items: center; }
+#bot table td:first-child, #bot table th:first-child,
+#bot table td:nth-child(2), #bot table th:nth-child(2) { text-align: left; }
+#bot table td:last-child, #bot table th:last-child { text-align: right; }

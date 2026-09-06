@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from scanner_volumen.app.state import ScannerState
+from scanner_volumen.bot.repo import BotRepo
 from scanner_volumen.storage.repos import SignalRepo
 
 ESTATICOS = Path(__file__).parent / "static"
@@ -24,7 +25,15 @@ INTERVALO_PUSH = 1.0
 log = logging.getLogger(__name__)
 
 
-def create_app(state: ScannerState, signal_repo: SignalRepo) -> FastAPI:
+def create_app(
+    state: ScannerState, signal_repo: SignalRepo,
+    bot_repo: BotRepo | None = None, modo: str = "paper",
+) -> FastAPI:
+    """`bot_repo` y `modo` tienen valor por defecto para que ningún llamador
+    existente (ni los tests que ya construían `create_app` con dos
+    argumentos) se rompa. Con el bot desactivado (`bot_repo=None`, el caso
+    de siempre hasta ahora) `/api/bot` responde `{"activo": False, ...}`
+    sin reventar."""
     app = FastAPI(title="Bitget Momentum Scanner")
 
     @app.get("/api/state")
@@ -41,6 +50,34 @@ def create_app(state: ScannerState, signal_repo: SignalRepo) -> FastAPI:
     @app.get("/api/signals")
     def get_signals(since: int = 0) -> list[dict]:
         return signal_repo.recent(since_ms=since)
+
+    @app.get("/api/bot")
+    def get_bot() -> dict:
+        """Estado del bot para el panel del dashboard. Solo serializa: como
+        el resto de la API, no dispara ningún cálculo.
+
+        `precio` va siempre a `None`: `ScannerState` no expone un precio en
+        vivo por símbolo (solo lo tiene el `Orchestrator`, vía `_precio_de`
+        en `__main__`), y esta tarea no le añade ese método."""
+        if bot_repo is None:
+            return {"activo": False, "equity": None, "abiertas": [], "cerradas": []}
+        abiertas = [
+            {
+                "symbol": fila["symbol"], "direction": fila["direction"],
+                "entry_ts": fila["entry_ts"], "entry_price": fila["entry_price"],
+                "precio": None, "margin": fila["margin"],
+            }
+            for fila in bot_repo.abiertas(modo)
+        ]
+        cerradas = [
+            {"symbol": f["symbol"], "close_ts": f["close_ts"], "pnl": f["pnl"],
+             "max_rank": f["max_rank"]}
+            for f in bot_repo.cerradas(modo)[-20:]
+        ]
+        return {
+            "activo": True, "modo": modo, "equity": bot_repo.equity(modo),
+            "abiertas": abiertas, "cerradas": list(reversed(cerradas)),
+        }
 
     @app.websocket("/ws")
     async def ws_estado(websocket: WebSocket) -> None:

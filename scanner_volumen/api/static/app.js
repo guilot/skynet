@@ -125,3 +125,36 @@ function conectar() {
   };
 }
 conectar();
+
+// El bot vive en su propia tabla (bot_posiciones), no en ScannerState: no
+// viaja en el payload del `/ws` de arriba. Un fetch con su propio
+// setInterval -en vez de forzarlo dentro del WebSocket del estado- deja las
+// dos fuentes de datos separadas, igual que ya lo están en el backend.
+function pintarBot(datos) {
+  const seccion = document.getElementById("bot");
+  if (!datos.activo) { seccion.hidden = true; return; }
+  seccion.hidden = false;
+  document.getElementById("bot-modo").textContent = datos.modo;
+  document.getElementById("bot-equity").textContent = num(datos.equity);
+  document.querySelector("#bot-abiertas tbody").innerHTML = datos.abiertas
+    .map((p) => `<tr>
+        <td>${p.symbol}</td>
+        <td>${p.direction}</td>
+        <td>${num(p.entry_price, 6)}</td>
+        <td>${num(p.margin)}</td>
+      </tr>`)
+    .join("");
+}
+
+async function refrescarBot() {
+  try {
+    const r = await fetch("/api/bot");
+    pintarBot(await r.json());
+  } catch (exc) {
+    // un fallo puntual del fetch no debe tumbar el resto del dashboard;
+    // el próximo setInterval lo reintenta solo.
+    console.warn("no se pudo refrescar el bot:", exc);
+  }
+}
+setInterval(refrescarBot, 5000);
+refrescarBot();

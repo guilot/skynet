@@ -342,7 +342,10 @@ async def main(argv: list[str] | None = None) -> None:
             await bot.reconstruir(_transiciones_de, _velas_de, _precio_de(orq),
                                   orq.now_ms(ahora_ms()))
 
-        app = create_app(orq.state, signal_repo)
+        app = create_app(
+            orq.state, signal_repo,
+            bot_repo=(bot_repo if cfg.bot.enabled else None), modo=cfg.bot.modo,
+        )
         servidor = uvicorn.Server(
             uvicorn.Config(
                 app, host=cfg.server.host, port=cfg.server.port, log_level="warning"
