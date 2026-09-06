@@ -13,11 +13,23 @@ la estrategia.
 """
 from __future__ import annotations
 
+import uuid
+from dataclasses import dataclass
 from typing import Protocol
 
 from scanner_volumen.bot.model import OrdenEjecutada
 from scanner_volumen.models import Direction
 from scanner_volumen.strategy.model import StrategyParams
+
+
+@dataclass(frozen=True)
+class StopVivo:
+    """Un stop puesto en el exchange (o, en paper, su simulacro en memoria)."""
+
+    stop_id: str
+    symbol: str
+    precio_disparo: float
+    cantidad: float
 
 
 class Broker(Protocol):
@@ -31,6 +43,17 @@ class Broker(Protocol):
         precio_mercado: float, ts: int,
     ) -> OrdenEjecutada: ...
 
+    async def colocar_stop(
+        self, *, symbol: str, direction: Direction, cantidad: float,
+        precio_disparo: float, client_oid: str,
+    ) -> str: ...
+
+    async def mover_stop(
+        self, *, symbol: str, stop_id: str, precio_disparo: float,
+    ) -> str: ...
+
+    async def cancelar_stop(self, *, symbol: str, stop_id: str) -> None: ...
+
 
 class PaperBroker:
     """Ejecuta contra el precio observado, sin tocar la red.
@@ -39,10 +62,19 @@ class PaperBroker:
     el que produce el paso del tiempo -entre que la regla decide y el bot
     actúa, el precio ya se movió-, y eso queda capturado por la diferencia
     entre el precio de referencia de la regla y este precio observado.
+
+    Implementa también el ciclo de vida del stop (`colocar_stop`,
+    `mover_stop`, `cancelar_stop`) aunque en paper no lo necesita -aquí nadie
+    puede liquidar la posición si el proceso muere-. Lo hace para que el
+    camino de código del `BotRunner` sea idéntico en los tres modos (paper,
+    lectura y real) y para que el ciclo del stop se pueda probar sin tocar la
+    red; el `BitgetBroker` de la Fase 3 implementará el mismo `Protocol`
+    contra el exchange de verdad.
     """
 
     def __init__(self, params: StrategyParams) -> None:
         self._params = params
+        self._stops: dict[str, StopVivo] = {}
 
     async def abrir(
         self, *, symbol: str, direction: Direction, notional: float,
@@ -77,3 +109,55 @@ class PaperBroker:
             ts=ts, precio=precio_mercado, cantidad=cantidad,
             comision=self._params.comision_taker * cantidad * precio_mercado,
         )
+
+    async def colocar_stop(
+        self, *, symbol: str, direction: Direction, cantidad: float,
+        precio_disparo: float, client_oid: str,
+    ) -> str:
+        """`direction` y `client_oid` no se usan en paper -no hay lado que
+        distinga el exchange ni orden real que idempotizar-, pero forman
+        parte del `Protocol` porque el `BitgetBroker` sí los necesita."""
+        if precio_disparo <= 0:
+            raise ValueError(
+                f"precio_disparo debe ser estrictamente positivo, recibido: {precio_disparo}"
+            )
+        stop_id = str(uuid.uuid4())
+        self._stops[symbol] = StopVivo(
+            stop_id=stop_id, symbol=symbol, precio_disparo=precio_disparo,
+            cantidad=cantidad,
+        )
+        return stop_id
+
+    async def mover_stop(
+        self, *, symbol: str, stop_id: str, precio_disparo: float,
+    ) -> str:
+        """Sustituye el stop vivo de `symbol` por uno nuevo al precio dado.
+
+        En un exchange real mover un stop es cancelar el viejo y colocar
+        otro -no hay una orden "editar"-, así que el `stop_id` cambia. Aquí
+        se refleja lo mismo: se conserva un único stop vivo por símbolo."""
+        if precio_disparo <= 0:
+            raise ValueError(
+                f"precio_disparo debe ser estrictamente positivo, recibido: {precio_disparo}"
+            )
+        anterior = self._stops.get(symbol)
+        cantidad = anterior.cantidad if anterior is not None else 0.0
+        nuevo_id = str(uuid.uuid4())
+        self._stops[symbol] = StopVivo(
+            stop_id=nuevo_id, symbol=symbol, precio_disparo=precio_disparo,
+            cantidad=cantidad,
+        )
+        return nuevo_id
+
+    async def cancelar_stop(self, *, symbol: str, stop_id: str) -> None:
+        """No lanza si el stop ya no existe: en real puede haberse ejecutado
+        ya -que es justo lo que queremos que pase-, y cancelarlo tiene que
+        ser una operación idempotente para no reventar el cierre normal de
+        una posición cuyo stop saltó."""
+        actual = self._stops.get(symbol)
+        if actual is not None and actual.stop_id == stop_id:
+            del self._stops[symbol]
+
+    def stops_vivos(self) -> dict[str, StopVivo]:
+        """Accesor de solo lectura para los tests: no lo consume el runner."""
+        return dict(self._stops)

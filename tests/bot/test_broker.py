@@ -57,6 +57,40 @@ async def test_rechaza_precio_no_positivo(metodo, precio):
                                 cantidad=2.0, precio_mercado=precio, ts=MIN)
 
 
+async def test_el_paper_broker_registra_el_stop_colocado():
+    broker = PaperBroker(StrategyParams())
+    sid = await broker.colocar_stop(symbol="A", direction=Direction.LONG,
+                                    cantidad=4.0, precio_disparo=97.5,
+                                    client_oid="oid-1")
+    assert sid
+    assert broker.stops_vivos()["A"].precio_disparo == pytest.approx(97.5)
+
+
+async def test_mover_el_stop_cambia_el_precio_y_conserva_uno_solo():
+    broker = PaperBroker(StrategyParams())
+    sid = await broker.colocar_stop(symbol="A", direction=Direction.LONG,
+                                    cantidad=4.0, precio_disparo=97.5,
+                                    client_oid="oid-1")
+    await broker.mover_stop(symbol="A", stop_id=sid, precio_disparo=100.0)
+    assert len(broker.stops_vivos()) == 1
+    assert broker.stops_vivos()["A"].precio_disparo == pytest.approx(100.0)
+
+
+async def test_cancelar_el_stop_lo_elimina():
+    broker = PaperBroker(StrategyParams())
+    sid = await broker.colocar_stop(symbol="A", direction=Direction.LONG,
+                                    cantidad=4.0, precio_disparo=97.5,
+                                    client_oid="oid-1")
+    await broker.cancelar_stop(symbol="A", stop_id=sid)
+    assert broker.stops_vivos() == {}
+
+
+async def test_cancelar_un_stop_inexistente_no_revienta():
+    # en real puede haberse ejecutado ya; cancelarlo debe ser idempotente
+    broker = PaperBroker(StrategyParams())
+    await broker.cancelar_stop(symbol="A", stop_id="no-existe")
+
+
 def test_paper_broker_no_importa_clientes_de_red():
     """PaperBroker no debe importar clientes HTTP, WebSocket ni módulos de Bitget.
 
