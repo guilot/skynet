@@ -1,10 +1,10 @@
-from scanner_volumen.backtest.trajectory.model import (
-    ExitReason, Fill, TrajectoryParams,
+from scanner_volumen.strategy.model import (
+    ExitReason, Fill, StrategyParams,
 )
 
 
 def test_params_por_defecto():
-    p = TrajectoryParams()
+    p = StrategyParams()
     assert p.equity_inicial == 1000.0
     assert p.fraccion_margen == 0.02
     assert p.apalancamiento == 20.0

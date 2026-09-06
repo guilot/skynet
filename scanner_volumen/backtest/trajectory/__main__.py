@@ -10,22 +10,22 @@ import argparse
 import sys
 from pathlib import Path
 
-from scanner_volumen.backtest.db import open_readonly
 from scanner_volumen.backtest.trajectory.loader import (
     load_transitions, make_candle_provider,
 )
-from scanner_volumen.backtest.trajectory.model import TrajectoryParams
 from scanner_volumen.backtest.trajectory.portfolio import run_trajectory
 from scanner_volumen.backtest.trajectory.report import format_trajectory_report
 from scanner_volumen.config import load_config
+from scanner_volumen.storage.db import open_readonly
 from scanner_volumen.storage.repos import CandleRepo, StateTransitionRepo
+from scanner_volumen.strategy.model import StrategyParams
 
 
 def main(argv: list[str] | None = None) -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    d = TrajectoryParams()
+    d = StrategyParams()
     p = argparse.ArgumentParser(
         prog="python -m scanner_volumen.backtest.trajectory",
         description="Backtest de la estrategia de trayectoria sobre "
@@ -33,6 +33,16 @@ def main(argv: list[str] | None = None) -> None:
     )
     p.add_argument("--db", type=Path, default=None)
     p.add_argument("--config", type=Path, default=Path("config.toml"))
+    p.add_argument(
+        "--desde", type=int, default=None,
+        help="ts en ms desde el que acotar la ventana (inclusive); sin este "
+             "flag, toda la base -comportamiento idéntico al de siempre-.",
+    )
+    p.add_argument(
+        "--hasta", type=int, default=None,
+        help="ts en ms hasta el que acotar la ventana (inclusive); sin este "
+             "flag, toda la base -comportamiento idéntico al de siempre-.",
+    )
     p.add_argument("--equity", type=float, default=d.equity_inicial)
     p.add_argument("--margin-frac", type=float, default=d.fraccion_margen)
     p.add_argument("--leverage", type=float, default=d.apalancamiento)
@@ -50,7 +60,7 @@ def main(argv: list[str] | None = None) -> None:
     cfg = load_config(args.config)
     db_path = args.db if args.db is not None else Path(cfg.server.db_path)
 
-    params = TrajectoryParams(
+    params = StrategyParams(
         equity_inicial=args.equity, fraccion_margen=args.margin_frac,
         apalancamiento=args.leverage, comision_taker=args.fee,
         stop_pct=args.stop_pct, max_concurrentes=args.max_concurrent,
@@ -63,7 +73,7 @@ def main(argv: list[str] | None = None) -> None:
 
     conn = open_readonly(db_path)
     try:
-        transitions = load_transitions(StateTransitionRepo(conn))
+        transitions = load_transitions(StateTransitionRepo(conn), args.desde, args.hasta)
         provider = make_candle_provider(CandleRepo(conn))
         run = run_trajectory(transitions, provider, params)
     finally:

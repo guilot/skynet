@@ -37,13 +37,19 @@ from scanner_volumen.app.orchestrator import Orchestrator
 from scanner_volumen.app.outcomes import OutcomeTracker
 from scanner_volumen.bitget.rest import BASE_URL, BitgetRest
 from scanner_volumen.bitget.ws import BitgetWebsocket
+from scanner_volumen.bot.broker import PaperBroker
+from scanner_volumen.bot.portfolio import LivePortfolio
+from scanner_volumen.bot.repo import BotRepo
+from scanner_volumen.bot.runner import BotRunner
 from scanner_volumen.config import load_config
+from scanner_volumen.models import Direction, State
 from scanner_volumen.provenance import get_code_revision
 from scanner_volumen.storage.db import open_db
 from scanner_volumen.storage.repos import (
     CandleRepo, MaintenanceRepo, ProfileRepo, SignalRepo, StateTransitionRepo,
     SupplyRepo,
 )
+from scanner_volumen.strategy.model import CandleRow, StrategyParams, TransitionRow
 from scanner_volumen.universe.selector import UniverseSelector
 from scanner_volumen.universe.supply import SupplyCache
 
@@ -110,15 +116,40 @@ async def paso_tickers(
     return ultimo_universo
 
 
-async def paso_evaluador(orq: Orchestrator, bootstrapper: Bootstrapper, ahora: int) -> None:
+def _precio_de(orq: Orchestrator):
+    """Último precio observado de un símbolo: la vela en curso del WebSocket
+    (lo más fresco que hay) y, si no la hay, el ticker de REST."""
+    def precio(symbol: str) -> float | None:
+        buffer = orq.buffers.get(symbol)
+        if buffer is not None:
+            actual = buffer.current()
+            if actual is not None:
+                return actual.close
+            cerradas = buffer.closed(1)
+            if cerradas:
+                return cerradas[-1].close
+        ticker = orq.tickers.get(symbol)
+        return None if ticker is None else ticker.last
+    return precio
+
+
+async def paso_evaluador(
+    orq: Orchestrator, bootstrapper: Bootstrapper, ahora: int, bot=None,
+) -> None:
     """Un paso de `bucle_evaluador`: drena reconexiones, evalúa y refresca
     el progreso del bootstrap. Ver `paso_tickers` sobre por qué está
-    extraído como función con nombre (I-5)."""
+    extraído como función con nombre (I-5).
+
+    `bot` es opcional (`None` por defecto) para que con `bot.enabled = false`
+    -el valor por defecto de `config.toml`- el escáner se comporte
+    exactamente como antes de que existiera el bot: todas las llamadas
+    existentes a `paso_evaluador` siguen funcionando sin cambios."""
     orq.state.now_ms = ahora  # I-2(a): "ahora" del exchange, para el dashboard
     # Igual que `paso_outcomes`: un fallo transitorio (p. ej. un error de
-    # SQLite al persistir una señal o una transición de estado) no debe tumbar
-    # el bucle del evaluador. Con el registro de transiciones WATCH+ hay muchas
-    # más escrituras por hora, así que el bucle necesita esta red.
+    # SQLite al persistir una señal o una transición de estado, o un fallo
+    # del propio bot) no debe tumbar el bucle del evaluador. Con el registro
+    # de transiciones WATCH+ hay muchas más escrituras por hora, así que el
+    # bucle necesita esta red.
     try:
         for simbolo in list(orq.reconnected):
             orq.reconnected.discard(simbolo)
@@ -126,6 +157,11 @@ async def paso_evaluador(orq: Orchestrator, bootstrapper: Bootstrapper, ahora: i
         for t in orq.evaluate(ahora):
             if t.should_alert:
                 log.info("ALERTA %s %s score=%.1f", t.symbol, t.current.value, t.score)
+        if bot is not None:
+            try:
+                await bot.on_tick(orq.transiciones_evaluadas, _precio_de(orq), ahora)
+            except Exception:
+                log.exception("bot: fallo aislado en on_tick")
         hecho, total = bootstrapper.progress()
         orq.state.bootstrap_done, orq.state.bootstrap_total = hecho, total
     except Exception as exc:  # noqa: BLE001
@@ -269,7 +305,58 @@ async def main(argv: list[str] | None = None) -> None:
             signal_repo, candle_repo, horizons=cfg.outcomes.horizons_minutes
         )
 
-        app = create_app(orq.state, signal_repo)
+        bot = None
+        if cfg.bot.enabled:
+            bot_repo = BotRepo(conn)
+            # fija el capital la primera vez y respeta el ya guardado en
+            # arranques posteriores: el saldo es un valor vivo, no se
+            # reinicia en cada despliegue. Segmentado por modo (C): el día
+            # que exista operativa `real`, no debe arrancar sobre el capital
+            # del `paper`.
+            bot_repo.set_equity_inicial(
+                cfg.bot.modo,
+                bot_repo.equity_inicial(cfg.bot.modo, defecto=cfg.bot.equity_inicial),
+            )
+            # igual patrón para `arrancado_ms`: sin él, la "Ventana" del
+            # informe se deriva del primer trade en vez del arranque real, y
+            # un bot que lleva días corriendo antes de operar por primera vez
+            # publicaría una ventana mucho más corta de la real.
+            bot_repo.set_arrancado_ms(bot_repo.arrancado_ms(defecto=ahora_ms()))
+            params = StrategyParams()
+            bot = BotRunner(params, cfg.bot, bot_repo, PaperBroker(params),
+                            LivePortfolio(params, cfg.bot, bot_repo))
+            log.info("bot ACTIVO en modo %s, equity %.2f",
+                     cfg.bot.modo, bot_repo.equity(cfg.bot.modo))
+        else:
+            log.info("bot desactivado (bot.enabled = false)")
+
+        if bot is not None:
+            def _transiciones_de(symbol: str, desde: int):
+                return [
+                    TransitionRow(
+                        ts=f["ts"], symbol=f["symbol"],
+                        prev_state=State(f["prev_state"]),
+                        new_state=State(f["new_state"]), price=f["price"],
+                        direction=Direction(f["direction"]), score=f["score"],
+                    )
+                    for f in state_transition_repo.por_simbolo(symbol, desde)
+                    if f["price"] is not None
+                ]
+
+            def _velas_de(symbol: str, desde: int):
+                return [
+                    CandleRow(ts=c.ts, open=c.open, high=c.high, low=c.low,
+                              close=c.close)
+                    for c in candle_repo.load(symbol, desde)
+                ]
+
+            await bot.reconstruir(_transiciones_de, _velas_de, _precio_de(orq),
+                                  orq.now_ms(ahora_ms()))
+
+        app = create_app(
+            orq.state, signal_repo,
+            bot_repo=(bot_repo if cfg.bot.enabled else None), modo=cfg.bot.modo,
+        )
         servidor = uvicorn.Server(
             uvicorn.Config(
                 app, host=cfg.server.host, port=cfg.server.port, log_level="warning"
@@ -297,7 +384,7 @@ async def main(argv: list[str] | None = None) -> None:
         async def bucle_evaluador() -> None:
             while True:
                 ahora = orq.now_ms(ahora_ms())
-                await paso_evaluador(orq, bootstrapper, ahora)
+                await paso_evaluador(orq, bootstrapper, ahora, bot)
                 await asyncio.sleep(cfg.engine.tick_seconds)
 
         async def bucle_outcomes() -> None:

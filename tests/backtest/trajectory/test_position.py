@@ -1,10 +1,10 @@
 import pytest
 
-from scanner_volumen.backtest.trajectory.model import (
-    CandleRow, ExitReason, TrajectoryParams, TransitionRow,
-)
 from scanner_volumen.backtest.trajectory.position import simulate_position
 from scanner_volumen.models import Direction, State
+from scanner_volumen.strategy.model import (
+    CandleRow, ExitReason, StrategyParams, TransitionRow,
+)
 
 MIN = 60_000
 
@@ -28,7 +28,7 @@ def test_tras_scale_out_en_profit_el_stop_sube_a_be():
     entry = tr(0, State.NORMAL, State.WATCH, 100.0)
     later = [tr(1 * MIN, State.WATCH, State.HOT, 110.0)]
     candles = velas(0, [100, 110, 105, 100, 100])
-    out = simulate_position(entry, later, candles, TrajectoryParams())
+    out = simulate_position(entry, later, candles, StrategyParams())
     assert out.fills[0].reason == ExitReason.SCALE_HOT and out.fills[0].price == 110.0
     assert out.fills[1].reason == ExitReason.STOP
     assert out.fills[1].price == pytest.approx(100.0)  # BE, no 97.5
@@ -42,7 +42,7 @@ def test_scale_out_en_perdida_no_mueve_el_stop_a_be():
     entry = tr(0, State.NORMAL, State.WATCH, 100.0, direction=Direction.SHORT)
     later = [tr(1 * MIN, State.WATCH, State.HOT, 101.0, direction=Direction.SHORT)]
     candles = velas(0, [100, 101, 101])
-    out = simulate_position(entry, later, candles, TrajectoryParams())
+    out = simulate_position(entry, later, candles, StrategyParams())
     reasons = [f.reason for f in out.fills]
     assert ExitReason.STOP not in reasons
     assert reasons[0] == ExitReason.SCALE_HOT
@@ -58,7 +58,7 @@ def test_escalera_completa_dispara_los_tres_tramos():
     ]
     candles = velas(0, [100, 110, 120, 130, 130])
     # extreme_run_min=0: cierre inmediato en EXTREME (esta escalera prueba ese camino)
-    out = simulate_position(entry, later, candles, TrajectoryParams(extreme_run_min=0))
+    out = simulate_position(entry, later, candles, StrategyParams(extreme_run_min=0))
     reasons = [f.reason for f in out.fills]
     assert reasons == [ExitReason.SCALE_HOT, ExitReason.SCALE_SIGNAL, ExitReason.EXTREME]
     assert out.fills[0].price == 110.0 and out.fills[0].fraction == pytest.approx(0.33)
@@ -73,7 +73,7 @@ def test_salto_a_signal_acumula_tramos_hot_y_signal():
     entry = tr(0, State.NORMAL, State.WATCH, 100.0)
     later = [tr(1 * MIN, State.WATCH, State.SIGNAL, 120.0)]
     candles = velas(0, [100, 120, 120, 120])
-    out = simulate_position(entry, later, candles, TrajectoryParams())
+    out = simulate_position(entry, later, candles, StrategyParams())
     # ambos tramos al mismo precio/ts, luego cierra por fin de datos
     assert [f.reason for f in out.fills][:2] == [
         ExitReason.SCALE_HOT, ExitReason.SCALE_SIGNAL]
@@ -87,7 +87,7 @@ def test_stop_long_cierra_al_precio_de_stop():
     # vela con low por debajo del stop (100*0.975=97.5)
     candles = [CandleRow(ts=0, open=100, high=100, low=100, close=100),
                CandleRow(ts=MIN, open=99, high=99, low=97.0, close=98)]
-    out = simulate_position(entry, [], candles, TrajectoryParams())
+    out = simulate_position(entry, [], candles, StrategyParams())
     assert len(out.fills) == 1
     assert out.fills[0].reason == ExitReason.STOP
     assert out.fills[0].price == pytest.approx(97.5)
@@ -98,7 +98,7 @@ def test_stop_long_con_hueco_rellena_al_open():
     entry = tr(0, State.NORMAL, State.WATCH, 100.0)
     candles = [CandleRow(ts=0, open=100, high=100, low=100, close=100),
                CandleRow(ts=MIN, open=96.0, high=96.0, low=95.0, close=95.5)]
-    out = simulate_position(entry, [], candles, TrajectoryParams())
+    out = simulate_position(entry, [], candles, StrategyParams())
     assert out.fills[0].reason == ExitReason.STOP
     assert out.fills[0].price == pytest.approx(96.0)  # open, no 97.5
 
@@ -108,7 +108,7 @@ def test_estancamiento_10min_sin_cambio_sale_en_be():
     # arma la salida en BE y cierra en la entrada (high >= entrada).
     entry = tr(0, State.NORMAL, State.WATCH, 100.0)
     candles = velas(0, [100] * 12)
-    out = simulate_position(entry, [], candles, TrajectoryParams())
+    out = simulate_position(entry, [], candles, StrategyParams())
     assert len(out.fills) == 1
     assert out.fills[0].reason == ExitReason.STALE_BE
     assert out.fills[0].ts == 10 * MIN
@@ -119,7 +119,7 @@ def test_estancamiento_en_profit_sale_a_mercado():
     # Estancado pero por encima de la entrada: la salida en BE sale a mercado.
     entry = tr(0, State.NORMAL, State.WATCH, 100.0)
     candles = velas(0, [100] + [105] * 11)  # sube a 105 y se queda
-    out = simulate_position(entry, [], candles, TrajectoryParams())
+    out = simulate_position(entry, [], candles, StrategyParams())
     assert out.fills[0].reason == ExitReason.STALE_BE
     assert out.fills[0].price == pytest.approx(105.0)  # max(mercado, entrada)
 
@@ -129,7 +129,7 @@ def test_estancamiento_bajo_agua_espera_a_be():
     # espera a que el precio vuelva a la entrada. Aquí no vuelve -> fin de datos.
     entry = tr(0, State.NORMAL, State.WATCH, 100.0)
     candles = velas(0, [100] + [99.0] * 15)  # 99 > stop 97.5, pero < entrada
-    out = simulate_position(entry, [], candles, TrajectoryParams())
+    out = simulate_position(entry, [], candles, StrategyParams())
     reasons = [f.reason for f in out.fills]
     assert ExitReason.STALE_BE not in reasons
     assert out.fills[-1].reason == ExitReason.END_OF_DATA
@@ -141,7 +141,7 @@ def test_transicion_reinicia_el_timer_de_estancamiento():
     entry = tr(0, State.NORMAL, State.WATCH, 100.0)
     later = [tr(6 * MIN, State.WATCH, State.HOT, 100.0)]  # cambio de estado
     candles = velas(0, [100] * 15)  # datos hasta 14min < 16min
-    out = simulate_position(entry, later, candles, TrajectoryParams())
+    out = simulate_position(entry, later, candles, StrategyParams())
     reasons = [f.reason for f in out.fills]
     assert ExitReason.SCALE_HOT in reasons
     assert ExitReason.STALE_BE not in reasons
@@ -158,7 +158,7 @@ def test_extreme_run_mantiene_y_cierra_a_mercado():
         tr(3 * MIN, State.SIGNAL, State.EXTREME, 130.0),
     ]
     candles = velas(0, [100, 110, 120, 130, 131, 132, 133, 134, 135, 135])
-    out = simulate_position(entry, later, candles, TrajectoryParams(extreme_run_min=5))
+    out = simulate_position(entry, later, candles, StrategyParams(extreme_run_min=5))
     ext = out.fills[-1]
     assert ext.reason == ExitReason.EXTREME
     assert ext.ts == 8 * MIN          # 3min (EXTREME) + 5min de run
@@ -175,7 +175,7 @@ def test_extreme_run_respeta_el_stop_en_be():
         tr(3 * MIN, State.SIGNAL, State.EXTREME, 130.0),
     ]
     candles = velas(0, [100, 110, 120, 130, 120, 110, 100, 100])
-    out = simulate_position(entry, later, candles, TrajectoryParams(extreme_run_min=10))
+    out = simulate_position(entry, later, candles, StrategyParams(extreme_run_min=10))
     assert out.fills[-1].reason == ExitReason.STOP
     assert out.fills[-1].price == pytest.approx(100.0)  # BE
 
@@ -183,14 +183,14 @@ def test_extreme_run_respeta_el_stop_en_be():
 def test_velas_vacias_lanza_value_error():
     entry = tr(0, State.NORMAL, State.WATCH, 100.0)
     with pytest.raises(ValueError):
-        simulate_position(entry, [], [], TrajectoryParams())
+        simulate_position(entry, [], [], StrategyParams())
 
 
 def test_entrada_en_hot_no_dispara_tramo_hot():
     entry = tr(0, State.NORMAL, State.HOT, 100.0)  # entra ya en HOT
     later = [tr(1 * MIN, State.HOT, State.SIGNAL, 110.0)]
     candles = velas(0, [100, 110, 110])
-    out = simulate_position(entry, later, candles, TrajectoryParams())
+    out = simulate_position(entry, later, candles, StrategyParams())
     # solo el tramo SIGNAL (33%), luego fin de datos con el resto
     reasons = [f.reason for f in out.fills]
     assert ExitReason.SCALE_HOT not in reasons

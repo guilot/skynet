@@ -186,6 +186,39 @@ def test_falla_si_episode_gap_minutes_no_es_positivo(tmp_path):
         load_config(destino)
 
 
+def test_config_bot_se_carga_entera():
+    """La sección [bot] carga con los cuatro campos bien tipados.
+
+    `enabled` NO se afirma por valor: si el bot está encendido o apagado es una
+    decisión de despliegue que vive en `config.toml`, no un invariante del
+    código. Fijarlo aquí obligaría a tocar este test cada vez que se enciende o
+    se apaga el bot, que es justo lo que no debe costar nada."""
+    cfg = load_config(CONFIG_PATH)
+    assert isinstance(cfg.bot.enabled, bool)
+    assert cfg.bot.modo == "paper"
+    assert cfg.bot.equity_inicial == 1000.0
+    assert cfg.bot.desvio_max_entrada == 0.0  # 0 = desactivado
+
+
+def test_modo_real_no_arranca(tmp_path):
+    # el switch de la Fase 3 está cableado pero no puede encenderse todavía
+    origen = CONFIG_PATH.read_text(encoding="utf-8")
+    destino = tmp_path / "config.toml"
+    destino.write_text(origen.replace('modo = "paper"', 'modo = "real"'),
+                       encoding="utf-8")
+    with pytest.raises(ValueError, match="Fase 3"):
+        load_config(destino)
+
+
+def test_modo_desconocido_falla(tmp_path):
+    origen = CONFIG_PATH.read_text(encoding="utf-8")
+    destino = tmp_path / "config.toml"
+    destino.write_text(origen.replace('modo = "paper"', 'modo = "simulado"'),
+                       encoding="utf-8")
+    with pytest.raises(ValueError, match="bot.modo"):
+        load_config(destino)
+
+
 def test_falla_si_min_episodes_for_significance_es_negativo(tmp_path):
     toml_roto = CONFIG_PATH.read_text().replace(
         "min_episodes_for_significance = 30", "min_episodes_for_significance = -1",

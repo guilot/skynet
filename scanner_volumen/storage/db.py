@@ -138,6 +138,62 @@ CREATE TABLE IF NOT EXISTS state_transitions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_state_transitions_ts ON state_transitions(ts);
+
+CREATE TABLE IF NOT EXISTS bot_posiciones (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    modo TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    entry_ts INTEGER NOT NULL,
+    entry_price REAL NOT NULL,
+    entry_price_senal REAL NOT NULL,
+    margin REAL NOT NULL,
+    notional REAL NOT NULL,
+    size REAL NOT NULL,
+    fee_entrada REAL NOT NULL,
+    abierta INTEGER NOT NULL,
+    close_ts INTEGER,
+    pnl REAL,
+    fees REAL,
+    max_rank INTEGER,
+    degradada INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_bot_pos_abierta ON bot_posiciones(modo, abierta);
+
+CREATE TABLE IF NOT EXISTS bot_fills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    posicion_id INTEGER NOT NULL,
+    ts INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    fraction REAL NOT NULL,
+    precio_referencia REAL NOT NULL,
+    precio REAL NOT NULL,
+    comision REAL NOT NULL,
+    tardio INTEGER NOT NULL DEFAULT 0,
+    precio_regla REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_bot_fills_pos ON bot_fills(posicion_id);
+
+CREATE TABLE IF NOT EXISTS bot_meta (
+    clave TEXT PRIMARY KEY,
+    valor TEXT NOT NULL
+);
+
+-- Contadores del informe del bot (descartes, transiciones vistas, la
+-- concurrencia máxima alcanzada): sin esto viven solo en RAM del proceso
+-- (`LivePortfolio.descartes`, `BotRunner.transiciones_vistas`) y se
+-- reinician con cada reinicio, así que el informe imprime "0" para
+-- siempre -justo las líneas que explicarían por qué el paper tomó menos
+-- trades que el backtest-. Clave compuesta `(modo, clave)` para que paper y
+-- real no mezclen sus cuentas, igual que el resto de tablas del bot.
+CREATE TABLE IF NOT EXISTS bot_contadores (
+    modo TEXT NOT NULL,
+    clave TEXT NOT NULL,
+    valor INTEGER NOT NULL,
+    PRIMARY KEY (modo, clave)
+) WITHOUT ROWID;
 """
 
 
@@ -146,7 +202,7 @@ CREATE INDEX IF NOT EXISTS idx_state_transitions_ts ON state_transitions(ts);
 # tocar porque ya existe. `PRAGMA user_version` es el mecanismo nativo de
 # SQLite para esto -entero simple embebido en el propio fichero, sin tabla
 # adicional que crear ni de la que depender antes de tener esquema-.
-VERSION_ESQUEMA = 3
+VERSION_ESQUEMA = 5
 
 
 def _migrar(conn: sqlite3.Connection) -> None:
@@ -175,6 +231,10 @@ def _migrar(conn: sqlite3.Connection) -> None:
         _migrar_v2_procedencia_de_signals(conn)
     if version_actual < 3:
         _migrar_v3_state_transitions(conn)
+    if version_actual < 4:
+        _migrar_v4_bot_tablas(conn)
+    if version_actual < 5:
+        _migrar_v5_informe_bot(conn)
     if version_actual < VERSION_ESQUEMA:
         conn.execute(f"PRAGMA user_version = {VERSION_ESQUEMA}")
         conn.commit()
@@ -257,6 +317,54 @@ def _migrar_v3_state_transitions(conn: sqlite3.Connection) -> None:
     return
 
 
+def _migrar_v4_bot_tablas(conn: sqlite3.Connection) -> None:
+    """No-op declarado, igual que `_migrar_v3_state_transitions`:
+    `bot_posiciones`, `bot_fills` y `bot_meta` se añadieron en su día como
+    tablas enteramente nuevas -el propio `CREATE TABLE IF NOT EXISTS` de
+    `ESQUEMA` ya las crea contra cualquier base existente sin tocar ninguna
+    columna de una tabla ya existente-, pero esa entrega no subió
+    `VERSION_ESQUEMA` para registrarlo. Este paso solo pone al día
+    `PRAGMA user_version`, retroactivamente, con lo que el esquema actual ya
+    incluye desde entonces."""
+    return
+
+
+def _migrar_v5_informe_bot(conn: sqlite3.Connection) -> None:
+    """Añade a `bot_posiciones`/`bot_fills`, ya existentes, las columnas que
+    necesita el informe de ejecución; `bot_contadores` es tabla enteramente
+    nueva y no necesita ALTER (la crea el propio `CREATE TABLE IF NOT
+    EXISTS` de `ESQUEMA`, igual que `_migrar_v4_bot_tablas`).
+
+    `bot_posiciones.degradada` distingue una posición que el runner aisló
+    tras un fallo del broker -sigue "abierta" en la base de datos, ocupando
+    su hueco de concurrencia, pero ya nadie la gobierna- de una posición
+    sana; sin esta columna esas posiciones desaparecían del informe sin
+    dejar rastro, y son sistemáticamente las que iban perdiendo (el camino
+    más probable a degradarse es un fallo al ejecutar un STOP).
+    `bot_fills.precio_regla` guarda el nivel que la regla prometía para cada
+    salida (el stop vigente, el break-even, o el precio de la transición,
+    según el motivo), para medir el desvío de salida contra un nivel real en
+    vez de contra el propio precio con el que el bot rellena su vela
+    sintética -que siempre daría desvío cero, no porque la ejecución fuera
+    perfecta, sino por construcción-.
+
+    `ALTER TABLE ... ADD COLUMN` no exige `DEFAULT` para una columna
+    nullable (`precio_regla`); `degradada` sí lleva `DEFAULT 0` porque nace
+    NOT NULL -toda fila ya existente antes de esta migración se asume sana,
+    que es lo correcto: una posición degradada solo pudo escribirse con
+    código que ya conoce esta columna-.
+    """
+    columnas_pos = {f["name"] for f in conn.execute("PRAGMA table_info(bot_posiciones)")}
+    if columnas_pos and "degradada" not in columnas_pos:
+        conn.execute(
+            "ALTER TABLE bot_posiciones ADD COLUMN degradada INTEGER NOT NULL DEFAULT 0"
+        )
+    columnas_fills = {f["name"] for f in conn.execute("PRAGMA table_info(bot_fills)")}
+    if columnas_fills and "precio_regla" not in columnas_fills:
+        conn.execute("ALTER TABLE bot_fills ADD COLUMN precio_regla REAL")
+    conn.commit()
+
+
 def open_db(path: Path) -> sqlite3.Connection:
     """Abre (creando si hace falta) la base de datos, migra el esquema de
     una base ya existente si hace falta, y aplica el esquema actual."""
@@ -269,4 +377,23 @@ def open_db(path: Path) -> sqlite3.Connection:
     _migrar(conn)
     conn.executescript(ESQUEMA)
     conn.commit()
+    return conn
+
+
+def open_readonly(path: Path) -> sqlite3.Connection:
+    """Apertura de la base de datos en modo solo-lectura.
+
+    El scanner puede seguir corriendo y escribiendo en la misma base mientras se
+    ejecuta un backtest (spec: "Do not modify that database"). `open_db` no
+    sirve aquí: aplica migraciones y `executescript(ESQUEMA)`, escrituras que
+    esta herramienta no necesita y que no debe arriesgarse a hacer contra una
+    base en uso. Se abre con el URI `mode=ro` de SQLite, que hace que
+    cualquier intento de escritura falle en el propio driver -no solo "no se
+    escribe por convención", sino que no puede escribirse-.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"no existe la base de datos: {path}")
+    uri = f"file:{path.resolve().as_posix()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
     return conn

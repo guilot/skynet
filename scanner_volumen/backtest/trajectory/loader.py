@@ -3,12 +3,18 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from scanner_volumen.backtest.trajectory.model import CandleRow, TransitionRow
+from scanner_volumen.strategy.model import CandleRow, TransitionRow
 from scanner_volumen.models import Direction, State
 from scanner_volumen.storage.repos import CandleRepo, StateTransitionRepo
 
 
-def load_transitions(repo: StateTransitionRepo) -> list[TransitionRow]:
+def load_transitions(
+    repo: StateTransitionRepo, desde_ms: int | None = None,
+    hasta_ms: int | None = None,
+) -> list[TransitionRow]:
+    """`desde_ms`/`hasta_ms` acotan la ventana del backtest (ver
+    `StateTransitionRepo.all_transitions`); `None` (el defecto) preserva el
+    comportamiento de siempre: toda la base."""
     return [
         TransitionRow(
             ts=f["ts"], symbol=f["symbol"],
@@ -16,7 +22,7 @@ def load_transitions(repo: StateTransitionRepo) -> list[TransitionRow]:
             price=f["price"], direction=Direction(f["direction"]),
             score=f["score"],
         )
-        for f in repo.all_transitions()
+        for f in repo.all_transitions(desde_ms, hasta_ms)
     ]
 
 

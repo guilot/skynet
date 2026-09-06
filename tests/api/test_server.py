@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from scanner_volumen.api.server import create_app
 from scanner_volumen.app.state import ScannerState, SymbolSnapshot
+from scanner_volumen.bot.repo import BotRepo
 from scanner_volumen.engine.metrics import SymbolMetrics
 from scanner_volumen.models import Direction, State
 from scanner_volumen.scoring.score import ScoreBreakdown
@@ -141,3 +142,81 @@ def test_el_websocket_envia_el_estado_al_conectar(cliente):
     with cliente.websocket_connect("/ws") as ws:
         datos = ws.receive_json()
         assert datos["rows"][0]["symbol"] == "AAAUSDT"
+
+
+def test_api_bot_sin_bot_devuelve_desactivado(cliente):
+    """`entorno` construye la app sin `bot_repo` (valor por defecto `None`,
+    el caso de siempre hasta ahora con `bot.enabled = false`): la ruta debe
+    responder desactivada sin reventar."""
+    r = cliente.get("/api/bot")
+    assert r.status_code == 200
+    assert r.json() == {"activo": False, "equity": None, "abiertas": [], "cerradas": []}
+
+
+def test_api_bot_publica_equity_y_abiertas(tmp_path):
+    """Reutiliza los mismos dobles que `entorno` (un `ScannerState` en
+    blanco y un `SignalRepo` sobre una conexión propia), pero con un
+    `BotRepo` real -sobre la misma conexión sqlite- para comprobar que la
+    ruta serializa equity, posiciones abiertas y posiciones cerradas tal
+    cual las guarda el bot, sin recalcular nada. Cubre además el recorte y
+    el orden de `cerradas` (Ronda 1: antes solo se probaba con la lista
+    vacía, así que un bug en el mapeo de campos o en el orden expuesto
+    habría pasado desapercibido)."""
+    estado = ScannerState()
+    conn = open_db(tmp_path / "scanner.db")
+    signal_repo = SignalRepo(conn)
+    bot_repo = BotRepo(conn)
+    bot_repo.set_equity_inicial("paper", 1000.0)
+    bot_repo.abrir(
+        modo="paper", symbol="AAAUSDT", direction=Direction.LONG, entry_ts=0,
+        entry_price=100.0, entry_price_senal=100.0, margin=20.0,
+        notional=400.0, size=4.0, fee_entrada=0.24,
+    )
+    pid_cerrada = bot_repo.abrir(
+        modo="paper", symbol="BBBUSDT", direction=Direction.LONG, entry_ts=0,
+        entry_price=50.0, entry_price_senal=50.0, margin=10.0,
+        notional=200.0, size=4.0, fee_entrada=0.12,
+    )
+    bot_repo.cerrar(pid_cerrada, close_ts=60_000, pnl=25.0, fees=0.3, max_rank=3)
+    app = create_app(estado, signal_repo, bot_repo=bot_repo, modo="paper")
+    with TestClient(app) as cliente:
+        datos = cliente.get("/api/bot").json()
+    conn.close()
+
+    assert datos["activo"] is True
+    assert datos["modo"] == "paper"
+    assert datos["equity"] == pytest.approx(1025.0)
+    assert len(datos["abiertas"]) == 1
+    assert datos["abiertas"][0]["symbol"] == "AAAUSDT"
+    assert datos["abiertas"][0]["precio"] is None
+    assert datos["cerradas"] == [
+        {"symbol": "BBBUSDT", "close_ts": 60_000, "pnl": pytest.approx(25.0),
+         "max_rank": 3},
+    ]
+
+
+def test_api_bot_recorta_cerradas_a_veinte_mas_recientes(tmp_path):
+    """La ruta pide `bot_repo.cerradas(modo, limite=20)`: comprueba que el
+    recorte llega hasta la API (no solo que `BotRepo.cerradas` lo respete
+    en aislado, ya probado en `tests/bot/test_repo.py`) y que expone las
+    más recientes primero."""
+    estado = ScannerState()
+    conn = open_db(tmp_path / "scanner.db")
+    signal_repo = SignalRepo(conn)
+    bot_repo = BotRepo(conn)
+    bot_repo.set_equity_inicial("paper", 1000.0)
+    for i in range(25):
+        pid = bot_repo.abrir(
+            modo="paper", symbol=f"S{i}USDT", direction=Direction.LONG,
+            entry_ts=i * 60_000, entry_price=10.0, entry_price_senal=10.0,
+            margin=10.0, notional=100.0, size=10.0, fee_entrada=0.05,
+        )
+        bot_repo.cerrar(pid, close_ts=(i + 1) * 60_000, pnl=1.0, fees=0.0, max_rank=1)
+    app = create_app(estado, signal_repo, bot_repo=bot_repo, modo="paper")
+    with TestClient(app) as cliente:
+        datos = cliente.get("/api/bot").json()
+    conn.close()
+
+    assert len(datos["cerradas"]) == 20
+    assert datos["cerradas"][0]["symbol"] == "S24USDT"  # la más reciente, primero
+    assert datos["cerradas"][-1]["symbol"] == "S5USDT"
