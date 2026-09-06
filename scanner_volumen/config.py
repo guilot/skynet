@@ -240,18 +240,12 @@ _MODOS_BOT = ("paper", "real")
 def _validar_bot(raw_bot: dict) -> None:
     """Valida el switch del bot al cargar, en un único punto de fallo.
 
-    "real" se reconoce como modo válido pero se rechaza en ejecución: el
-    interruptor de la Fase 3 queda cableado donde va a ir, y no puede
-    encenderse por accidente antes de que exista la ejecución real."""
+    "real" se reconoce como modo válido. El interruptor de la Fase 3 vive
+    ahora en `resolver_modo`, que exige además la variable de entorno."""
     modo = raw_bot["modo"]
     if modo not in _MODOS_BOT:
         raise ValueError(
             f"bot.modo no es válido: {modo!r} (válidos: {list(_MODOS_BOT)})"
-        )
-    if modo == "real":
-        raise ValueError(
-            "bot.modo = 'real' requiere la ejecución contra Bitget, que es la "
-            "Fase 3 y todavía no está implementada. Usa 'paper'."
         )
     if raw_bot["equity_inicial"] <= 0:
         raise ValueError(
