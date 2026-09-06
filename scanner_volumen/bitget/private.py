@@ -141,14 +141,27 @@ class BitgetPrivate:
         return payload
 
     async def get_saldo(self) -> SaldoCuenta:
-        """Obtiene el saldo de la cuenta.
+        """Obtiene el saldo de la subcuenta entera (plural, todas las monedas).
+
+        Endpoint plural `/api/v2/mix/account/accounts` devuelve una lista de cuentas,
+        una por moneda de margen. Esta tarea selecciona explícitamente la de USDT,
+        que es la moneda sobre la que dimensiona el bot.
 
         El `realizado` es accountEquity - unrealizedPL, la cifra que replica
         la semántica del backtest.
         """
-        payload = await self._pedir("GET", "/api/v2/mix/account/account")
+        payload = await self._pedir("GET", "/api/v2/mix/account/accounts")
         data_list = payload.get("data", [])
-        data = data_list[0] if data_list else {}
+
+        # Seleccionar explícitamente la cuenta en USDT
+        data = None
+        for item in data_list:
+            if item.get("marginCoin") == "USDT":
+                data = item
+                break
+
+        if data is None:
+            raise RuntimeError("No se encontró saldo en USDT en Bitget")
 
         equity = float(data.get("accountEquity", 0))
         pnl_no_realizado = float(data.get("unrealizedPL", 0))

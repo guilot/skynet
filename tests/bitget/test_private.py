@@ -58,7 +58,10 @@ async def test_la_firma_no_es_el_secreto_en_claro():
 
 
 async def test_firmas_distintas_para_peticiones_distintas():
-    priv, cliente = _privado({"code": "00000", "data": []})
+    priv, cliente = _privado({"code": "00000", "data": [{
+        "marginCoin": "USDT", "accountEquity": "1000.0",
+        "unrealizedPL": "0.0", "available": "1000.0",
+    }]})
     await priv.get_posiciones()
     await priv.get_saldo()
     firmas = [p["headers"]["ACCESS-SIGN"] for p in cliente.peticiones]
@@ -119,7 +122,10 @@ async def test_la_cadena_de_consulta_firmada_es_exactamente_la_que_se_envia():
     de parámetros pero la URL se construye con otra, haciendo que Bitget rechace
     la firma con error genérico.
     """
-    priv, cliente = _privado({"code": "00000", "data": []})
+    priv, cliente = _privado({"code": "00000", "data": [{
+        "marginCoin": "USDT", "accountEquity": "1000.0",
+        "unrealizedPL": "0.0", "available": "1000.0",
+    }]})
     await priv.get_saldo()
 
     peticion = cliente.peticiones[0]
@@ -153,3 +159,41 @@ async def test_la_cadena_de_consulta_firmada_es_exactamente_la_que_se_envia():
         f"La firma enviada no coincide con la esperada. "
         f"URL={url_enviada}, params_str={params_str!r}"
     )
+
+
+async def test_el_saldo_selecciona_usdt_cuando_hay_multiples_monedas():
+    """Cuando hay múltiples monedas de margen, se escoge explícitamente USDT."""
+    priv, _ = _privado({"code": "00000", "data": [
+        {
+            "marginCoin": "BTC", "accountEquity": "1.0",
+            "unrealizedPL": "0.1", "available": "0.5",
+        },
+        {
+            "marginCoin": "USDT", "accountEquity": "1050.0",
+            "unrealizedPL": "50.0", "available": "800.0",
+        },
+        {
+            "marginCoin": "ETH", "accountEquity": "10.0",
+            "unrealizedPL": "1.0", "available": "5.0",
+        },
+    ]})
+    saldo = await priv.get_saldo()
+    # Debe coger la de USDT, no la primera (BTC)
+    assert saldo.realizado == pytest.approx(1000.0)
+    assert saldo.equity == pytest.approx(1050.0)
+
+
+async def test_el_saldo_falla_si_no_hay_usdt():
+    """Si no hay saldo en USDT, lanza un error claro."""
+    priv, _ = _privado({"code": "00000", "data": [
+        {
+            "marginCoin": "BTC", "accountEquity": "1.0",
+            "unrealizedPL": "0.1", "available": "0.5",
+        },
+        {
+            "marginCoin": "ETH", "accountEquity": "10.0",
+            "unrealizedPL": "1.0", "available": "5.0",
+        },
+    ]})
+    with pytest.raises(RuntimeError, match="No se encontró saldo en USDT"):
+        await priv.get_saldo()
