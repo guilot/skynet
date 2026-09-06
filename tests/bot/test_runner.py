@@ -1,6 +1,7 @@
 import pytest
 
 from scanner_volumen.bot.broker import PaperBroker
+from scanner_volumen.bot.model import OrdenEjecutada
 from scanner_volumen.bot.portfolio import LivePortfolio
 from scanner_volumen.bot.repo import BotRepo
 from scanner_volumen.bot.runner import BotRunner
@@ -284,3 +285,67 @@ async def test_los_contadores_del_informe_se_persisten(bot):
     contadores = repo.contadores("paper")
     assert contadores["transiciones"] == 3  # el segundo tick no trajo ninguna
     assert contadores["max_concurrentes"] == 3
+
+
+class _BrokerParcial:
+    """Cierra solo una parte de lo pedido, las veces que se le diga."""
+
+    def __init__(self, params, fraccion_servida=0.5, veces_parcial=99):
+        self._params = params
+        self.fraccion_servida = fraccion_servida
+        self.veces_parcial = veces_parcial
+        self.cierres = []
+
+    async def abrir(self, *, symbol, direction, notional, precio_mercado, ts):
+        return OrdenEjecutada(ts=ts, precio=precio_mercado,
+                              cantidad=notional / precio_mercado, comision=0.0)
+
+    async def cerrar(self, *, symbol, direction, cantidad, precio_mercado, ts):
+        self.cierres.append(cantidad)
+        if len(self.cierres) <= self.veces_parcial:
+            servida = cantidad * self.fraccion_servida
+        else:
+            servida = cantidad
+        return OrdenEjecutada(ts=ts, precio=precio_mercado, cantidad=servida,
+                              comision=0.0)
+
+
+async def test_un_fill_parcial_se_reintenta_hasta_completarse(tmp_path):
+    # el broker sirve la mitad la primera vez y todo la segunda: el bot debe
+    # reintentar el resto y acabar contabilizando la cantidad COMPLETA
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn); repo.set_equity_inicial("paper", 1000.0)
+    cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    params = StrategyParams(comision_taker=0.0)
+    broker = _BrokerParcial(params, fraccion_servida=0.5, veces_parcial=1)
+    runner = BotRunner(params, cfg, repo, broker, LivePortfolio(params, cfg, repo))
+
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+    await runner.on_tick([], precios({"A": 97.0}), ahora=MIN)   # stop
+
+    assert len(broker.cierres) >= 2, "no reintento el resto"
+    assert runner.abiertas == {}
+    cerradas = repo.cerradas("paper")
+    assert len(cerradas) == 1
+    # 4 unidades a 100, cerradas a 97: -12.0 exactos si se conto TODO
+    assert cerradas[0]["pnl"] == pytest.approx(-12.0)
+    conn.close()
+
+
+async def test_si_el_resto_no_se_completa_la_posicion_queda_degradada(tmp_path):
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn); repo.set_equity_inicial("paper", 1000.0)
+    cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    params = StrategyParams(comision_taker=0.0)
+    broker = _BrokerParcial(params, fraccion_servida=0.5)  # siempre parcial
+    runner = BotRunner(params, cfg, repo, broker, LivePortfolio(params, cfg, repo))
+
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+    await runner.on_tick([], precios({"A": 97.0}), ahora=MIN)
+
+    # no se descuadra el motor en silencio: se marca y se deja para el arranque
+    assert "A" in runner.abiertas
+    assert runner.abiertas["A"].degradada is True
+    conn.close()

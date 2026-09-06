@@ -45,6 +45,20 @@ log = logging.getLogger(__name__)
 
 PrecioDe = Callable[[str], float | None]
 
+# Máximo número de intentos de cierre para manejar fills parciales.
+# Con 3 intentos se cubre el 87.5% de los casos de dos fills parciales
+# (0.5 x 0.5 x 0.5 = 12.5% de probabilidad de quedarse corto incluso así).
+# Si el broker falla a media ejecución, 3 intentos es un buen balance entre
+# insistencia y evitar un bucle infinito.
+MAX_INTENTOS_CIERRE = 3
+
+# Tolerancia relativa para considerar que una cantidad está completa.
+# Con números en coma flotante, 4.0 - 0.5 - 0.5 - 3.0 no da exactamente
+# cero, así que necesitamos comparar con tolerancia. 1e-9 es lo bastante
+# pequeño para cantidades típicas (1-100000 unidades) sin ser tan
+# estricto que rechace redondeos reales.
+TOLERANCIA_CANTIDAD = 1e-9
+
 
 def _precio_regla_de(
     pos: PosicionAbierta, intent: ExitIntent, stop_vigente: float,
@@ -300,20 +314,73 @@ class BotRunner:
         self, pos: PosicionAbierta, intent: ExitIntent, precio: float, ahora: int,
         stop_vigente: float, tardio: bool = False,
     ) -> None:
-        cantidad = pos.size * intent.fraction
-        orden = await self._broker.cerrar(
-            symbol=pos.symbol, direction=pos.direction, cantidad=cantidad,
-            precio_mercado=precio, ts=ahora,
-        )
-        pos.reglas.on_fill(Fill(ts=intent.ts, price=orden.precio,
-                                fraction=intent.fraction, reason=intent.reason))
-        self._acumular_pnl(pos, orden.precio, intent.fraction, orden.comision)
+        """Ejecuta una salida intentando cerrar la cantidad completa, reintentando
+        fills parciales.
+
+        El motor de reglas mantiene dos contadores: _comprometido (baja al emitir
+        la intención) y _restante (baja al confirmar el fill). Si confirmamos menos
+        de lo pedido, quedan desincronizados para siempre, y el motor cerrará de
+        menos en adelante, incapaz de llegar a su tamaño objetivo.
+
+        Por eso la política es REINTENTAR: no confirmamos una fracción parcial
+        directamente, sino que reintentamos cerrar el resto hasta completarlo o
+        agotar intentos. Só si tras los intentos queda resto, confirmamos lo
+        ejecutado de verdad y marcamos la posición como degradada. El próximo
+        arranque reconciliará la discrepancia.
+        """
+        cantidad_objetivo = pos.size * intent.fraction
+        acumulado = 0.0  # cantidad ejecutada hasta ahora
+        comisiones_totales = 0.0
+        precio_acumulado = 0.0  # suma de precio * cantidad, para media ponderada
+
+        for intento in range(MAX_INTENTOS_CIERRE):
+            # ¿cuánto queda por cerrar?
+            falta = cantidad_objetivo - acumulado
+
+            # ¿ya acabamos (con tolerancia)?
+            if abs(falta) < TOLERANCIA_CANTIDAD:
+                break
+
+            orden = await self._broker.cerrar(
+                symbol=pos.symbol, direction=pos.direction, cantidad=falta,
+                precio_mercado=precio, ts=ahora,
+            )
+
+            acumulado += orden.cantidad
+            comisiones_totales += orden.comision
+            precio_acumulado += orden.precio * orden.cantidad
+
+        # Calcular la fracción realmente ejecutada y el precio medio ponderado
+        ejecutado_total = acumulado
+        fraccion_ejecutada = ejecutado_total / pos.size if pos.size > 0 else 0.0
+        precio_medio = precio_acumulado / ejecutado_total if ejecutado_total > 0 else precio
+
+        # Confirmar al motor UNA SOLA VEZ con la fracción realmente ejecutada
+        pos.reglas.on_fill(Fill(ts=intent.ts, price=precio_medio,
+                                fraction=fraccion_ejecutada, reason=intent.reason))
+
+        # Acumular PnL con el precio medio ponderado y las comisiones reales
+        self._acumular_pnl(pos, precio_medio, fraccion_ejecutada, comisiones_totales)
+
         self._repo.registrar_fill(
-            pos.id, ts=intent.ts, reason=intent.reason, fraction=intent.fraction,
-            precio_referencia=intent.precio_referencia, precio=orden.precio,
-            comision=orden.comision, tardio=tardio,
+            pos.id, ts=intent.ts, reason=intent.reason, fraction=fraccion_ejecutada,
+            precio_referencia=intent.precio_referencia, precio=precio_medio,
+            comision=comisiones_totales, tardio=tardio,
             precio_regla=_precio_regla_de(pos, intent, stop_vigente),
         )
+
+        # Si no conseguimos ejecutar lo que se pedía, marcar como degradada
+        falta_final = cantidad_objetivo - ejecutado_total
+        if abs(falta_final) > TOLERANCIA_CANTIDAD:
+            pos.degradada = True
+            self._repo.marcar_degradada(pos.id)
+            log.error(
+                "bot: %s: cierre parcial %s: pedidos %.6g, ejecutados %.6g, "
+                "diferencia %.6g. Motor quedará descuadrado en este arranque; "
+                "reconciliación en próximo arranque lo reparará.",
+                pos.symbol, intent.reason.value, cantidad_objetivo, ejecutado_total,
+                falta_final,
+            )
 
     def _acumular_pnl(
         self, pos: PosicionAbierta, precio: float, fraction: float, comision: float,
