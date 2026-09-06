@@ -1,0 +1,230 @@
+"""Reconciliación al arrancar (Task 8): el bot en modo real no puede fiarse
+solo de su base de datos -Bitget es quien de verdad tiene el dinero-. Estos
+tests cubren las tres situaciones de la tabla del brief más el caso de
+idempotencia por `client_oid` y el aislamiento de fallos.
+"""
+import pytest
+
+from scanner_volumen.bot.broker import PaperBroker
+from scanner_volumen.bot.model import OrdenEjecutada, PosicionExchange
+from scanner_volumen.bot.portfolio import LivePortfolio
+from scanner_volumen.bot.repo import BotRepo
+from scanner_volumen.bot.runner import BotRunner
+from scanner_volumen.config import BotConfig
+from scanner_volumen.models import Direction, State
+from scanner_volumen.storage.db import open_db
+from scanner_volumen.strategy.model import CandleRow, StrategyParams, TransitionRow
+
+MIN = 60_000
+
+
+def _nuevo_runner(conn):
+    repo = BotRepo(conn)
+    cfg = BotConfig(enabled=True, modo="paper", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    params = StrategyParams(comision_taker=0.0)
+    cartera = LivePortfolio(params, cfg, repo)
+    return BotRunner(params, cfg, repo, PaperBroker(params), cartera), repo
+
+
+@pytest.fixture
+def conn(tmp_path):
+    c = open_db(tmp_path / "scanner.db")
+    BotRepo(c).set_equity_inicial("paper", 1000.0)
+    yield c
+    c.close()
+
+
+def tr(symbol="A", ts=0, prev=State.NORMAL, new=State.WATCH, price=100.0,
+       score=75.0):
+    return TransitionRow(ts=ts, symbol=symbol, prev_state=prev, new_state=new,
+                         price=price, direction=Direction.LONG, score=score)
+
+
+def velas(inicio, precios):
+    return [CandleRow(ts=inicio + i * MIN, open=p, high=p, low=p, close=p)
+            for i, p in enumerate(precios)]
+
+
+def _sin_historial(symbol, desde):
+    return []
+
+
+def _sin_velas(symbol, desde):
+    return []
+
+
+def _sin_precio(symbol):
+    return None
+
+
+def _sin_cierre(symbol):
+    return None
+
+
+async def test_posicion_en_ambos_se_adopta_con_el_motor_reconstruido(conn):
+    # Bot 1: entra y escala a HOT (cobra el tramo y sube el stop a BE), igual
+    # que en la reconstrucción tras reinicio (Fase 2) -la reconciliación
+    # reutiliza exactamente la misma maquinaria (`_reconstruir_una`).
+    bot1, repo = _nuevo_runner(conn)
+    await bot1.on_tick([tr()], lambda s: 100.0, ahora=0)
+    await bot1.on_tick([tr(ts=MIN, prev=State.WATCH, new=State.HOT, price=110.0)],
+                       lambda s: 105.0, ahora=MIN)
+    assert bot1.abiertas["A"].reglas.stop_en_be is True
+
+    # Bot 2: proceso nuevo. Bitget SÍ tiene la posición (ambos la tienen).
+    bot2, _ = _nuevo_runner(conn)
+    historial = [tr(), tr(ts=MIN, prev=State.WATCH, new=State.HOT, price=110.0)]
+    exchange = [PosicionExchange(symbol="A", direction=Direction.LONG,
+                                  size=4.0, entry_price=100.0, entry_ts=0,
+                                  client_oid=None)]
+    await bot2.reconciliar_con_exchange(
+        exchange,
+        transiciones_de=lambda s, desde: historial,
+        velas_de=lambda s, desde: velas(0, [100.0, 110.0]),
+        precio_de=lambda s: 110.0,
+        fill_de_cierre=_sin_cierre,
+        ahora=2 * MIN,
+    )
+    assert "A" in bot2.abiertas
+    assert bot2.abiertas["A"].reglas.stop_en_be is True
+    assert bot2.abiertas["A"].reglas.restante == pytest.approx(0.67)
+
+
+async def test_el_bot_la_cree_abierta_bitget_no_se_cierra_con_el_fill_real(conn):
+    bot1, repo = _nuevo_runner(conn)
+    await bot1.on_tick([tr()], lambda s: 100.0, ahora=0)
+    assert "A" in bot1.abiertas
+
+    # Bot 2: proceso nuevo, Bitget ya no tiene la posición -se cerró
+    # mientras estábamos caídos-. Se le inyecta el fill real de ese cierre.
+    bot2, _ = _nuevo_runner(conn)
+    fill_real = OrdenEjecutada(ts=5 * MIN, precio=90.0, cantidad=4.0, comision=0.0)
+    await bot2.reconciliar_con_exchange(
+        [],
+        transiciones_de=_sin_historial, velas_de=_sin_velas, precio_de=_sin_precio,
+        fill_de_cierre=lambda s: fill_real if s == "A" else None,
+        ahora=5 * MIN,
+    )
+    assert "A" not in bot2.abiertas
+    cerradas = repo.cerradas("paper")
+    assert len(cerradas) == 1
+    assert cerradas[0]["symbol"] == "A"
+    # LONG, entra a 100, cierra a 90: pérdida.
+    assert cerradas[0]["pnl"] == pytest.approx((90.0 - 100.0) * 4.0)
+    assert repo.contadores("paper").get("posiciones cerradas en el exchange") == 1
+
+
+async def test_bitget_la_tiene_el_bot_no_la_reconoce_no_se_toca_y_se_veta(conn):
+    bot, repo = _nuevo_runner(conn)
+    exchange = [PosicionExchange(symbol="B", direction=Direction.LONG,
+                                  size=1.0, entry_price=50.0, entry_ts=0,
+                                  client_oid=None)]
+    await bot.reconciliar_con_exchange(
+        exchange,
+        transiciones_de=_sin_historial, velas_de=_sin_velas, precio_de=_sin_precio,
+        fill_de_cierre=_sin_cierre,
+        ahora=MIN,
+    )
+    assert "B" not in bot.abiertas
+    assert repo.abiertas("paper") == []  # no se creó ningún registro local
+    assert "B" in bot.simbolos_vetados
+    assert repo.contadores("paper").get("posiciones ajenas") == 1
+
+    # una entrada posterior para ese símbolo se descarta, sin abrir nada.
+    await bot.on_tick([tr(symbol="B", ts=2 * MIN)], lambda s: 50.0, ahora=2 * MIN)
+    assert "B" not in bot.abiertas
+    assert repo.contadores("paper").get("simbolo vetado") == 1
+
+
+async def test_reserva_con_client_oid_que_casa_se_reconoce_como_propia(conn):
+    repo = BotRepo(conn)
+    # Un proceso murió justo después de que Bitget aceptara la orden: la fila
+    # quedó reservada (confirmada=0) con datos provisionales.
+    posicion_id = repo.abrir(
+        modo="paper", symbol="A", direction=Direction.LONG, entry_ts=0,
+        entry_price=100.0, entry_price_senal=100.0, margin=20.0,
+        notional=400.0, size=4.0, fee_entrada=0.0,
+        client_oid="bot-abc123", confirmada=False,
+    )
+
+    bot, _ = _nuevo_runner(conn)
+    exchange = [PosicionExchange(symbol="A", direction=Direction.LONG,
+                                  size=4.0, entry_price=101.5, entry_ts=0,
+                                  client_oid="bot-abc123")]
+    await bot.reconciliar_con_exchange(
+        exchange,
+        transiciones_de=lambda s, desde: [tr()], velas_de=lambda s, desde: [],
+        precio_de=lambda s: 101.5,
+        fill_de_cierre=_sin_cierre,
+        ahora=MIN,
+    )
+    fila = repo.por_client_oid("paper", "bot-abc123")
+    assert fila["id"] == posicion_id
+    assert fila["confirmada"] == 1
+    assert fila["entry_price"] == pytest.approx(101.5)
+    # se reconoce como propia -no como ajena- y se adopta como cualquier otra.
+    assert "A" in bot.abiertas
+    assert "A" not in bot.simbolos_vetados
+    assert repo.contadores("paper").get("posiciones ajenas", 0) == 0
+
+
+async def test_reserva_sin_contrapartida_se_cierra_sin_operacion(conn):
+    repo = BotRepo(conn)
+    posicion_id = repo.abrir(
+        modo="paper", symbol="A", direction=Direction.LONG, entry_ts=0,
+        entry_price=100.0, entry_price_senal=100.0, margin=20.0,
+        notional=400.0, size=4.0, fee_entrada=0.0,
+        client_oid="bot-nunca-ejecuto", confirmada=False,
+    )
+    bot, _ = _nuevo_runner(conn)
+    await bot.reconciliar_con_exchange(
+        [],  # Bitget no tiene absolutamente nada de esta orden
+        transiciones_de=_sin_historial, velas_de=_sin_velas, precio_de=_sin_precio,
+        fill_de_cierre=_sin_cierre,
+        ahora=MIN,
+    )
+    fila = repo.por_client_oid("paper", "bot-nunca-ejecuto")
+    assert fila["confirmada"] == 0  # nunca se llegó a confirmar de verdad
+    assert fila["abierta"] == 0     # pero ya no ocupa el hueco
+    assert repo.abiertas("paper") == []
+    assert repo.contadores("paper").get("reserva sin ejecutar") == 1
+
+
+async def test_un_fallo_al_reconciliar_una_no_impide_las_demas_ni_arrancar(conn):
+    bot1, repo = _nuevo_runner(conn)
+    await bot1.on_tick([tr(symbol="A")], lambda s: 100.0, ahora=0)
+    await bot1.on_tick([tr(symbol="C", ts=0)], lambda s: 100.0, ahora=0)
+    assert set(bot1.abiertas) == {"A", "C"}
+
+    bot2, _ = _nuevo_runner(conn)
+    exchange = [PosicionExchange(symbol="A", direction=Direction.LONG,
+                                  size=4.0, entry_price=100.0, entry_ts=0,
+                                  client_oid=None)]
+    fill_c = OrdenEjecutada(ts=MIN, precio=95.0, cantidad=4.0, comision=0.0)
+
+    def _historial_que_revienta_para_a(symbol, desde):
+        if symbol == "A":
+            raise RuntimeError("boom: el histórico de A no se pudo leer")
+        return []
+
+    # No debe propagar la excepción: la reconciliación de C debe completarse
+    # igualmente y el proceso debe poder seguir arrancando.
+    await bot2.reconciliar_con_exchange(
+        exchange,
+        transiciones_de=_historial_que_revienta_para_a, velas_de=_sin_velas,
+        precio_de=_sin_precio,
+        fill_de_cierre=lambda s: fill_c if s == "C" else None,
+        ahora=MIN,
+    )
+
+    # C (bot la cree abierta, Bitget no) se reconcilió sin problema.
+    assert "C" not in bot2.abiertas
+    cerradas = {f["symbol"]: f for f in repo.cerradas("paper")}
+    assert "C" in cerradas
+
+    # A falló al reconciliarse: se deja tal cual (sigue abierta en la base,
+    # sin adoptar en este proceso), no aparece adoptada a medias.
+    assert "A" not in bot2.abiertas
+    abiertas = {f["symbol"] for f in repo.abiertas("paper")}
+    assert "A" in abiertas

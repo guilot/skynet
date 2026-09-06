@@ -61,9 +61,34 @@ class PosicionAbierta:
     stop_price_colocado: float | None = None
 
 
+@dataclass(frozen=True)
+class PosicionExchange:
+    """Una posición tal como la reporta el exchange, ya traducida al
+    vocabulario del bot (símbolo, dirección, tamaño en unidades del activo).
+
+    La reconciliación de arranque (Task 8, `BotRunner.reconciliar_con_
+    exchange`) la compara contra lo que el bot cree tener abierto en su
+    base de datos -la verdad, en modo real, la tiene el exchange, no la
+    base-. `client_oid`, si se conoce, es el identificador de la orden que
+    la abrió: es lo que permite reconocer como propia una posición que un
+    proceso murió a medias sin llegar a confirmar (ver `BotRepo.
+    reservadas_sin_confirmar`); puede ser `None` si no se pudo recuperar
+    (p. ej. porque el exchange ya no conserva ese historial de órdenes).
+    """
+
+    symbol: str
+    direction: Direction
+    size: float
+    entry_price: float
+    entry_ts: int
+    client_oid: str | None = None
+
+
 # Etiquetas de descarte del bot, en el orden en que se imprimen. Coinciden con
 # las del backtest salvo "sin velas" (que en vivo no aplica) y "desvio" (que en
-# el backtest no existe).
+# el backtest no existe). "simbolo vetado" es la única exclusiva de la Fase 3:
+# la reconciliación de arranque (Task 8) veta un símbolo que el exchange tiene
+# abierto y el bot no reconoce, para no volver a tocarlo en toda la sesión.
 ETIQUETAS_DESCARTE = (
     "NEUTRAL",
     "simbolo abierto",
@@ -71,4 +96,5 @@ ETIQUETAS_DESCARTE = (
     "score bajo",
     "par congelado",
     "desvio",
+    "simbolo vetado",
 )

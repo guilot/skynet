@@ -40,11 +40,11 @@ from collections.abc import Callable
 from uuid import uuid4
 
 from scanner_volumen.bot.broker import Broker
-from scanner_volumen.bot.model import PosicionAbierta
+from scanner_volumen.bot.model import OrdenEjecutada, PosicionAbierta, PosicionExchange
 from scanner_volumen.bot.portfolio import LivePortfolio
 from scanner_volumen.bot.repo import BotRepo
 from scanner_volumen.config import BotConfig
-from scanner_volumen.models import Direction
+from scanner_volumen.models import Direction, State
 from scanner_volumen.strategy.entries import es_entrada
 from scanner_volumen.strategy.model import (
     CandleRow, ExitIntent, ExitReason, Fill, StrategyParams, TransitionRow,
@@ -54,6 +54,11 @@ from scanner_volumen.strategy.position import PositionRules, agrupar_por_vela
 log = logging.getLogger(__name__)
 
 PrecioDe = Callable[[str], float | None]
+# Dado un símbolo que el bot cree abierto pero que ya no está en el exchange,
+# el fill real con el que se cerró mientras el proceso estaba caído -o
+# `None` si no se pudo recuperar de la historia del exchange. Lo usa
+# `reconciliar_con_exchange` (Task 8): nunca se inventa un precio de cierre.
+FillDeCierre = Callable[[str], OrdenEjecutada | None]
 
 # Máximo número de intentos de cierre para manejar fills parciales.
 # Con 3 intentos se cubre el 87.5% de los casos de dos fills parciales
@@ -129,6 +134,15 @@ class BotRunner:
         self.abiertas: dict[str, PosicionAbierta] = {}
         self.transiciones_vistas = 0
         self.cierres_tardios = 0
+        # Símbolos que el exchange tiene abiertos y que el bot, al arrancar,
+        # no supo explicar como propios (Task 8: reconciliación). Se vetan
+        # -no se abre nada nuevo en ellos- durante el resto de la sesión de
+        # este proceso: la regla que no se negocia es que el bot nunca cierra
+        # con dinero real algo que no entiende, y abrir una entrada NUEVA
+        # ahí encima solo empeoraría la confusión. No se persiste: es un
+        # veto de esta sesión, y el próximo arranque vuelve a reconciliar
+        # desde cero.
+        self.simbolos_vetados: set[str] = set()
 
     async def on_tick(
         self, transiciones: list[TransitionRow], precio_de: PrecioDe, ahora: int,
@@ -159,6 +173,12 @@ class BotRunner:
         for t in transiciones:
             try:
                 if not es_entrada(t):
+                    continue
+                if t.symbol in self.simbolos_vetados:
+                    # el exchange tiene esto abierto y la reconciliación no
+                    # supo reconocerlo como propio (Task 8): no se toca ni se
+                    # abre nada encima mientras dure la sesión.
+                    self._repo.incrementar_contador(self._cfg.modo, "simbolo vetado")
                     continue
                 if t.price is None or t.price <= 0:
                     # sin precio de señal (símbolo sin vela en curso) no hay
@@ -465,6 +485,218 @@ class BotRunner:
         pos.reglas.on_fill(Fill(ts=intent.ts, price=precio,
                                 fraction=intent.fraction, reason=intent.reason))
         self._acumular_pnl(pos, precio, intent.fraction, registrado["comision"])
+
+    # --- reconciliación con el exchange al arrancar (Task 8) ---
+
+    async def reconciliar_con_exchange(
+        self, posiciones_exchange: list[PosicionExchange],
+        transiciones_de, velas_de, precio_de: PrecioDe,
+        fill_de_cierre: FillDeCierre, ahora: int,
+    ) -> None:
+        """Reconcilia lo que el bot cree tener abierto contra lo que el
+        exchange reporta de verdad. En modo paper la base de datos es la
+        verdad; en modo real, la verdad la tiene el exchange -ahí es donde
+        está el dinero-, y esto es lo que cierra esa brecha al arrancar.
+
+        Recorre las tres situaciones posibles, en este orden:
+
+        1. Ambos la tienen: se ADOPTA reutilizando `_reconstruir_una` -la
+           misma maquinaria de la Fase 2 que replica el historial de
+           transiciones y velas y casa los fills ya registrados, dejando el
+           motor en su estado exacto.
+        2. El bot la cree abierta y el exchange no: se cerró mientras
+           estábamos caídos. Se busca el FILL REAL de ese cierre (nunca se
+           inventa un precio) y se cierra en la base a ese precio.
+        3. El exchange la tiene y el bot no la reconoce: la regla que no se
+           negocia es que el bot nunca cierra con dinero real algo que no
+           entiende. NO se toca -se deja intacta para que la vea un
+           humano- y se veta el símbolo el resto de la sesión
+           (`self.simbolos_vetados`, comprobado en `on_tick`).
+
+        Antes de dar una posición del exchange por ajena, se busca por
+        `client_oid` entre las filas reservadas sin confirmar
+        (`confirmada = 0`): esa es la huella exacta de un proceso que murió
+        entre mandar la orden y registrar su resultado, y si coincide la
+        posición es propia, no ajena -se confirma con los datos reales y
+        sigue el camino normal del punto 1-. Una reserva SIN contrapartida
+        en el exchange significa que la orden nunca llegó a ejecutarse: se
+        cierra sin operación para no dejarla colgada ocupando un hueco de
+        concurrencia.
+
+        Cada posición se aísla de las demás, igual que en `on_tick` y en
+        `reconstruir`: un fallo al reconciliar una no debe impedir
+        reconciliar el resto ni que el bot llegue a arrancar.
+        """
+        modo = self._cfg.modo
+
+        for fila in self._repo.reservadas_sin_confirmar(modo):
+            try:
+                self._resolver_reserva(fila, posiciones_exchange, ahora)
+            except Exception:
+                log.exception(
+                    "bot: reconciliacion: fallo al resolver la reserva de "
+                    "%s (client_oid=%r); se deja tal cual para el proximo "
+                    "arranque", fila["symbol"], fila["client_oid"])
+
+        filas_abiertas = self._repo.abiertas(modo)
+        simbolos_bot = {f["symbol"] for f in filas_abiertas}
+        por_symbol_exchange = {p.symbol: p for p in posiciones_exchange}
+
+        for fila in filas_abiertas:
+            try:
+                if fila["symbol"] in por_symbol_exchange:
+                    # (1) ambos la tienen: adoptar reconstruyendo el motor.
+                    await self._reconstruir_una(
+                        fila, transiciones_de, velas_de, precio_de, ahora)
+                else:
+                    # (2) el bot la cree abierta, el exchange no.
+                    await self._reconciliar_cerrada_en_exchange(
+                        fila, transiciones_de, fill_de_cierre, ahora)
+            except Exception:
+                log.exception(
+                    "bot: reconciliacion: fallo al reconciliar %s; se deja "
+                    "tal cual para el proximo arranque", fila["symbol"])
+
+        for symbol in por_symbol_exchange:
+            if symbol in simbolos_bot:
+                continue
+            try:
+                # (3) el exchange la tiene y el bot no la reconoce: no se
+                # toca, se veta.
+                self.simbolos_vetados.add(symbol)
+                self._repo.incrementar_contador(modo, "posiciones ajenas")
+                log.error(
+                    "bot: reconciliacion: %s abierta en el exchange y "
+                    "desconocida para el bot; NO se toca -- simbolo vetado "
+                    "el resto de la sesion, requiere revision manual",
+                    symbol)
+            except Exception:
+                log.exception(
+                    "bot: reconciliacion: fallo al registrar %s como ajena",
+                    symbol)
+
+    def _resolver_reserva(
+        self, fila: dict, posiciones_exchange: list[PosicionExchange],
+        ahora: int,
+    ) -> None:
+        """Resuelve una fila `confirmada = 0`: la huella de un proceso que
+        murió entre mandar la orden y registrar su resultado.
+
+        Si su `client_oid` casa con una posición del exchange, la orden SÍ
+        se ejecutó -es propia-: se confirma con los datos reales (igual que
+        `confirmar_apertura` en caliente) y sigue su camino normal como una
+        posición más en `reconciliar_con_exchange` (el símbolo ya aparecerá
+        en `repo.abiertas()` confirmado cuando ese paso vuelva a leerla).
+
+        Si no casa con nada, la orden nunca llegó a ejecutarse: se cierra
+        sin operación (pnl y comisión de cierre en cero) para no dejarla
+        colgada ocupando un hueco de concurrencia.
+        """
+        client_oid = fila["client_oid"]
+        pos_exch = next(
+            (p for p in posiciones_exchange
+             if client_oid is not None and p.client_oid == client_oid),
+            None,
+        )
+        if pos_exch is not None:
+            self._repo.confirmar_apertura(
+                fila["id"], entry_price=pos_exch.entry_price,
+                size=pos_exch.size, fee_entrada=fila["fee_entrada"],
+            )
+            return
+        self._repo.cerrar(fila["id"], close_ts=ahora, pnl=0.0,
+                          fees=fila["fee_entrada"], max_rank=0)
+        self._repo.incrementar_contador(self._cfg.modo, "reserva sin ejecutar")
+        log.warning(
+            "bot: reconciliacion: %s (client_oid=%r) reservada sin "
+            "contrapartida en el exchange; la orden nunca se ejecuto, se "
+            "cierra sin operacion", fila["symbol"], client_oid)
+
+    async def _reconciliar_cerrada_en_exchange(
+        self, fila: dict, transiciones_de, fill_de_cierre: FillDeCierre,
+        ahora: int,
+    ) -> None:
+        """Cierra en la base una posición que el bot cree abierta pero que
+        ya no existe en el exchange: se cerró mientras el proceso estaba
+        caído. Se completa SIEMPRE con el fill real de ese cierre -nunca con
+        un precio inventado-; si no se encuentra, se deja la fila intacta
+        para revisión manual en vez de arriesgar un PnL fantasma.
+        """
+        symbol = fila["symbol"]
+        orden = fill_de_cierre(symbol)
+        if orden is None:
+            log.error(
+                "bot: reconciliacion: %s figura abierta en la base pero no "
+                "en el exchange, y no se encontro el fill real de su "
+                "cierre; se deja intacta -- requiere revision manual",
+                symbol)
+            return
+
+        entry_ts = fila["entry_ts"]
+        direction = Direction(fila["direction"])
+        historial = list(transiciones_de(symbol, entry_ts))
+        entrada = next((t for t in historial if t.ts == entry_ts), None)
+        if entrada is not None:
+            max_rank = max(t.new_state.rank for t in historial)
+            entrada_real = TransitionRow(
+                ts=entry_ts, symbol=symbol, prev_state=entrada.prev_state,
+                new_state=entrada.new_state, price=fila["entry_price"],
+                direction=direction, score=entrada.score,
+            )
+        else:
+            # sin transición de entrada en la base no hay de dónde sacar el
+            # `max_rank` real; se usa el mínimo posible en vez de reventar
+            # -esto solo maquilla una estadística del informe (Runners vs
+            # Arrastre), nunca el dinero, que sale íntegro de `_acumular_pnl`.
+            max_rank = 0
+            entrada_real = TransitionRow(
+                ts=entry_ts, symbol=symbol, prev_state=State.NORMAL,
+                new_state=State.NORMAL, price=fila["entry_price"],
+                direction=direction, score=0.0,
+            )
+
+        # `pos` es una construcción de solo lectura de contabilidad: no se
+        # vuelve a tocar su motor de reglas (no hay ninguna `ExitIntent`
+        # pendiente que confirmar, el exchange ya decidió el cierre por su
+        # cuenta), solo se usa para reutilizar `_acumular_pnl` -la única
+        # fórmula de la que sale el PnL real- en vez de recalcularlo aquí
+        # con una segunda copia que pudiera divergir.
+        pos = PosicionAbierta(
+            id=fila["id"], symbol=symbol, direction=direction,
+            entry_ts=entry_ts, entry_price=fila["entry_price"],
+            entry_price_senal=fila["entry_price_senal"], margin=fila["margin"],
+            notional=fila["notional"], size=fila["size"],
+            reglas=PositionRules(entrada_real, self._params),
+            pnl_acumulado=-fila["fee_entrada"], fees_acumuladas=fila["fee_entrada"],
+            stop_id=fila["stop_id"],
+        )
+        restante = 1.0
+        for f in self._repo.fills_de(fila["id"]):
+            self._acumular_pnl(pos, f["precio"], f["fraction"], f["comision"])
+            restante -= f["fraction"]
+        if restante > TOLERANCIA_CANTIDAD:
+            self._acumular_pnl(pos, orden.precio, restante, orden.comision)
+            # Motivo STOP: en espíritu es exactamente eso -el stop que
+            # habíamos dejado puesto en el exchange (Task 7) protegiendo la
+            # posición mientras el proceso estaba caído-, con la salvedad de
+            # que aquí no hay un nivel de regla conocido contra el que medir
+            # el desvío (`precio_regla=None`, igual que EXTREME/END_OF_DATA).
+            self._repo.registrar_fill(
+                pos.id, ts=ahora, reason=ExitReason.STOP, fraction=restante,
+                precio_referencia=orden.precio, precio=orden.precio,
+                comision=orden.comision,
+            )
+
+        await self._cancelar_stop(pos)
+        self._repo.cerrar(pos.id, close_ts=ahora, pnl=pos.pnl_acumulado,
+                          fees=pos.fees_acumuladas, max_rank=max_rank)
+        self.portfolio.registrar_cierre(symbol, ahora, pos.pnl_acumulado)
+        self._repo.incrementar_contador(
+            self._cfg.modo, "posiciones cerradas en el exchange")
+        log.warning(
+            "bot: reconciliacion: %s cerrada en el exchange mientras el bot "
+            "estaba caido; se cierra en la base a %.6g (pnl %.2f)",
+            symbol, orden.precio, pos.pnl_acumulado)
 
     # --- posiciones vivas ---
 
