@@ -1,3 +1,7 @@
+import base64
+import hashlib
+import hmac
+
 import pytest
 
 from scanner_volumen.bitget.private import BitgetPrivate
@@ -95,3 +99,57 @@ async def test_las_posiciones_se_mapean_con_simbolo_lado_y_tamano():
     assert len(posiciones) == 1
     assert posiciones[0].symbol == "BTCUSDT"
     assert posiciones[0].tamano == pytest.approx(0.5)
+
+
+async def test_repr_no_filtra_las_credenciales():
+    """El repr de la instancia nunca debe exponer api_key, api_secret o passphrase."""
+    priv, _ = _privado({"code": "00000", "data": []})
+    repr_str = repr(priv)
+    assert "clave" not in repr_str
+    assert "secreto" not in repr_str
+    assert "frase" not in repr_str
+    # Sí debe incluir el venue
+    assert "USDT-FUTURES" in repr_str
+
+
+async def test_la_cadena_de_consulta_firmada_es_exactamente_la_que_se_envia():
+    """Verifica que lo que se firma es byte a byte lo que se envía.
+
+    Este test cierra el agujero donde la firma se construye con una serialización
+    de parámetros pero la URL se construye con otra, haciendo que Bitget rechace
+    la firma con error genérico.
+    """
+    priv, cliente = _privado({"code": "00000", "data": []})
+    await priv.get_saldo()
+
+    peticion = cliente.peticiones[0]
+    url_enviada = peticion["url"]
+    headers = peticion["headers"]
+    timestamp = headers["ACCESS-TIMESTAMP"]
+    firma_recibida = headers["ACCESS-SIGN"]
+
+    # Extraer path y query string de la URL
+    # URL tiene formato: https://api.bitget.com/ruta?parámetros
+    # Queremos extraer /ruta?parámetros o /ruta (sin ?)
+    assert url_enviada.startswith("https://api.bitget.com")
+    path_y_query = url_enviada[len("https://api.bitget.com"):]
+
+    # Separar path de query string
+    if "?" in path_y_query:
+        path, query_parte = path_y_query.split("?", 1)
+        query_string = "?" + query_parte
+    else:
+        path = path_y_query
+        query_string = ""
+
+    # Reconstruir la firma con lo que se envió
+    params_str = timestamp + "GET" + path + query_string
+    firma_esperada = base64.b64encode(
+        hmac.new("secreto".encode(), params_str.encode(), hashlib.sha256).digest()
+    ).decode()
+
+    # La firma debe coincidir exactamente
+    assert firma_recibida == firma_esperada, (
+        f"La firma enviada no coincide con la esperada. "
+        f"URL={url_enviada}, params_str={params_str!r}"
+    )

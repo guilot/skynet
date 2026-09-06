@@ -66,25 +66,41 @@ class BitgetPrivate:
         self._passphrase = passphrase
         self._product_params = {"productType": venue}
 
+    def __repr__(self) -> str:
+        """Representación que no expone las credenciales."""
+        return f"BitgetPrivate(venue={self._venue!r})"
+
     async def _pedir(self, method: str, path: str, params: dict[str, str] | None = None) -> dict:
         """Realiza una petición autenticada a Bitget.
 
         Comprueba que code == "00000", sino lanza RuntimeError sin exponer credenciales.
+
+        IMPORTANTE: La cadena de consulta se construye una sola vez y se usa tanto para
+        la firma como para la URL. Esto garantiza que lo que se firma es exactamente
+        lo que se envía. Para POST/PUT con cuerpo, aplicar el mismo principio:
+        serializar una sola vez y usar esa cadena exacta en la firma y en el envío
+        (via content= de httpx, nunca json=).
         """
         await self._bucket.acquire()
         todos = {**self._product_params, **(params or {})}
 
-        url = f"{BASE_URL}{path}"
+        # Forzar el método a mayúsculas (spec de Bitget)
+        metodo_mayusculas = method.upper()
         timestamp = str(int(time.time() * 1000))
 
-        # Construir la firma según el spec de Bitget
+        # Construir la cadena de consulta UNA SOLA VEZ para usarla en firma y URL
+        # Si no hay parámetros, la parte extra debe ser cadena vacía (no "?")
         query_string = ""
-        if method == "GET" and todos:
+        if metodo_mayusculas == "GET" and todos:
+            # Sorted para garantizar orden consistente
+            # Nota: aquí se asume que los valores no necesitan codificación URL.
+            # Si aparecen valores con caracteres especiales, usar urllib.parse.urlencode
+            # pero entonces hay que asegurarse de que la codificación se usa en ambas cosas.
             query_string = "&".join(f"{k}={v}" for k, v in sorted(todos.items()))
             query_string = "?" + query_string
 
         # paramsStr = timestamp + METODO + ruta + extra
-        params_str = timestamp + method + path + query_string
+        params_str = timestamp + metodo_mayusculas + path + query_string
 
         # firma = base64(HMAC-SHA256(secreto, paramsStr))
         firma = base64.b64encode(
@@ -95,6 +111,9 @@ class BitgetPrivate:
             ).digest()
         ).decode()
 
+        # Construir la URL final con la cadena de consulta ya formada
+        url = f"{BASE_URL}{path}{query_string}"
+
         headers = {
             "ACCESS-KEY": self._api_key,
             "ACCESS-SIGN": firma,
@@ -103,10 +122,10 @@ class BitgetPrivate:
             "Content-Type": "application/json",
         }
 
+        # NO pasar params= en GET; la URL ya contiene la query string
         resp = await self._client.request(
-            method,
+            metodo_mayusculas,
             url,
-            params=todos if method == "GET" else None,
             headers=headers,
         )
         resp.raise_for_status()
