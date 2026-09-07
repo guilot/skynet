@@ -74,6 +74,13 @@ class PosicionExchange:
     proceso murió a medias sin llegar a confirmar (ver `BotRepo.
     reservadas_sin_confirmar`); puede ser `None` si no se pudo recuperar
     (p. ej. porque el exchange ya no conserva ese historial de órdenes).
+
+    `fee_entrada`, si se conoce, es la comisión que el exchange cobró de
+    verdad al abrir -la reconciliación la usa para sustituir el valor
+    provisional de una reserva confirmada por `client_oid` (ver
+    `BotRunner._resolver_reserva`); sin ella, ese PnL queda optimista en
+    exactamente lo que costó abrir. Puede ser `None` si el exchange no la
+    conserva junto al resto de datos de la posición.
     """
 
     symbol: str
@@ -82,6 +89,7 @@ class PosicionExchange:
     entry_price: float
     entry_ts: int
     client_oid: str | None = None
+    fee_entrada: float | None = None
 
 
 # Etiquetas de descarte del bot, en el orden en que se imprimen. Coinciden con

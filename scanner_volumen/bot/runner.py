@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
 from scanner_volumen.bot.broker import Broker
@@ -58,7 +58,12 @@ PrecioDe = Callable[[str], float | None]
 # el fill real con el que se cerró mientras el proceso estaba caído -o
 # `None` si no se pudo recuperar de la historia del exchange. Lo usa
 # `reconciliar_con_exchange` (Task 8): nunca se inventa un precio de cierre.
-FillDeCierre = Callable[[str], OrdenEjecutada | None]
+# Asíncrono a propósito: la consulta real al historial de fills de Bitget es
+# una llamada de red, y este método ya corre en un contexto `async` que hace
+# `await` sobre el broker en el resto del fichero -envolver esa llamada en
+# una fachada síncrona no aportaría nada y solo trasladaría la curvatura a
+# quien cablee esto contra el exchange de verdad (Task 13).
+FillDeCierre = Callable[[str], Awaitable[OrdenEjecutada | None]]
 
 # Máximo número de intentos de cierre para manejar fills parciales.
 # Con 3 intentos se cubre el 87.5% de los casos de dos fills parciales
@@ -518,10 +523,15 @@ class BotRunner:
         (`confirmada = 0`): esa es la huella exacta de un proceso que murió
         entre mandar la orden y registrar su resultado, y si coincide la
         posición es propia, no ajena -se confirma con los datos reales y
-        sigue el camino normal del punto 1-. Una reserva SIN contrapartida
-        en el exchange significa que la orden nunca llegó a ejecutarse: se
-        cierra sin operación para no dejarla colgada ocupando un hueco de
-        concurrencia.
+        sigue el camino normal del punto 1- (ver `_resolver_reserva`). Una
+        reserva SIN contrapartida en el exchange significa que la orden
+        nunca llegó a ejecutarse: se cierra sin operación para no dejarla
+        colgada ocupando un hueco de concurrencia -pero solo cuando esa
+        ausencia es concluyente (todas las posiciones del exchange traían
+        `client_oid` y ninguna coincidía); si alguna posición del exchange
+        vino sin identificador, no se puede descartar que sea justo esa la
+        posición propia, y la reserva se deja intacta para revisión manual
+        en vez de arriesgar cerrarla por error.
 
         Cada posición se aísla de las demás, igual que en `on_tick` y en
         `reconstruir`: un fallo al reconciliar una no debe impedir
@@ -544,6 +554,15 @@ class BotRunner:
 
         for fila in filas_abiertas:
             try:
+                if not fila["confirmada"]:
+                    # sigue reservada: `_resolver_reserva` no pudo ni
+                    # confirmarla ni descartarla con certeza (client_oid sin
+                    # correlacionar, ver más abajo). Sus datos
+                    # (`entry_price`/`size`) son provisionales -no se puede
+                    # adoptar ni cerrar con ellos sin arriesgar el libro
+                    # contable-, así que se deja tal cual para el próximo
+                    # arranque; ya quedó registrada con su propio contador.
+                    continue
                 if fila["symbol"] in por_symbol_exchange:
                     # (1) ambos la tienen: adoptar reconstruyendo el motor.
                     await self._reconstruir_una(
@@ -587,10 +606,30 @@ class BotRunner:
         `confirmar_apertura` en caliente) y sigue su camino normal como una
         posición más en `reconciliar_con_exchange` (el símbolo ya aparecerá
         en `repo.abiertas()` confirmado cuando ese paso vuelva a leerla).
+        `fee_entrada` se sustituye por la comisión real del exchange cuando
+        se conoce; el valor de la reserva es solo el provisional que
+        `BotRunner._abrir` graba ANTES de mandar la orden -mantenerlo
+        dejaría el PnL de la posición inflado exactamente en lo que costó
+        abrir. Si el exchange no la conserva, se avisa con un `log.warning`
+        explícito en vez de dejarlo pasar en silencio.
 
-        Si no casa con nada, la orden nunca llegó a ejecutarse: se cierra
-        sin operación (pnl y comisión de cierre en cero) para no dejarla
-        colgada ocupando un hueco de concurrencia.
+        Si NINGUNA posición del exchange trae este `client_oid`, hay dos
+        lecturas posibles y no son intercambiables:
+
+        - Si todas las posiciones del exchange traían identificador (y por
+          tanto la ausencia de coincidencia es real, no un artefacto de
+          datos incompletos), la orden nunca llegó a ejecutarse: se cierra
+          sin operación (pnl y comisión de cierre en cero) para no dejarla
+          colgada ocupando un hueco de concurrencia.
+        - Si alguna posición del exchange vino SIN identificador (o esta
+          misma reserva no tiene `client_oid` que buscar), no hay forma de
+          descartar que sea justo esa la posición propia: cerrarla como "no
+          ejecutada" podría estar liquidando en el libro contable, con
+          pnl=0, una posición que en realidad sigue viva y apalancada en el
+          exchange. Se deja la fila intacta -ni confirmada ni cerrada- para
+          revisión manual, contada aparte (`"reserva sin correlacionar"`,
+          distinta de `"reserva sin ejecutar"` para que el motivo se pueda
+          diagnosticar en producción).
         """
         client_oid = fila["client_oid"]
         pos_exch = next(
@@ -599,11 +638,33 @@ class BotRunner:
             None,
         )
         if pos_exch is not None:
+            fee_entrada = pos_exch.fee_entrada
+            if fee_entrada is None:
+                fee_entrada = fila["fee_entrada"]
+                log.warning(
+                    "bot: reconciliacion: %s (client_oid=%r) confirmada sin "
+                    "comision real de entrada; se mantiene el valor "
+                    "provisional (%.6g) y el PnL de esta posicion quedara "
+                    "optimista en esa cantidad", fila["symbol"], client_oid,
+                    fee_entrada)
             self._repo.confirmar_apertura(
                 fila["id"], entry_price=pos_exch.entry_price,
-                size=pos_exch.size, fee_entrada=fila["fee_entrada"],
+                size=pos_exch.size, fee_entrada=fee_entrada,
             )
             return
+
+        sin_identificador = any(p.client_oid is None for p in posiciones_exchange)
+        if client_oid is None or sin_identificador:
+            self._repo.incrementar_contador(
+                self._cfg.modo, "reserva sin correlacionar")
+            log.error(
+                "bot: reconciliacion: %s (client_oid=%r) reservada sin "
+                "confirmar, y no se pudo correlacionar con certeza contra "
+                "el exchange -hay posiciones sin identificador de orden, o "
+                "esta reserva no tiene uno propio-; se deja intacta -- "
+                "requiere revision manual", fila["symbol"], client_oid)
+            return
+
         self._repo.cerrar(fila["id"], close_ts=ahora, pnl=0.0,
                           fees=fila["fee_entrada"], max_rank=0)
         self._repo.incrementar_contador(self._cfg.modo, "reserva sin ejecutar")
@@ -623,7 +684,7 @@ class BotRunner:
         para revisión manual en vez de arriesgar un PnL fantasma.
         """
         symbol = fila["symbol"]
-        orden = fill_de_cierre(symbol)
+        orden = await fill_de_cierre(symbol)
         if orden is None:
             log.error(
                 "bot: reconciliacion: %s figura abierta en la base pero no "
