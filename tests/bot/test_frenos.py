@@ -6,6 +6,8 @@ memoria, un `Frenos` nuevo tras un reinicio bajo `Restart=always` recalcularía
 la referencia sobre el saldo YA castigado -el mismo día en que el freno está
 saltando- y el bot volvería a operar justo cuando no debe.
 """
+import os
+
 import pytest
 
 from scanner_volumen.bot.frenos import (
@@ -25,10 +27,14 @@ DIA_2 = DIA_1 + 24 * 60 * 60 * 1000
 
 
 def _cfg(tmp_path, perdida_diaria_max: float = 0.10) -> BotConfig:
+    return _cfg_con_fichero(tmp_path / "parar_bot", perdida_diaria_max)
+
+
+def _cfg_con_fichero(fichero_parada, perdida_diaria_max: float = 0.10) -> BotConfig:
     return BotConfig(
         enabled=True, modo="paper", equity_inicial=1000.0,
         desvio_max_entrada=0.0, perdida_diaria_max=perdida_diaria_max,
-        fichero_parada=str(tmp_path / "parar_bot"),
+        fichero_parada=str(fichero_parada),
     )
 
 
@@ -143,7 +149,7 @@ def test_al_cambiar_de_dia_utc_la_referencia_se_renueva_y_el_freno_se_libera(
 
 def test_parada_de_emergencia_bloquea_y_borrar_el_fichero_reanuda(repo, tmp_path):
     """Crear el fichero corta, borrarlo reanuda -sin reiniciar nada- porque
-    `puede_abrir` lo comprueba con `Path.exists()` en cada llamada."""
+    `puede_abrir` lo comprueba con `os.stat()` en cada llamada."""
     frenos = Frenos(_cfg(tmp_path), repo, "paper")
     fichero = tmp_path / "parar_bot"
     assert frenos.puede_abrir(DIA_1) is None
@@ -155,21 +161,50 @@ def test_parada_de_emergencia_bloquea_y_borrar_el_fichero_reanuda(repo, tmp_path
     assert frenos.puede_abrir(DIA_1) is None
 
 
-def test_si_comprobar_el_fichero_de_parada_falla_se_frena_por_precaucion(
+def test_parada_de_emergencia_frena_si_el_directorio_es_ilegible(repo, tmp_path):
+    """El caso REAL de producción, no simulado: un directorio del fichero
+    de parada vuelto ilegible (`chmod 000`) hace que `os.stat()` lance
+    `PermissionError` al intentar resolver la ruta.
+
+    Esto es justo lo que `Path.exists()` NO permite distinguir: en CPython
+    (comprobado en 3.14 -`pathlib.Path.exists` delega en `os.path.exists`,
+    que atrapa `(OSError, ValueError)` puertas adentro y devuelve `False`
+    para cualquier fallo) un directorio ilegible se ve exactamente igual
+    que "el fichero no existe", y `puede_abrir` habría dejado operar al bot
+    en el único escenario de permisos que puede darse de verdad. Por eso
+    `_parada_de_emergencia` usa `os.stat()` en vez de `Path.exists()` -este
+    test es el que demuestra que la distinción importa de verdad, no solo
+    en el papel."""
+    if os.geteuid() == 0:
+        pytest.skip("como root los permisos de fichero no se aplican")
+
+    directorio = tmp_path / "protegido"
+    directorio.mkdir()
+    fichero = directorio / "parar_bot"
+    fichero.write_text("")
+    frenos = Frenos(_cfg_con_fichero(fichero), repo, "paper")
+
+    os.chmod(directorio, 0o000)
+    try:
+        assert frenos.puede_abrir(DIA_1) == MOTIVO_PARADA_EMERGENCIA
+    finally:
+        # restaurar antes de terminar: si no, pytest no puede limpiar tmp_path
+        os.chmod(directorio, 0o755)
+
+
+def test_parada_de_emergencia_frena_ante_un_oserror_generico(
     repo, tmp_path, monkeypatch,
 ):
-    """La parada de emergencia falla CERRADO por diseño, no por casualidad
-    del orden del código: si `Path.exists()` revienta -aquí se fuerza con
-    un `PermissionError`, el caso real que motiva este test- `puede_abrir`
-    debe devolver el freno como activo, no dejar que la excepción suba y
-    que un reordenamiento futuro de `on_tick` termine dejando el bot
-    operando pese al fallo."""
+    """Complementa el test de arriba (que cubre `PermissionError` de
+    verdad) con un `OSError` genérico -para que la rama "no se puede
+    determinar" del código no dependa solo de un tipo concreto de fallo de
+    permisos."""
     frenos = Frenos(_cfg(tmp_path), repo, "paper")
 
-    def _revienta(self):
-        raise PermissionError("simulado: sin permiso para leer la ruta")
+    def _revienta(ruta):
+        raise OSError("simulado: fallo de E/S al comprobar la ruta")
 
-    monkeypatch.setattr("pathlib.Path.exists", _revienta)
+    monkeypatch.setattr("scanner_volumen.bot.frenos.os.stat", _revienta)
     assert frenos.puede_abrir(DIA_1) == MOTIVO_PARADA_EMERGENCIA
 
 

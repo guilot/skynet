@@ -16,17 +16,18 @@ cambia es que no se evalúan entradas nuevas.
   referencia en memoria la fijaría sobre el saldo YA castigado -justo el día
   en que hace falta que no se mueva- y el bot seguiría operando.
 - **Parada de emergencia**: si existe `fichero_parada` en disco, no se abre
-  nada. Se comprueba con `Path.exists()` en cada llamada -una consulta
-  barata al sistema de ficheros-, lo que permite cortar desde SSH creando el
+  nada. Se comprueba con `os.stat()` en cada llamada -una consulta barata
+  al sistema de ficheros-, lo que permite cortar desde SSH creando el
   fichero, y reanudar borrándolo, sin reiniciar el proceso. Si la propia
-  comprobación falla (p. ej. un `PermissionError` en la ruta), se frena
-  igualmente -por diseño, no por accidente: ver `_parada_de_emergencia`.
+  comprobación no puede determinar si el fichero existe (p. ej. un
+  `PermissionError` en algún directorio de la ruta), se frena igualmente
+  -por diseño, no por accidente: ver `_parada_de_emergencia`.
 """
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
-from pathlib import Path
 
 from scanner_volumen.bot.repo import BotRepo
 from scanner_volumen.config import BotConfig
@@ -64,7 +65,7 @@ class Frenos:
         ninguno está activo.
 
         La parada de emergencia se comprueba primero: es la más barata (un
-        `Path.exists()` sin tocar la base de datos) y la que un humano puede
+        `os.stat()` sin tocar la base de datos) y la que un humano puede
         querer que gane siempre, sin depender de en qué estado ande la
         pérdida diaria.
 
@@ -107,30 +108,41 @@ class Frenos:
         self._referencia_del_dia(ahora, saldo)
 
     def _parada_de_emergencia(self) -> bool:
-        """True si hay que frenar por el fichero de parada -incluido el
-        caso en que la propia comprobación falla.
+        """True si hay que frenar por el fichero de parada.
 
-        `Path.exists()` no traga cualquier fallo: una ruta con un
-        `PermissionError`, por ejemplo, se propaga en vez de devolver
-        `False` en silencio. Sin este `try/except`, esa excepción subiría
-        por `on_tick` hasta el `except Exception` de más arriba y el
-        resultado de HOY sería benigno -ese tick no abre nada, porque la
-        excepción ocurre antes del bucle de entradas-, pero solo por
-        casualidad del orden del código: un reordenamiento futuro de
-        `on_tick`, o un cambio en el manejo de excepciones de arriba, lo
-        rompería en silencio y dejaría el bot operando pese al fallo. Esta
-        es la decisión explícita en su lugar: un freno de EMERGENCIA que no
-        puede ni preguntar si debe frenar tiene que asumir que la respuesta
-        es sí -fallar cerrado, nunca abierto, con dinero real en juego."""
+        Deliberadamente NO usa `Path.exists()`: en CPython (comprobado en
+        3.14, y así desde que `pathlib` delega en `os.path.exists`) esa
+        llamada atrapa `(OSError, ValueError)` puertas adentro y devuelve
+        `False` para CUALQUIER fallo, incluido un directorio de la ruta
+        vuelto ilegible (`PermissionError`) -exactamente el caso que un
+        freno de emergencia no puede permitirse leer como "no hay
+        parada". `exists()` colapsa "el fichero no está" y "no puedo saber
+        si está" en el mismo `False`, y ese colapso es el agujero: con
+        `Path.exists()`, el único escenario de permisos que puede darse de
+        verdad en producción hace que el freno falle ABIERTO -el bot sigue
+        operando- justo cuando debería fallar cerrado.
+
+        Por eso se usa `os.stat()` directamente y se distinguen los tres
+        casos por separado:
+
+        - `FileNotFoundError`: el fichero está ausente de verdad. Sin freno.
+        - Cualquier otro `OSError` (`PermissionError` incluido): no se puede
+          determinar si el fichero existe. Freno activo, con log -ante la
+          duda, un freno de EMERGENCIA tiene que asumir que la respuesta es
+          sí, nunca dejar el bot operando porque no pudo ni preguntar.
+        - Sin excepción: el fichero está. Freno activo."""
         try:
-            return Path(self._cfg.fichero_parada).exists()
+            os.stat(self._cfg.fichero_parada)
+        except FileNotFoundError:
+            return False
         except OSError:
             log.exception(
-                "bot: fallo al comprobar el fichero de parada de "
-                "emergencia (%r); se frena por precaucion",
+                "bot: no se pudo determinar si existe el fichero de parada "
+                "de emergencia (%r); se frena por precaucion",
                 self._cfg.fichero_parada,
             )
             return True
+        return True
 
     def _perdida_diaria_superada(self, ahora: int) -> bool:
         saldo_actual = self._repo.equity(self._modo)
