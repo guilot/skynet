@@ -25,6 +25,14 @@ def _clave_equity_inicial(modo: str) -> str:
     return f"equity_inicial:{modo}"
 
 
+def _clave_saldo_dia(modo: str, dia: str) -> str:
+    """El saldo de referencia del freno de pérdida diaria (`bot/frenos.py`),
+    segmentado por modo -igual que `equity_inicial`- y por día (`dia` en
+    formato `AAAA-MM-DD`, siempre UTC): sin el día en la clave, la referencia
+    de ayer seguiría vigente hoy y el freno nunca se liberaría."""
+    return f"saldo_dia:{modo}:{dia}"
+
+
 class BotRepo:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
@@ -245,6 +253,30 @@ class BotRepo:
             (modo,),
         ).fetchone()
         return self.equity_inicial(modo, defecto=0.0) + float(fila["total"])
+
+    # --- frenos (Task 10) ---
+
+    def fijar_saldo_dia(self, modo: str, dia: str, valor: float) -> None:
+        """Fija el saldo de referencia de `dia` (persistido en `bot_meta`,
+        nunca en memoria): un reinicio bajo `Restart=always` en pleno
+        frenazo tiene que encontrar exactamente el mismo valor con el que
+        empezó el día, no recalcularlo sobre el saldo ya castigado."""
+        self._conn.execute(
+            "INSERT INTO bot_meta (clave, valor) VALUES (?, ?) "
+            "ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor",
+            (_clave_saldo_dia(modo, dia), repr(float(valor))),
+        )
+        self._conn.commit()
+
+    def saldo_dia(self, modo: str, dia: str) -> float | None:
+        """El saldo de referencia ya fijado para `dia`, o `None` si todavía
+        no se ha fijado ninguno -es la señal que usa `Frenos` para decidir
+        si esta es la primera consulta del día."""
+        fila = self._conn.execute(
+            "SELECT valor FROM bot_meta WHERE clave = ?",
+            (_clave_saldo_dia(modo, dia),),
+        ).fetchone()
+        return None if fila is None else float(fila["valor"])
 
     # --- arranque ---
 

@@ -94,9 +94,13 @@ class PosicionExchange:
 
 # Etiquetas de descarte del bot, en el orden en que se imprimen. Coinciden con
 # las del backtest salvo "sin velas" (que en vivo no aplica) y "desvio" (que en
-# el backtest no existe). "simbolo vetado" es la única exclusiva de la Fase 3:
-# la reconciliación de arranque (Task 8) veta un símbolo que el exchange tiene
+# el backtest no existe). "simbolo vetado" es exclusiva de la Fase 3: la
+# reconciliación de arranque (Task 8) veta un símbolo que el exchange tiene
 # abierto y el bot no reconoce, para no volver a tocarlo en toda la sesión.
+# "perdida diaria" y "parada de emergencia" son los frenos manuales de la
+# Fase 3 (Task 10, `bot/frenos.py`): a diferencia de las demás etiquetas, que
+# se contabilizan transición a transición, estas cuentan una vez por tick en
+# el que el freno impidió evaluar entradas.
 ETIQUETAS_DESCARTE = (
     "NEUTRAL",
     "simbolo abierto",
@@ -105,4 +109,6 @@ ETIQUETAS_DESCARTE = (
     "par congelado",
     "desvio",
     "simbolo vetado",
+    "perdida diaria",
+    "parada de emergencia",
 )

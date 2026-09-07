@@ -185,12 +185,19 @@ class BotConfig:
     alejarse del precio de la señal antes de descartar la entrada. Nace en 0.0
     (desactivado): primero se mide cuánto cuesta llegar tarde, y solo después
     se elige un umbral con datos detrás.
+
+    `perdida_diaria_max` y `fichero_parada` son los dos frenos manuales de la
+    Fase 3 (`bot/frenos.py`): cortan ENTRADAS nuevas -nunca la gestión de las
+    posiciones abiertas- cuando la pérdida del día supera esa fracción del
+    saldo de referencia, o cuando existe el fichero de parada de emergencia.
     """
 
     enabled: bool
     modo: str
     equity_inicial: float
     desvio_max_entrada: float
+    perdida_diaria_max: float = 0.10
+    fichero_parada: str = "data/parar_bot"
 
 
 @dataclass(frozen=True)
@@ -255,6 +262,11 @@ def _validar_bot(raw_bot: dict) -> None:
         raise ValueError(
             "bot.desvio_max_entrada no puede ser negativo, llegó "
             f"{raw_bot['desvio_max_entrada']!r}"
+        )
+    perdida = raw_bot["perdida_diaria_max"]
+    if not (0 <= perdida <= 1):
+        raise ValueError(
+            f"bot.perdida_diaria_max debe estar entre 0 y 1, llegó {perdida!r}"
         )
 
 

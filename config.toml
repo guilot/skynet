@@ -142,4 +142,6 @@ vwap         = { max_points = 8,  breakpoints = [[-20.0, -8], [-2.0, 0], [2.0, 8
 enabled = true           # ENCENDIDO en paper desde 2026-09-06 (fase 2)
 modo = "paper"           # 'paper' | 'real'  <- el switch de la Fase 3
 equity_inicial = 1000.0
-desvio_max_entrada = 0.0 # fracción; 0 = desactivado
+desvio_max_entrada = 0.0   # fracción; 0 = desactivado
+perdida_diaria_max = 0.10  # fracción del saldo del día; freno de entradas
+fichero_parada = "data/parar_bot"  # si existe, freno de entradas (parada de emergencia)

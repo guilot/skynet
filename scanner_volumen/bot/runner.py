@@ -40,6 +40,7 @@ from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
 from scanner_volumen.bot.broker import Broker
+from scanner_volumen.bot.frenos import Frenos
 from scanner_volumen.bot.model import OrdenEjecutada, PosicionAbierta, PosicionExchange
 from scanner_volumen.bot.portfolio import LivePortfolio
 from scanner_volumen.bot.repo import BotRepo
@@ -131,12 +132,18 @@ class BotRunner:
         self, params: StrategyParams, cfg_bot: BotConfig, repo: BotRepo,
         broker: Broker, portfolio: LivePortfolio,
         fill_de_cierre: FillDeCierre | None = None,
+        frenos: Frenos | None = None,
     ) -> None:
         self._params = params
         self._cfg = cfg_bot
         self._repo = repo
         self._broker = broker
         self.portfolio = portfolio
+        # Los frenos manuales (Task 10): pérdida diaria máxima y parada de
+        # emergencia. `None` en los tests de este módulo y en cualquier
+        # construcción anterior a esta tarea -sin frenos configurados,
+        # `on_tick` nunca corta entradas por este motivo, igual que antes.
+        self._frenos = frenos
         # El proveedor del fill real de un cierre que decidió el exchange
         # por su cuenta -mismo contrato que el parámetro homónimo de
         # `reconciliar_con_exchange`, pero inyectado aquí en el constructor
@@ -185,7 +192,17 @@ class BotRunner:
                 pos.degradada = True
                 self._repo.marcar_degradada(pos.id)
 
-        # (2) evaluar entradas nuevas
+        # (2) evaluar entradas nuevas -salvo que algún freno manual (Task 10:
+        # pérdida diaria máxima, parada de emergencia) lo impida. El freno
+        # corta la entrada ENTERA de este tick, no transición a transición
+        # -a diferencia de los descartes de `LivePortfolio`, que sí se miran
+        # símbolo a símbolo-, así que se cuenta una vez por tick bloqueado,
+        # no una vez por transición que ni se llega a mirar. El bucle de (1)
+        # ya corrió: un freno activo nunca deja de gobernar lo ya abierto.
+        motivo_freno = self._frenos.puede_abrir(ahora) if self._frenos else None
+        if motivo_freno is not None:
+            self._repo.incrementar_contador(self._cfg.modo, motivo_freno)
+            return
         for t in transiciones:
             try:
                 if not es_entrada(t):

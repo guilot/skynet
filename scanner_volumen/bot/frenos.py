@@ -1,0 +1,105 @@
+"""Los frenos manuales de la Fase 3: los límites que un humano puede
+accionar para cortar entradas nuevas sin tocar el gobierno de lo ya abierto.
+
+**Los dos frenos cortan ENTRADAS nuevas, nunca la gestión de las posiciones
+abiertas.** Dejar una posición apalancada sin gobierno -sin que se le sigan
+moviendo el stop, sin que se cierre cuando toca- sería peor que el problema
+que estos frenos existen para evitar. `BotRunner.on_tick` sigue avanzando el
+bucle de las abiertas exactamente igual, freno activo o no; lo único que
+cambia es que no se evalúan entradas nuevas.
+
+- **Pérdida diaria máxima**: si el equity actual (`BotRepo.equity`, el saldo
+  vivo del bot) ha caído más de `perdida_diaria_max` desde el saldo de
+  referencia del día, no se abre nada más hasta que cambie el día UTC. La
+  referencia se PERSISTE en `bot_meta` (nunca en un atributo de esta clase):
+  bajo `Restart=always`, un reinicio en pleno frenazo que recalculara la
+  referencia en memoria la fijaría sobre el saldo YA castigado -justo el día
+  en que hace falta que no se mueva- y el bot seguiría operando.
+- **Parada de emergencia**: si existe `fichero_parada` en disco, no se abre
+  nada. Se comprueba con `Path.exists()` en cada llamada -una consulta
+  barata al sistema de ficheros-, lo que permite cortar desde SSH creando el
+  fichero, y reanudar borrándolo, sin reiniciar el proceso.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+
+from scanner_volumen.bot.repo import BotRepo
+from scanner_volumen.config import BotConfig
+
+# Nombres que devuelve `puede_abrir`: se persisten tal cual como clave de
+# `bot_contadores` (ver `BotRunner.on_tick`), así que también son las
+# etiquetas que aparecen en el informe -deben coincidir con las que se
+# añaden a `ETIQUETAS_DESCARTE` en `bot/model.py`.
+MOTIVO_PERDIDA_DIARIA = "perdida diaria"
+MOTIVO_PARADA_EMERGENCIA = "parada de emergencia"
+
+
+def _dia_utc(ahora: int) -> str:
+    """`ahora` (epoch ms) -> `"AAAA-MM-DD"` en UTC.
+
+    Nunca en el reloj local: todo el proyecto ancla el tiempo en el reloj
+    del exchange -el `ahora` que recibe `on_tick`-, no en el de la máquina
+    donde corre el proceso."""
+    return datetime.fromtimestamp(ahora / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+class Frenos:
+    """Los dos frenos manuales. `puede_abrir` es la única consulta que
+    necesita el runner antes de evaluar entradas nuevas en cada tick."""
+
+    def __init__(self, cfg_bot: BotConfig, repo: BotRepo, modo: str) -> None:
+        self._cfg = cfg_bot
+        self._repo = repo
+        self._modo = modo
+
+    def puede_abrir(self, ahora: int) -> str | None:
+        """El nombre del freno que impide abrir ahora mismo, o `None` si
+        ninguno está activo.
+
+        La parada de emergencia se comprueba primero: es la más barata (un
+        `Path.exists()` sin tocar la base de datos) y la que un humano puede
+        querer que gane siempre, sin depender de en qué estado ande la
+        pérdida diaria."""
+        if Path(self._cfg.fichero_parada).exists():
+            return MOTIVO_PARADA_EMERGENCIA
+        if self._perdida_diaria_superada(ahora):
+            return MOTIVO_PERDIDA_DIARIA
+        return None
+
+    def registrar_saldo_del_dia(self, ahora: int, saldo: float) -> None:
+        """Fija el saldo de referencia de HOY (UTC) a `saldo`, si todavía no
+        hay uno persistido para este día -y modo-.
+
+        No lo sobrescribe si ya existe: la referencia se fija una sola vez
+        por día y se respeta después, sin importar cuántas veces se vuelva
+        a llamar ni con qué `saldo` -incluido tras un reinicio, que es
+        justo el caso que garantiza que esto sea seguro con dinero real."""
+        self._referencia_del_dia(ahora, saldo)
+
+    def _perdida_diaria_superada(self, ahora: int) -> bool:
+        saldo_actual = self._repo.equity(self._modo)
+        referencia = self._referencia_del_dia(ahora, saldo_actual)
+        if referencia <= 0:
+            # sin saldo de referencia positivo no hay sobre qué medir una
+            # fracción de pérdida con sentido.
+            return False
+        perdida = (referencia - saldo_actual) / referencia
+        return perdida >= self._cfg.perdida_diaria_max
+
+    def _referencia_del_dia(self, ahora: int, saldo_por_defecto: float) -> float:
+        """El saldo de referencia de hoy (UTC), persistido en `bot_meta` por
+        día y modo (`BotRepo.saldo_dia` / `fijar_saldo_dia`).
+
+        La primera vez que se consulta un día -desde `puede_abrir` o desde
+        `registrar_saldo_del_dia`, da igual cuál llegue primero- se fija a
+        `saldo_por_defecto` y esa queda como la referencia del día;
+        cualquier consulta posterior, de esta instancia o de una creada
+        después de un reinicio, respeta el valor ya guardado."""
+        dia = _dia_utc(ahora)
+        referencia = self._repo.saldo_dia(self._modo, dia)
+        if referencia is None:
+            self._repo.fijar_saldo_dia(self._modo, dia, saldo_por_defecto)
+            return saldo_por_defecto
+        return referencia
