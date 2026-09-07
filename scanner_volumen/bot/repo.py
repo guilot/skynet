@@ -182,18 +182,30 @@ class BotRepo:
         self, posicion_id: int, *, ts: int, reason: ExitReason, fraction: float,
         precio_referencia: float, precio: float, comision: float,
         tardio: bool = False, precio_regla: float | None = None,
+        cierre_exchange: bool = False,
     ) -> None:
         """`precio_regla` es el nivel que la regla prometía para esta salida
         (el stop vigente, el break-even, o el precio de la transición, según
         el motivo); `None` cuando no hay nivel prometido contra el que medir
         (p. ej. `EXTREME` por temporizador, que cierra a mercado adrede). Lo
-        decide el runner, no este repositorio: aquí solo se persiste."""
+        decide el runner, no este repositorio: aquí solo se persiste.
+
+        `cierre_exchange` distingue un cierre que decidió el exchange por su
+        cuenta -el stop saltó, o hubo liquidación, mientras el bot miraba a
+        otro lado (Task 9, sondeo periódico)- de uno que decidió el motor de
+        reglas en caliente. No se traduce a un `ExitReason` nuevo a
+        propósito: en espíritu sigue siendo la regla del stop ejecutándose
+        (`reason=STOP`), y `ExitReason` es el enumerado que el informe
+        compartido con el backtest recorre entero para el bloque de "PnL por
+        motivo de salida" -un valor nuevo metería ahí una línea nueva y
+        rompería su golden master sin que el backtest hubiera cambiado."""
         self._conn.execute(
             "INSERT INTO bot_fills (posicion_id, ts, reason, fraction, "
-            "precio_referencia, precio, comision, tardio, precio_regla) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "precio_referencia, precio, comision, tardio, precio_regla, "
+            "cierre_exchange) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (posicion_id, ts, reason.value, fraction, precio_referencia,
-             precio, comision, 1 if tardio else 0, precio_regla),
+             precio, comision, 1 if tardio else 0, precio_regla,
+             1 if cierre_exchange else 0),
         )
         self._conn.commit()
 

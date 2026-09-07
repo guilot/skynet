@@ -175,7 +175,8 @@ CREATE TABLE IF NOT EXISTS bot_fills (
     precio REAL NOT NULL,
     comision REAL NOT NULL,
     tardio INTEGER NOT NULL DEFAULT 0,
-    precio_regla REAL
+    precio_regla REAL,
+    cierre_exchange INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_bot_fills_pos ON bot_fills(posicion_id);
@@ -206,7 +207,7 @@ CREATE TABLE IF NOT EXISTS bot_contadores (
 # tocar porque ya existe. `PRAGMA user_version` es el mecanismo nativo de
 # SQLite para esto -entero simple embebido en el propio fichero, sin tabla
 # adicional que crear ni de la que depender antes de tener esquema-.
-VERSION_ESQUEMA = 7
+VERSION_ESQUEMA = 8
 
 
 def _migrar(conn: sqlite3.Connection) -> None:
@@ -243,6 +244,8 @@ def _migrar(conn: sqlite3.Connection) -> None:
         _migrar_v6_client_oid(conn)
     if version_actual < 7:
         _migrar_v7_stop_id(conn)
+    if version_actual < 8:
+        _migrar_v8_cierre_exchange(conn)
     if version_actual < VERSION_ESQUEMA:
         conn.execute(f"PRAGMA user_version = {VERSION_ESQUEMA}")
         conn.commit()
@@ -438,6 +441,36 @@ def _migrar_v7_stop_id(conn: sqlite3.Connection) -> None:
     columnas = {f["name"] for f in conn.execute("PRAGMA table_info(bot_posiciones)")}
     if columnas and "stop_id" not in columnas:
         conn.execute("ALTER TABLE bot_posiciones ADD COLUMN stop_id TEXT")
+    conn.commit()
+
+
+def _migrar_v8_cierre_exchange(conn: sqlite3.Connection) -> None:
+    """Añade a `bot_fills`, ya existente, la marca de que un cierre lo
+    ejecutó el exchange por su cuenta -el stop saltó, o hubo liquidación-
+    mientras el bot miraba a otro lado (Task 9, sondeo periódico).
+
+    Deliberadamente NO se añade un valor nuevo a `ExitReason`: un cierre así
+    sigue siendo, en espíritu, la regla del stop ejecutándose (motivo
+    `STOP`), y `ExitReason` lo recorre entero el informe compartido con el
+    backtest para imprimir el bloque de "PnL por motivo de salida" -un valor
+    nuevo metería una línea nueva ahí y rompería el golden master del
+    backtest sin que su comportamiento haya cambiado. Lo que distingue este
+    cierre de un STOP local corriente es únicamente esta columna.
+
+    `ALTER TABLE ... ADD COLUMN ... NOT NULL` exige un `DEFAULT` en SQLite;
+    se usa `0` porque todo fill ya existente antes de esta migración lo
+    ejecutó el propio bot, nunca un sondeo del exchange que todavía no
+    existía.
+
+    Guarda de `PRAGMA table_info`, mismo patrón que `_migrar_v7_stop_id`: si
+    la tabla no existe (base nueva) o la columna ya está (un `open_db`
+    repetido, o una base creada por el `CREATE TABLE IF NOT EXISTS` de
+    `ESQUEMA`, que ya la incluye), no hay nada que hacer."""
+    columnas = {f["name"] for f in conn.execute("PRAGMA table_info(bot_fills)")}
+    if columnas and "cierre_exchange" not in columnas:
+        conn.execute(
+            "ALTER TABLE bot_fills ADD COLUMN cierre_exchange INTEGER NOT NULL DEFAULT 0"
+        )
     conn.commit()
 
 

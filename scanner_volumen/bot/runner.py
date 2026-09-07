@@ -130,12 +130,23 @@ class BotRunner:
     def __init__(
         self, params: StrategyParams, cfg_bot: BotConfig, repo: BotRepo,
         broker: Broker, portfolio: LivePortfolio,
+        fill_de_cierre: FillDeCierre | None = None,
     ) -> None:
         self._params = params
         self._cfg = cfg_bot
         self._repo = repo
         self._broker = broker
         self.portfolio = portfolio
+        # El proveedor del fill real de un cierre que decidió el exchange
+        # por su cuenta -mismo contrato que el parámetro homónimo de
+        # `reconciliar_con_exchange`, pero inyectado aquí en el constructor
+        # porque `sondear_exchange` (Task 9) lo necesita en cada sondeo
+        # periódico, y su firma pública (`posiciones_exchange, ahora`) la
+        # fija el llamador de la Task 13 sin margen para colarle un
+        # argumento más. `None` en paper (no hay exchange que sondear) y en
+        # cualquier construcción que no lo necesite -el resto de tests de
+        # este módulo, por ejemplo.
+        self._fill_de_cierre = fill_de_cierre
         self.abiertas: dict[str, PosicionAbierta] = {}
         self.transiciones_vistas = 0
         self.cierres_tardios = 0
@@ -758,6 +769,98 @@ class BotRunner:
             "bot: reconciliacion: %s cerrada en el exchange mientras el bot "
             "estaba caido; se cierra en la base a %.6g (pnl %.2f)",
             symbol, orden.precio, pos.pnl_acumulado)
+
+    # --- sondeo periodico de cierres del exchange (Task 9) ---
+
+    async def sondear_exchange(
+        self, posiciones_exchange: list[PosicionExchange], ahora: int,
+    ) -> None:
+        """Detecta, por sondeo periódico, una posición que el exchange cerró
+        por su cuenta -el stop saltó, o hubo liquidación- mientras el bot
+        miraba a otro lado: con el stop puesto en el exchange (Task 7) la
+        posición sigue protegida aunque el proceso no reaccione al instante,
+        pero el motor de reglas seguiría creyéndola abierta hasta que algo
+        se lo diga.
+
+        Distinto, y deliberadamente más simple, que `reconciliar_con_
+        exchange` (Task 8): aquella corre UNA VEZ al arrancar y cubre las
+        tres situaciones posibles (adoptar, cerrar, vetar) porque en ese
+        instante el bot no sabe nada todavía. Este método corre
+        PERIÓDICAMENTE mientras el bot ya está vivo y gobernando -la Task 13
+        cablea su cadencia-, así que las otras dos situaciones no aplican
+        aquí: una posición que ambos tienen ya la gobierna `on_tick` en cada
+        tick, no hace falta "adoptarla" de nuevo en cada sondeo; y una
+        posición que el exchange tiene y el bot no reconoce no es de este
+        bot -abrirla no fue su decisión-, tocarla incumpliría la misma regla
+        que ya respeta la reconciliación de arranque, y si es genuinamente
+        ajena ya quedó vetada al arrancar.
+
+        En modo `paper` no hay exchange real que sondear: no hace nada.
+
+        Cada símbolo se aísla de los demás, igual que en `on_tick` y en
+        `reconciliar_con_exchange`: un fallo al cerrar uno no debe impedir
+        sondear el resto.
+        """
+        if self._cfg.modo == "paper":
+            return
+        simbolos_exchange = {p.symbol for p in posiciones_exchange}
+        for symbol in list(self.abiertas):
+            if symbol in simbolos_exchange:
+                continue
+            try:
+                await self._cerrar_por_sondeo(symbol, ahora)
+            except Exception:
+                log.exception(
+                    "bot: sondeo: fallo al cerrar %s tras detectar que ya "
+                    "no esta en el exchange; se reintentara en el proximo "
+                    "sondeo", symbol)
+
+    async def _cerrar_por_sondeo(self, symbol: str, ahora: int) -> None:
+        """Cierra en la base una posición que ya no está en el exchange,
+        completándola SIEMPRE con el fill real de ese cierre -nunca con un
+        precio inventado-. Si no se encuentra (`_fill_de_cierre` es `None`,
+        o la consulta no devuelve nada), se deja la posición intacta -sigue
+        realmente abierta y protegida por lo que quedara de su stop- para
+        que el próximo sondeo, o la reconciliación del próximo arranque, lo
+        resuelva con más información; inventar un precio aquí falsificaría
+        el libro contable.
+
+        Se registra como un fill de motivo `STOP` -en espíritu es
+        exactamente eso, el stop del exchange (o una liquidación)
+        protegiendo la posición, solo que el bot no estaba mirando cuando
+        ocurrió- con `cierre_exchange=True`: esa columna es la que lo
+        distingue de un `STOP` que disparó el motor de reglas en caliente,
+        sin ensuciar `ExitReason` (ver `BotRepo.registrar_fill`).
+
+        `pos.reglas.restante` ya refleja lo que de verdad queda abierto -a
+        diferencia de `_reconciliar_cerrada_en_exchange`, donde `pos` es una
+        reconstrucción de solo lectura sin fills aplicados a su motor, esta
+        `pos` es la posición VIVA que `on_tick` lleva gobernando, así que su
+        motor ya tiene descontada cualquier parcial cobrada antes de este
+        sondeo."""
+        pos = self.abiertas[symbol]
+        orden = await self._fill_de_cierre(symbol) if self._fill_de_cierre else None
+        if orden is None:
+            self._repo.incrementar_contador(self._cfg.modo, "sondeo sin fill real")
+            log.error(
+                "bot: sondeo: %s desaparecio del exchange y no se encontro "
+                "el fill real de su cierre; se deja intacta -- requiere "
+                "revision manual", symbol)
+            return
+
+        restante = pos.reglas.restante
+        self._acumular_pnl(pos, orden.precio, restante, orden.comision)
+        self._repo.registrar_fill(
+            pos.id, ts=ahora, reason=ExitReason.STOP, fraction=restante,
+            precio_referencia=orden.precio, precio=orden.precio,
+            comision=orden.comision, cierre_exchange=True,
+        )
+        await self._cerrar(pos, ahora)
+        self._repo.incrementar_contador(
+            self._cfg.modo, "cierres detectados por sondeo")
+        log.warning(
+            "bot: sondeo: %s desaparecio del exchange; se cierra en la base "
+            "a %.6g (pnl %.2f)", symbol, orden.precio, pos.pnl_acumulado)
 
     # --- posiciones vivas ---
 

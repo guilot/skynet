@@ -3,7 +3,7 @@ import logging
 import pytest
 
 from scanner_volumen.bot.broker import PaperBroker, StopVivo
-from scanner_volumen.bot.model import OrdenEjecutada
+from scanner_volumen.bot.model import OrdenEjecutada, PosicionExchange
 from scanner_volumen.bot.portfolio import LivePortfolio
 from scanner_volumen.bot.repo import BotRepo
 from scanner_volumen.bot.runner import BotRunner
@@ -809,3 +809,118 @@ async def test_si_falla_colocar_y_tambien_el_cierre_de_emergencia_queda_degradad
     assert "intervencion manual" in mensajes.lower()
     assert "se descarta esta entrada" not in mensajes
     conn.close()
+
+
+# --- sondeo periodico de posiciones y cierres del exchange (Task 9) ---
+#
+# Distinto de `reconciliar_con_exchange` (Task 8, que corre UNA VEZ al
+# arrancar y cubre las tres situaciones posibles): este sondeo es más
+# simple y corre PERIÓDICAMENTE mientras el bot vive, y solo cubre la
+# situación en la que el bot cree una posición abierta y el exchange ya no
+# la tiene -el stop del exchange saltó, o hubo liquidación, mientras el bot
+# miraba a otro lado-.
+
+
+def _runner_real(tmp_path, fill_de_cierre=None):
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn)
+    repo.set_equity_inicial("real", 1000.0)
+    cfg = BotConfig(enabled=True, modo="real", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    params = StrategyParams(comision_taker=0.0)
+    cartera = LivePortfolio(params, cfg, repo)
+    runner = BotRunner(params, cfg, repo, PaperBroker(params), cartera,
+                       fill_de_cierre=fill_de_cierre)
+    return runner, repo
+
+
+def _pos_exchange(symbol, size=4.0, entry_price=100.0):
+    return PosicionExchange(symbol=symbol, direction=Direction.LONG, size=size,
+                            entry_price=entry_price, entry_ts=0)
+
+
+async def test_una_posicion_que_desaparece_del_exchange_se_cierra(tmp_path):
+    """El stop del exchange se ejecuto mientras el bot miraba a otro lado."""
+    async def _fill_de_cierre(symbol):
+        return OrdenEjecutada(ts=5 * MIN, precio=97.0, cantidad=4.0, comision=0.0)
+
+    runner, repo = _runner_real(tmp_path, fill_de_cierre=_fill_de_cierre)
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+    pid = runner.abiertas["A"].id
+
+    # abrir una posicion, luego sondear con una lista de posiciones VACIA
+    await runner.sondear_exchange([], ahora=5 * MIN)
+
+    assert runner.abiertas == {}
+    fills = repo.fills_de(pid)
+    assert fills[-1]["reason"] == ExitReason.STOP.value
+    assert fills[-1]["cierre_exchange"] == 1
+    cerradas = repo.cerradas("real")
+    assert len(cerradas) == 1
+    assert cerradas[0]["abierta"] == 0
+    # LONG, entra a 100, cierra a 97: size = (20 x 20)/100 = 4.0
+    assert cerradas[0]["pnl"] == pytest.approx((97.0 - 100.0) * 4.0)
+    assert repo.contadores("real").get("cierres detectados por sondeo") == 1
+
+
+async def test_el_sondeo_no_toca_las_que_siguen_abiertas(tmp_path):
+    runner, repo = _runner_real(tmp_path)
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+
+    await runner.sondear_exchange([_pos_exchange("A")], ahora=5 * MIN)
+
+    assert "A" in runner.abiertas
+    assert repo.abiertas("real")[0]["symbol"] == "A"
+    assert repo.fills_de(runner.abiertas["A"].id) == []
+
+
+async def test_el_sondeo_no_se_ejecuta_en_modo_paper(bot):
+    # en paper no hay exchange real que sondear; llamarlo no debe tocar nada
+    runner, repo = bot
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+
+    await runner.sondear_exchange([], ahora=5 * MIN)
+
+    assert "A" in runner.abiertas
+    assert repo.abiertas("paper")[0]["symbol"] == "A"
+
+
+async def test_el_sondeo_sin_fill_real_no_inventa_precio_y_deja_la_posicion_intacta(
+    tmp_path, caplog,
+):
+    # sin `fill_de_cierre` configurado no hay forma de saber a que precio
+    # cerro el exchange: no se inventa uno, se deja la posicion tal cual
+    # para que el proximo sondeo -o la reconciliacion del proximo
+    # arranque- lo resuelva con mas informacion.
+    runner, repo = _runner_real(tmp_path)
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+
+    with caplog.at_level(logging.ERROR):
+        await runner.sondear_exchange([], ahora=5 * MIN)
+
+    assert "A" in runner.abiertas
+    fila = repo.abiertas("real")[0]
+    assert fila["symbol"] == "A"
+    assert fila["abierta"] == 1
+    mensajes = " ".join(r.getMessage() for r in caplog.records)
+    assert "A" in mensajes
+
+
+async def test_un_fallo_al_sondear_una_no_impide_sondear_las_demas(tmp_path, caplog):
+    async def _fill_de_cierre(symbol):
+        if symbol == "A":
+            raise RuntimeError("boom: el broker no responde para A")
+        return OrdenEjecutada(ts=5 * MIN, precio=95.0, cantidad=4.0, comision=0.0)
+
+    runner, repo = _runner_real(tmp_path, fill_de_cierre=_fill_de_cierre)
+    await runner.on_tick([tr(symbol="A")], precios({"A": 100.0}), ahora=0)
+    await runner.on_tick([tr(symbol="B", ts=0)], precios({"B": 100.0}), ahora=0)
+    assert set(runner.abiertas) == {"A", "B"}
+
+    with caplog.at_level(logging.ERROR):
+        await runner.sondear_exchange([], ahora=5 * MIN)
+
+    # B se cerro sin problema aunque A reventara al consultar su fill
+    assert "B" not in runner.abiertas
+    assert "A" in runner.abiertas
+    assert repo.cerradas("real")[0]["symbol"] == "B"
