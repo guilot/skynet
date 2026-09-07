@@ -18,15 +18,20 @@ cambia es que no se evalúan entradas nuevas.
 - **Parada de emergencia**: si existe `fichero_parada` en disco, no se abre
   nada. Se comprueba con `Path.exists()` en cada llamada -una consulta
   barata al sistema de ficheros-, lo que permite cortar desde SSH creando el
-  fichero, y reanudar borrándolo, sin reiniciar el proceso.
+  fichero, y reanudar borrándolo, sin reiniciar el proceso. Si la propia
+  comprobación falla (p. ej. un `PermissionError` en la ruta), se frena
+  igualmente -por diseño, no por accidente: ver `_parada_de_emergencia`.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
 from scanner_volumen.bot.repo import BotRepo
 from scanner_volumen.config import BotConfig
+
+log = logging.getLogger(__name__)
 
 # Nombres que devuelve `puede_abrir`: se persisten tal cual como clave de
 # `bot_contadores` (ver `BotRunner.on_tick`), así que también son las
@@ -61,8 +66,20 @@ class Frenos:
         La parada de emergencia se comprueba primero: es la más barata (un
         `Path.exists()` sin tocar la base de datos) y la que un humano puede
         querer que gane siempre, sin depender de en qué estado ande la
-        pérdida diaria."""
-        if Path(self._cfg.fichero_parada).exists():
+        pérdida diaria.
+
+        CONTRATO DE ORDEN con `registrar_saldo_del_dia`: la primera vez que
+        se llama en un día UTC nuevo -desde este método o desde ese otro,
+        el que llegue primero-, la referencia del día queda fijada. Si nadie
+        llamó antes a `registrar_saldo_del_dia`, ESTE método la fija con el
+        equity derivado del bot (`BotRepo.equity`). Si el cableador quiere
+        anclar la referencia a otro saldo -p. ej. el saldo real del
+        exchange en modo real, más fiable que la contabilidad reconstruida
+        cuando hay dinero de verdad en juego-, tiene que llamar a
+        `registrar_saldo_del_dia` ANTES de la primera llamada a este método
+        en ese día: si llega después, ya no tiene ningún efecto (ver el
+        docstring de `registrar_saldo_del_dia`)."""
+        if self._parada_de_emergencia():
             return MOTIVO_PARADA_EMERGENCIA
         if self._perdida_diaria_superada(ahora):
             return MOTIVO_PERDIDA_DIARIA
@@ -75,8 +92,45 @@ class Frenos:
         No lo sobrescribe si ya existe: la referencia se fija una sola vez
         por día y se respeta después, sin importar cuántas veces se vuelva
         a llamar ni con qué `saldo` -incluido tras un reinicio, que es
-        justo el caso que garantiza que esto sea seguro con dinero real."""
+        justo el caso que garantiza que esto sea seguro con dinero real.
+
+        ORDEN OBLIGATORIO: esta llamada debe llegar ANTES que la primera
+        llamada a `puede_abrir` del día. Si `puede_abrir` corre primero, ya
+        fija la referencia por su cuenta -con el equity derivado del bot,
+        no con el `saldo` que se le pase aquí después-, y esta llamada,
+        aunque traiga un valor distinto (el saldo real del exchange, por
+        ejemplo), NO TIENE NINGÚN EFECTO: llega tarde a una referencia que
+        ya quedó fijada. Ninguno de los dos métodos puede detectar ese
+        orden incorrecto desde dentro de esta clase -comparten la misma
+        regla de "quien pregunta primero, fija"-, así que respetar el orden
+        es responsabilidad de quien cablea el bucle del bot."""
         self._referencia_del_dia(ahora, saldo)
+
+    def _parada_de_emergencia(self) -> bool:
+        """True si hay que frenar por el fichero de parada -incluido el
+        caso en que la propia comprobación falla.
+
+        `Path.exists()` no traga cualquier fallo: una ruta con un
+        `PermissionError`, por ejemplo, se propaga en vez de devolver
+        `False` en silencio. Sin este `try/except`, esa excepción subiría
+        por `on_tick` hasta el `except Exception` de más arriba y el
+        resultado de HOY sería benigno -ese tick no abre nada, porque la
+        excepción ocurre antes del bucle de entradas-, pero solo por
+        casualidad del orden del código: un reordenamiento futuro de
+        `on_tick`, o un cambio en el manejo de excepciones de arriba, lo
+        rompería en silencio y dejaría el bot operando pese al fallo. Esta
+        es la decisión explícita en su lugar: un freno de EMERGENCIA que no
+        puede ni preguntar si debe frenar tiene que asumir que la respuesta
+        es sí -fallar cerrado, nunca abierto, con dinero real en juego."""
+        try:
+            return Path(self._cfg.fichero_parada).exists()
+        except OSError:
+            log.exception(
+                "bot: fallo al comprobar el fichero de parada de "
+                "emergencia (%r); se frena por precaucion",
+                self._cfg.fichero_parada,
+            )
+            return True
 
     def _perdida_diaria_superada(self, ahora: int) -> bool:
         saldo_actual = self._repo.equity(self._modo)

@@ -65,20 +65,36 @@ def test_superada_la_perdida_diaria_bloquea(repo, tmp_path):
     assert frenos.puede_abrir(DIA_1 + MIN) == MOTIVO_PERDIDA_DIARIA
 
 
-def test_la_referencia_del_dia_persiste_tras_un_reinicio(repo, tmp_path):
-    """El test que importa de verdad: un `Frenos` NUEVO sobre el MISMO
-    repositorio (nunca se reabre la conexión ni se reconstruye el `Frenos`
-    original en memoria) debe seguir viendo el freno activo, porque la
-    referencia vive en `bot_meta`, no en un atributo de la instancia."""
+def test_la_referencia_del_dia_persiste_tras_un_reinicio(tmp_path):
+    """El test que importa de verdad. Simula el reinicio como lo vería el
+    proceso real bajo `Restart=always`: se cierra la conexión original y se
+    REABRE la misma base de datos en disco (`open_db` sobre el mismo
+    fichero), con un `BotRepo` y un `Frenos` construidos desde cero -no se
+    reutiliza ni el objeto `Frenos`, ni el `BotRepo`, ni la conexión-. El
+    freno debe seguir activo, porque la referencia vive en `bot_meta`, en
+    el fichero, no en un atributo de ninguna instancia en RAM."""
+    ruta_db = tmp_path / "scanner.db"
     cfg = _cfg(tmp_path)
+
+    conn = open_db(ruta_db)
+    repo = BotRepo(conn)
+    repo.set_equity_inicial("paper", 1000.0)
     frenos = Frenos(cfg, repo, "paper")
     frenos.puede_abrir(DIA_1)  # fija la referencia en 1000
     _perder(repo, 150.0)  # equity real: 850
     assert frenos.puede_abrir(DIA_1 + MIN) == MOTIVO_PERDIDA_DIARIA
+    conn.close()
 
-    # "reinicio": una instancia nueva, no la misma con estado en RAM
-    frenos_reiniciado = Frenos(cfg, repo, "paper")
-    assert frenos_reiniciado.puede_abrir(DIA_1 + 2 * MIN) == MOTIVO_PERDIDA_DIARIA
+    # "reinicio": conexión, repositorio y Frenos construidos desde cero
+    # sobre el MISMO fichero en disco.
+    conn_reiniciada = open_db(ruta_db)
+    try:
+        repo_reiniciado = BotRepo(conn_reiniciada)
+        frenos_reiniciado = Frenos(cfg, repo_reiniciado, "paper")
+        assert (frenos_reiniciado.puede_abrir(DIA_1 + 2 * MIN)
+                == MOTIVO_PERDIDA_DIARIA)
+    finally:
+        conn_reiniciada.close()
 
 
 def test_registrar_saldo_del_dia_fija_solo_la_primera_vez(repo, tmp_path):
@@ -91,6 +107,27 @@ def test_registrar_saldo_del_dia_fija_solo_la_primera_vez(repo, tmp_path):
     frenos.registrar_saldo_del_dia(DIA_1 + MIN, 500.0)  # no debe pisar 1000
     _perder(repo, 100.0)  # equity real: 900 -> 10% de pérdida sobre 1000
     assert frenos.puede_abrir(DIA_1 + 2 * MIN) == MOTIVO_PERDIDA_DIARIA
+
+
+def test_registrar_saldo_del_dia_no_tiene_efecto_si_puede_abrir_ya_consulto(
+    repo, tmp_path,
+):
+    """Documenta el contrato de orden entre los dos métodos (ver los
+    docstrings de `Frenos.puede_abrir` y `Frenos.registrar_saldo_del_dia`):
+    `registrar_saldo_del_dia` debe llamarse ANTES de la primera consulta de
+    `puede_abrir` del día. Si `puede_abrir` corre primero, ya fija la
+    referencia con el equity derivado del bot, y una llamada posterior a
+    `registrar_saldo_del_dia` -aunque traiga un saldo distinto, como haría
+    la Task 13 con el saldo real del exchange en modo real- NO TIENE
+    NINGÚN EFECTO. Si el cableado futuro invierte el orden, este test es
+    el que lo delata."""
+    frenos = Frenos(_cfg(tmp_path), repo, "paper")
+    assert frenos.puede_abrir(DIA_1) is None  # fija la referencia en 1000 (equity)
+    frenos.registrar_saldo_del_dia(DIA_1 + MIN, 500.0)  # llega tarde: sin efecto
+    _perder(repo, 100.0)  # equity real: 900 -> 10% de perdida sobre la referencia (1000)
+    assert frenos.puede_abrir(DIA_1 + 2 * MIN) == MOTIVO_PERDIDA_DIARIA
+    # si `registrar_saldo_del_dia` hubiera pisado la referencia con 500, la
+    # cuenta sería (500 - 900) / 500 < 0 y el freno NO se activaría.
 
 
 def test_al_cambiar_de_dia_utc_la_referencia_se_renueva_y_el_freno_se_libera(
@@ -116,6 +153,24 @@ def test_parada_de_emergencia_bloquea_y_borrar_el_fichero_reanuda(repo, tmp_path
 
     fichero.unlink()
     assert frenos.puede_abrir(DIA_1) is None
+
+
+def test_si_comprobar_el_fichero_de_parada_falla_se_frena_por_precaucion(
+    repo, tmp_path, monkeypatch,
+):
+    """La parada de emergencia falla CERRADO por diseño, no por casualidad
+    del orden del código: si `Path.exists()` revienta -aquí se fuerza con
+    un `PermissionError`, el caso real que motiva este test- `puede_abrir`
+    debe devolver el freno como activo, no dejar que la excepción suba y
+    que un reordenamiento futuro de `on_tick` termine dejando el bot
+    operando pese al fallo."""
+    frenos = Frenos(_cfg(tmp_path), repo, "paper")
+
+    def _revienta(self):
+        raise PermissionError("simulado: sin permiso para leer la ruta")
+
+    monkeypatch.setattr("pathlib.Path.exists", _revienta)
+    assert frenos.puede_abrir(DIA_1) == MOTIVO_PARADA_EMERGENCIA
 
 
 def test_la_parada_de_emergencia_no_impide_gobernar_lo_ya_abierto(repo, tmp_path):
