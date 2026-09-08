@@ -35,6 +35,14 @@ VAR_PASSPHRASE = "SCANNER_BITGET_DEMO_PASSPHRASE"
 PRODUCT_TYPE_DEMO = "SUSDT-FUTURES"
 SYMBOL_DEMO = "SBTCSUSDT"
 
+# El discriminante de verdad es el SUFIJO, no el prefijo. Los símbolos de
+# simulación cotizan contra SUSDT (`SBTCSUSDT`, `SETHSUSDT`), mientras que
+# el prefijo "S" lo cumplen un montón de símbolos REALES que este mismo
+# escáner opera -SOLUSDT, SUIUSDT, SHIBUSDT, SEIUSDT, SANDUSDT, SXPUSDT-.
+# Comprobar solo el prefijo dejaba pasar los seis: ver `test_seguridad.py`,
+# donde están fijados uno a uno como casos negativos.
+SUFIJO_DEMO = "SUSDT"
+
 
 def _verificar_entorno_de_simulacion(venue: str, symbol: str) -> None:
     """Aborta (con `RuntimeError`, no con un `assert` que `-O` podría
@@ -52,10 +60,13 @@ def _verificar_entorno_de_simulacion(venue: str, symbol: str) -> None:
             f"pruebas se NIEGA a construir un cliente autenticado que no "
             f"apunte, de forma inequivoca, al entorno de demo trading."
         )
-    if not symbol.startswith("S"):
+    if not (symbol.startswith("S") and symbol.endswith(SUFIJO_DEMO)):
         raise RuntimeError(
-            f"ABORTADO por seguridad: symbol={symbol!r} no lleva el "
-            f"prefijo 'S' con el que Bitget marca los simbolos de "
-            f"simulacion (p.ej. 'SBTCSUSDT'). Este banco de pruebas se "
-            f"NIEGA a operar un simbolo que podria coincidir con uno real."
+            f"ABORTADO por seguridad: symbol={symbol!r} no es de "
+            f"simulacion. Los simbolos de demo empiezan por 'S' Y cotizan "
+            f"contra {SUFIJO_DEMO} (p.ej. 'SBTCSUSDT'). El sufijo es el "
+            f"discriminante que importa: hay simbolos REALES que empiezan "
+            f"por 'S' (SOLUSDT, SUIUSDT, SHIBUSDT...) y comprobar solo el "
+            f"prefijo los dejaba pasar. Este banco de pruebas se NIEGA a "
+            f"operar un simbolo que podria coincidir con uno real."
         )

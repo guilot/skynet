@@ -29,6 +29,26 @@ def test_un_simbolo_sin_prefijo_S_aborta():
         _verificar_entorno_de_simulacion(PRODUCT_TYPE_DEMO, "BTCUSDT")
 
 
+# Simbolos REALES que este mismo escaner opera, todos empezando por "S".
+# NO son inventados: son el caso dificil, y son los que una guarda que solo
+# mirase el prefijo dejaria pasar -dejando al banco abrir una posicion con
+# dinero de verdad. Que nadie los borre pensando que son ruido.
+SIMBOLOS_REALES_QUE_EMPIEZAN_POR_S = [
+    "SOLUSDT", "SUIUSDT", "SHIBUSDT", "SEIUSDT", "SANDUSDT", "SXPUSDT",
+]
+
+
+@pytest.mark.parametrize("symbol", SIMBOLOS_REALES_QUE_EMPIEZAN_POR_S)
+def test_un_simbolo_real_que_empieza_por_S_aborta(symbol):
+    """El caso que de verdad prueba que la guarda discrimina.
+
+    Comprobar `startswith("S")` no basta: estos seis lo cumplen y son
+    pares reales. El discriminante es el sufijo -cotizar contra SUSDT-,
+    que ninguno de ellos cumple."""
+    with pytest.raises(RuntimeError, match="ABORTADO"):
+        _verificar_entorno_de_simulacion(PRODUCT_TYPE_DEMO, symbol)
+
+
 def test_ambos_invalidos_a_la_vez_aborta_por_el_productType_primero():
     # Cualquiera de los dos motivos debe abortar; se fija el orden de
     # evaluacion (productType antes que simbolo) para que el mensaje de

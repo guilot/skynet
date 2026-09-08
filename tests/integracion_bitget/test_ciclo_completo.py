@@ -53,6 +53,21 @@ si falla).
 
 No se ejecuta en cada cambio: es un banco manual, para cuando hay algo que
 verificar contra el exchange de verdad (aunque sea de mentira).
+
+## Si falla la PRIMERA llamada, por autenticación
+
+Hay dos sospechosos, y el orden en que se miren importa:
+
+1. las credenciales (que sean de demo, con permisos de futuros, bien
+   copiadas);
+2. **el supuesto 10**: que la simulación no necesite nada más que el
+   `productType` y el prefijo del símbolo — mismo host, mismas cabeceras,
+   misma autenticación. Eso está SIN VERIFICAR, igual que los otros nueve.
+
+La trampa es que un fallo por el supuesto 10 se parece exactamente a una
+firma HMAC rota, y la firma ya costó una ronda entera de arreglo en la
+Task 2 — así que es el sitio donde alguien perdería horas depurando lo que
+no es. Descarta el supuesto 10 antes de tocar la firma.
 """
 from __future__ import annotations
 
@@ -122,9 +137,18 @@ async def test_ciclo_completo_abrir_stop_mover_cerrar_cancelar(broker, privado):
     try:
         # 1. Saldo positivo: valida la firma HMAC, la pieza que más veces
         # ha mordido en esta fase (progress.md, Task 2).
+        # Si ESTA llamada falla por autenticacion hay DOS sospechosos, y
+        # conviene nombrarlos los dos: es facil dar por hecho que la firma
+        # esta rota -ya costo una ronda entera en la Task 2- cuando el
+        # problema podria ser que el entorno de demo exija algo que este
+        # cliente no manda (supuesto 10).
         with bajo_sospecha(
             "1: leer saldo (valida la firma HMAC)",
-            "supuesto 9 (accountEquity/unrealizedPL en /account/accounts)",
+            "supuesto 9 (accountEquity/unrealizedPL en /account/accounts) "
+            "y, si el error es de AUTENTICACION, supuesto 10 (que la "
+            "simulacion no necesite nada mas que el productType: mismo "
+            "host, mismas cabeceras). NO des por hecho que la firma esta "
+            "rota sin descartar antes el supuesto 10",
         ):
             saldo = await privado.get_saldo()
         assert saldo.realizado > 0, (
