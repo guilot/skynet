@@ -161,8 +161,12 @@ async def paso_evaluador(
     `cerrojo` es el mismo `asyncio.Lock` que toma `paso_sondeo`: sin él, el
     sondeo del exchange puede pillar a `on_tick` suspendido en un `await` del
     broker y registrar un cierre DUPLICADO (ver `paso_sondeo` para el
-    escenario completo). También es opcional: en `paper` no hay bucle de
-    sondeo con el que competir, así que el bot corre exactamente como hoy."""
+    escenario completo). `main()` lo pasa SIEMPRE, también en `paper`, donde
+    no hay bucle de sondeo con el que competir: tomar un cerrojo libre no
+    cede el control del bucle de eventos (`Lock.acquire` tiene camino rápido
+    sin `await`), así que el comportamiento de `paper` no cambia, y una sola
+    forma de llamada es menos frágil que dos. El parámetro sigue siendo
+    opcional por los llamadores de los tests, anteriores a esta tarea."""
     orq.state.now_ms = ahora  # I-2(a): "ahora" del exchange, para el dashboard
     # Igual que `paso_outcomes`: un fallo transitorio (p. ej. un error de
     # SQLite al persistir una señal o una transición de estado, o un fallo
@@ -479,13 +483,28 @@ def posiciones_del_bot(
     `/api/v2/mix/position/all-position` y se dejan explícitamente vacíos en
     vez de inventarlos:
 
-    - `client_oid`: el endpoint de posiciones no lo trae. La consecuencia
-      está prevista y es la conservadora: `BotRunner._resolver_reserva` no da
-      por "nunca ejecutada" ninguna reserva mientras haya posiciones sin
-      identificador, y la deja intacta para revisión manual.
+    - **`client_oid`: el endpoint de posiciones no lo trae, y esto TIENE
+      consecuencias** (corregido tras un hallazgo de revisión que demostró
+      que la afirmación anterior aquí -"la consecuencia está prevista y es la
+      conservadora"- era FALSA). Sin `client_oid`,
+      `BotRunner._resolver_reserva` no puede correlacionar NUNCA: una reserva
+      sin confirmar -la huella de un proceso que murió entre mandar la orden y
+      registrarla, plausible bajo `Restart=always`- no se adopta jamás. Y como
+      el stop se coloca DESPUÉS de confirmar la apertura, esa posición real
+      puede estar apalancada y sin stop en el exchange. Lo conservador de
+      verdad, y lo que ahora hace `_resolver_reserva`, es **vetar el símbolo**:
+      antes de ese arreglo el bot abría otra posición encima de la real, en el
+      mismo arranque y otra vez en cada reinicio.
     - `entry_ts`: tampoco viene, y ningún camino de la reconciliación lo lee
       (se comprobó uno a uno); se pone a 0 antes que un instante inventado que
       alguien pudiera tomar por real más adelante.
+
+    Se DESCARTAN las posiciones de tamaño no positivo: Bitget devuelve en este
+    endpoint filas con `total = 0` para símbolos sin posición viva, y una fila
+    así traducida sería una posición fantasma con dos efectos contrarios y
+    ambos malos -el sondeo creería que la posición sigue abierta y nunca
+    detectaría su cierre, y la reconciliación de arranque la vetaría como
+    ajena.
 
     Un lado que no sea "long" ni "short" lanza en vez de elegir una dirección
     por defecto: interpretar mal el lado de una posición apalancada es peor
@@ -494,6 +513,8 @@ def posiciones_del_bot(
     """
     traducidas = []
     for p in posiciones:
+        if p.tamano <= 0:
+            continue
         if p.lado == "long":
             direction = Direction.LONG
         elif p.lado == "short":
@@ -517,10 +538,22 @@ async def fill_de_cierre_no_disponible(symbol: str) -> None:
 
     `BotRunner` (tareas 8 y 9) pide este dato cuando descubre que una posición
     que creía abierta ya no está en el exchange, y por diseño NUNCA inventa el
-    precio de cierre: si no se consigue el fill real, deja la posición intacta,
-    la cuenta (`"sondeo sin fill real"`) y grita en el log pidiendo revisión
-    manual. Este proveedor devuelve `None` siempre, así que ese es exactamente
-    el camino que se toma.
+    precio de cierre: si no se consigue el fill real, deja la posición abierta,
+    la marca `degradada`, la cuenta (`"sondeo sin fill real"`) y grita en el
+    log pidiendo revisión manual. Este proveedor devuelve `None` siempre, así
+    que ese es exactamente el camino que se toma.
+
+    **LA CONSECUENCIA OPERATIVA NO ES MENOR** (corregido tras la ronda de
+    revisión, que cuantificó lo que la primera versión de este docstring
+    despachaba como "ruidoso"): la salida por stop es la salida NORMAL de la
+    estrategia, así que esto pasa a menudo. Cada posición varada sigue
+    ocupando su hueco de concurrencia; con `max_concurrentes = 5`, cinco de
+    ellas dejan al bot sin abrir nada, y sobreviven al reinicio. Por eso el
+    informe tiene ahora una línea propia para contarlas
+    (`report._lineas_modo_real`) y `deploy/ENTORNO.md` le pide al operador que
+    la vigile a diario: la alternativa -inventar un precio- falsificaría el
+    libro contable en silencio, que es peor, pero "no falsificar" no es lo
+    mismo que "no hace falta hacer nada".
 
     **Por qué no se implementa aquí.** `BitgetPrivate.get_fill` consulta los
     fills DE UNA ORDEN (`symbol` + `orderId`), y en este escenario no hay
@@ -584,7 +617,9 @@ async def paso_sondeo(
     como "desaparecida del exchange" y se cerraría en la base recién abierta.
     Se paga por ello la latencia de una petición mientras el tick espera, que
     es del mismo orden que los `await` al broker que el tick ya hace con el
-    cerrojo tomado.
+    cerrojo tomado, y está acotada por el `timeout` del cliente HTTP (20 s,
+    ver `main()`): en el peor caso un tick sale tarde, nunca se queda
+    esperando para siempre.
 
     No propaga, como el resto de los `paso_*`: si el exchange no responde, se
     registra y se reintenta en el próximo sondeo.
@@ -689,7 +724,7 @@ async def main(argv: list[str] | None = None) -> None:
         bot = None
         piezas = None
         proveedor_saldo = None
-        frenos = None
+        frenos = None  # se construye dentro del `if` de abajo, en todos los modos
         # Un único cerrojo para todo el bot: lo toman el tick del evaluador y
         # el paso de sondeo, que son los dos caminos que pueden cerrar una
         # posición. Ver `paso_sondeo` para el fill duplicado que esto evita.
@@ -726,16 +761,33 @@ async def main(argv: list[str] | None = None) -> None:
                 # antes de la primera entrada de cada par (Task 11).
                 verificador = VerificadorCuenta(
                     params, piezas.privado.get_configuracion_symbol)
-                # Los frenos manuales solo se cablean en los modos reales, y
-                # es una decisión, no un olvido: hoy `paper` corre en
-                # producción SIN ellos, y encendérselos cambiaría el
-                # comportamiento del proceso que está midiendo la estrategia
-                # -un frenazo por pérdida diaria dejaría de abrir entradas
-                # que el backtest sí abre, y la comparación entre ambos, que
-                # es para lo que existe la Fase 2, dejaría de ser válida. Los
-                # frenos protegen dinero real; donde no hay dinero real, no
-                # tienen a quién proteger.
-                frenos = Frenos(cfg_bot, bot_repo, modo, proveedor_saldo)
+            # Los frenos se cablean en TODOS los modos -pero no los dos
+            # frenos en todos (corrección de la ronda de revisión, que separó
+            # lo que yo había juntado):
+            #
+            # - La PARADA DE EMERGENCIA vale en cualquier modo. Solo actúa
+            #   cuando un humano crea el fichero, así que "cambiaría el
+            #   comportamiento del proceso que mide la estrategia" no es un
+            #   argumento en su contra: cambiarlo es exactamente lo que se le
+            #   pide. Con el fichero ausente es inerte y `paper` sale
+            #   idéntico. Dejarla sin cablear ahí era documentar en el manual
+            #   de despliegue un control vivo que en el único modo que corre
+            #   en producción no hacía nada.
+            # - La PÉRDIDA DIARIA solo en los modos reales. Actúa sola, y en
+            #   `paper` dejaría de abrir entradas que el backtest sí abre:
+            #   rompería la comparación paper/backtest, que es para lo que
+            #   existe ese modo. Donde no hay dinero real no tiene a quién
+            #   proteger.
+            #
+            # `proveedor_saldo` es el MISMO objeto que recibe `LivePortfolio`
+            # justo debajo (Task 11): la referencia del freno y la medida del
+            # margen no pueden salir de fuentes distintas. En `real_lectura`
+            # esa fuente es el saldo real de una cuenta que el bot simulado no
+            # mueve, así que el freno solo saltará si el saldo baja por otra
+            # vía (una operación manual, funding): mide lo que de verdad hay,
+            # aunque en ese modo rara vez tenga nada que cortar.
+            frenos = Frenos(cfg_bot, bot_repo, modo, proveedor_saldo,
+                            perdida_diaria_activa=(modo != PAPER))
             bot = BotRunner(
                 params, cfg_bot, bot_repo, piezas.broker,
                 LivePortfolio(params, cfg_bot, bot_repo, proveedor_saldo),

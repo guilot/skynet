@@ -12,7 +12,8 @@ from datetime import datetime, timezone
 import pytest
 
 from scanner_volumen.bot.frenos import (
-    MOTIVO_PARADA_EMERGENCIA, MOTIVO_PERDIDA_DIARIA, Frenos,
+    MOTIVO_PARADA_EMERGENCIA, MOTIVO_PERDIDA_DIARIA, MOTIVO_SALDO_NO_FIABLE,
+    Frenos,
 )
 from scanner_volumen.bot.repo import BotRepo
 from scanner_volumen.config import BotConfig
@@ -342,3 +343,109 @@ def test_la_parada_de_emergencia_no_impide_gobernar_lo_ya_abierto(repo, tmp_path
     (tmp_path / "parar_bot").write_text("")
     assert frenos.puede_abrir(DIA_1) == MOTIVO_PARADA_EMERGENCIA
     assert [f["id"] for f in repo.abiertas("paper")] == [pid]
+
+
+# --- tercer freno: saldo no fiable (Task 13, ronda de revision) ---
+
+
+def _cfg_frenos(tmp_path, perdida=0.10):
+    return BotConfig(
+        enabled=True, modo="real", equity_inicial=1000.0, desvio_max_entrada=0.0,
+        perdida_diaria_max=perdida, fichero_parada=str(tmp_path / "no-existe"),
+    )
+
+
+def test_un_proveedor_que_lanza_frena_con_su_propio_motivo(tmp_path, repo, caplog):
+    """El proveedor de saldo de los modos reales LANZA cuando no tiene una
+    lectura real y reciente. Antes de esta ronda esa excepcion subia hasta el
+    manejador generico del bucle evaluador: el bot dejaba de abrir -correcto-
+    pero el unico rastro era un `log.exception` POR TICK y el informe no
+    decia nada de por que se habia parado."""
+    repo.set_equity_inicial("real", 1000.0)
+
+    def proveedor_roto():
+        raise ValueError("todavia no se ha observado ningun saldo real")
+
+    frenos = Frenos(_cfg_frenos(tmp_path), repo, "real", proveedor_roto)
+
+    with caplog.at_level("ERROR"):
+        assert frenos.puede_abrir(0) == MOTIVO_SALDO_NO_FIABLE
+
+    # y NO se persiste ninguna referencia del dia con un valor fantasma
+    assert repo.saldo_dia("real", "1970-01-01") is None
+
+
+def test_el_aviso_de_saldo_no_fiable_no_se_repite_en_cada_tick(tmp_path, repo, caplog):
+    """Con la cadencia del evaluador (1 s), un corte de red de diez minutos
+    serian ~600 mensajes identicos ahogando el log."""
+    repo.set_equity_inicial("real", 1000.0)
+
+    def proveedor_roto():
+        raise ValueError("sin saldo")
+
+    frenos = Frenos(_cfg_frenos(tmp_path), repo, "real", proveedor_roto)
+
+    with caplog.at_level("ERROR"):
+        for _ in range(5):
+            assert frenos.puede_abrir(0) == MOTIVO_SALDO_NO_FIABLE
+
+    avisos = [r for r in caplog.records if "saldo real fiable" in r.getMessage()]
+    assert len(avisos) == 1
+
+
+def test_el_freno_de_saldo_no_fiable_se_levanta_al_volver_el_saldo(tmp_path, repo):
+    repo.set_equity_inicial("real", 1000.0)
+    estado = {"roto": True}
+
+    def proveedor(_estado=estado):
+        if _estado["roto"]:
+            raise ValueError("sin saldo")
+        return 1000.0
+
+    frenos = Frenos(_cfg_frenos(tmp_path), repo, "real", proveedor)
+    assert frenos.puede_abrir(0) == MOTIVO_SALDO_NO_FIABLE
+
+    estado["roto"] = False
+    assert frenos.puede_abrir(0) is None
+    # y ahora sí fija la referencia del día, con el saldo bueno
+    assert repo.saldo_dia("real", "1970-01-01") == pytest.approx(1000.0)
+
+
+def test_la_parada_de_emergencia_gana_al_saldo_no_fiable(tmp_path, repo):
+    """El orden importa para quien lee el informe: si un humano ha accionado
+    la parada, eso es lo que hay que contarle, no un problema de red."""
+    repo.set_equity_inicial("real", 1000.0)
+    parada = tmp_path / "parar_bot"
+    parada.write_text("")
+    cfg = BotConfig(
+        enabled=True, modo="real", equity_inicial=1000.0, desvio_max_entrada=0.0,
+        perdida_diaria_max=0.10, fichero_parada=str(parada),
+    )
+
+    def proveedor_roto():
+        raise ValueError("sin saldo")
+
+    frenos = Frenos(cfg, repo, "real", proveedor_roto)
+    assert frenos.puede_abrir(0) == MOTIVO_PARADA_EMERGENCIA
+
+
+def test_sin_perdida_diaria_activa_no_se_consulta_el_saldo(tmp_path, repo):
+    """`paper`: el freno de perdida diaria no se evalua en absoluto -no se
+    lee el saldo ni se persiste ninguna referencia-, para no dejar de abrir
+    entradas que el backtest si abre y romper la comparacion. La parada de
+    emergencia, en cambio, sigue viva (ver `test_main.py`)."""
+    consultas = {"n": 0}
+
+    def proveedor():
+        consultas["n"] += 1
+        return 1.0  # una perdida del 99.9% que deberia frenar si se evaluara
+
+    cfg = BotConfig(
+        enabled=True, modo="paper", equity_inicial=1000.0, desvio_max_entrada=0.0,
+        perdida_diaria_max=0.10, fichero_parada=str(tmp_path / "no-existe"),
+    )
+    frenos = Frenos(cfg, repo, "paper", proveedor, perdida_diaria_activa=False)
+
+    assert frenos.puede_abrir(0) is None
+    assert consultas["n"] == 0
+    assert repo.saldo_dia("paper", "1970-01-01") is None

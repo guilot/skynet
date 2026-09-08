@@ -7,6 +7,7 @@ consigues del que la regla pedía.
 """
 from __future__ import annotations
 
+from scanner_volumen.bot.frenos import MOTIVO_SALDO_NO_FIABLE as FRENO_SALDO_NO_FIABLE
 from scanner_volumen.bot.model import ETIQUETAS_DESCARTE
 from scanner_volumen.bot.modo import REAL, REAL_LECTURA
 from scanner_volumen.bot.repo import BotRepo
@@ -231,6 +232,26 @@ def _lineas_modo_real(
     lineas.append(
         f"  Freno parada de emergencia activado: "
         f"{contadores.get('parada de emergencia', 0)} veces"
+    )
+    # El tercer freno (Task 13): el proveedor de saldo no tenía una lectura
+    # real y reciente que dar. Solo puede ocurrir en los modos reales, y por
+    # eso vive aquí y no en `ETIQUETAS_DESCARTE` -que imprimiría una línea de
+    # ceros también en `paper`. Ver `bot/frenos.py`.
+    lineas.append(
+        f"  Freno saldo no fiable activado: "
+        f"{contadores.get(FRENO_SALDO_NO_FIABLE, 0)} veces"
+    )
+    # Posiciones que el exchange cerró por su cuenta y que el bot NO pudo
+    # cerrar en su libro porque no consiguió el fill real de ese cierre
+    # (nunca se inventa un precio, ver `BotRunner._cerrar_por_sondeo`).
+    # Quedan marcadas `degradada` y siguen ocupando su hueco de
+    # concurrencia: es la línea que le dice al operador que hay filas
+    # varadas esperando una intervención manual, y sin ella el único rastro
+    # era un `log.error` perdido en journalctl.
+    varadas = contadores.get("sondeo sin fill real", 0)
+    lineas.append(
+        f"  Cierres SIN fill real (posiciones varadas, requieren revision "
+        f"manual): {varadas}"
     )
     return lineas
 

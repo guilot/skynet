@@ -27,12 +27,14 @@ from scanner_volumen.__main__ import (
 )
 from scanner_volumen.app.orchestrator import Orchestrator
 from scanner_volumen.app.state import ScannerState
-from scanner_volumen.bitget.private import BitgetPrivate, SaldoCuenta
+from scanner_volumen.bitget.private import (
+    BitgetPrivate, ConfiguracionCuentaSymbol, SaldoCuenta,
+)
 from scanner_volumen.bitget.private import PosicionExchange as PosicionExchangeBitget
 from scanner_volumen.bitget.ws import WsEvent
 from scanner_volumen.bot.bitget_broker import BitgetBroker
 from scanner_volumen.bot.broker import PaperBroker
-from scanner_volumen.bot.frenos import Frenos
+from scanner_volumen.bot.frenos import MOTIVO_PARADA_EMERGENCIA, Frenos
 from scanner_volumen.bot.model import OrdenEjecutada
 from scanner_volumen.bot.modo import PAPER, REAL, REAL_LECTURA
 from scanner_volumen.bot.portfolio import LivePortfolio
@@ -505,6 +507,13 @@ class PrivadoFalso:
         self.consultas_de_posiciones += 1
         return list(self._posiciones)
 
+    async def get_configuracion_symbol(self, symbol):
+        return ConfiguracionCuentaSymbol(
+            margen_aislado=True,
+            apalancamiento_long=float(StrategyParams().apalancamiento),
+            apalancamiento_short=float(StrategyParams().apalancamiento),
+        )
+
 
 def _entorno_con_claves():
     return {
@@ -928,3 +937,263 @@ async def test_paso_sondeo_pide_las_posiciones_con_el_cerrojo_tomado(tmp_path):
 
     assert visto["cerrojo_tomado"] is True
     conn.close()
+
+
+# --- la secuencia de arranque de los modos reales (ronda de revisión) ---
+#
+# HALLAZGO QUE MOTIVA ESTE BLOQUE: el revisor aplicó NUEVE mutaciones al
+# cableado de `main()` -entre ellas `frenos=None` y `verificador=None`, que
+# desconectan por completo dos criterios de aceptación de la fase- y la suite
+# entera siguió verde en las nueve. El código estaba bien escrito y no lo
+# defendía nada. Estos tests son esa red: arrancan `main()` de verdad con un
+# cliente falso y se paran justo en la frontera de los bucles, para poder
+# afirmar sobre lo que quedó cableado.
+
+
+class _MainCapturada:
+    """Lo que quedó construido cuando `main()` llegó a levantar los bucles."""
+
+    def __init__(self):
+        self.tareas: list[str] = []
+        self.portfolio_kwargs = None
+        self.frenos_args = None
+        self.frenos = None
+        self.runner_kwargs = None
+        self.runner = None
+        self.create_app_kwargs = None
+        self.repo = None
+
+
+def _config_para(tmp_path, modo, fichero_parada):
+    """Copia de `config.toml` con el modo, la base de datos y el fichero de
+    parada apuntando a `tmp_path`: nada de esto puede tocar producción."""
+    texto = CONFIG_PATH.read_text(encoding="utf-8")
+    texto = texto.replace('modo = "paper"', f'modo = "{modo}"')
+    texto = texto.replace('db_path = "data/scanner.db"',
+                          f'db_path = "{tmp_path / "scanner.db"}"')
+    texto = texto.replace('fichero_parada = "data/parar_bot"',
+                          f'fichero_parada = "{fichero_parada}"')
+    destino = tmp_path / "config.toml"
+    destino.write_text(texto, encoding="utf-8")
+    return destino
+
+
+async def _arrancar_main(monkeypatch, tmp_path, *, modo_config, valor_env,
+                         privado=None, fichero_parada=None):
+    """Corre `main()` hasta la frontera de los bucles y devuelve el cableado.
+
+    `asyncio.gather` se sustituye por un doble que anota qué corrutinas iban a
+    lanzarse y las cierra sin ejecutarlas: es exactamente el punto donde acaba
+    el cableado y empieza el proceso vivo, y frenar ahí evita que ningún bucle
+    llegue a tocar la red. El cliente privado es un doble, así que tampoco lo
+    hacen ni el saldo ni las posiciones."""
+    import scanner_volumen.__main__ as principal
+
+    capt = _MainCapturada()
+    fichero_parada = fichero_parada or (tmp_path / "parar_bot")
+    ruta = _config_para(tmp_path, modo_config, fichero_parada)
+
+    if valor_env is None:
+        monkeypatch.delenv("SCANNER_BOT_REAL", raising=False)
+    else:
+        monkeypatch.setenv("SCANNER_BOT_REAL", valor_env)
+    for nombre, valor in _entorno_con_claves().items():
+        monkeypatch.setenv(nombre, valor)
+
+    monkeypatch.setattr(principal, "get_code_revision", lambda cwd: "test")
+    if privado is not None:
+        monkeypatch.setattr(principal, "BitgetPrivate", lambda *a, **k: privado)
+
+    real_portfolio, real_frenos = principal.LivePortfolio, principal.Frenos
+    real_runner, real_repo = principal.BotRunner, principal.BotRepo
+    real_create_app = principal.create_app
+
+    def _portfolio(*a, **k):
+        capt.portfolio_kwargs = (a, k)
+        return real_portfolio(*a, **k)
+
+    def _frenos(*a, **k):
+        capt.frenos_args = (a, k)
+        capt.frenos = real_frenos(*a, **k)
+        return capt.frenos
+
+    def _runner(*a, **k):
+        capt.runner_kwargs = (a, k)
+        capt.runner = real_runner(*a, **k)
+        return capt.runner
+
+    def _repo_falso(*a, **k):
+        capt.repo = real_repo(*a, **k)
+        return capt.repo
+
+    def _create_app(*a, **k):
+        capt.create_app_kwargs = k
+        return real_create_app(*a, **k)
+
+    monkeypatch.setattr(principal, "LivePortfolio", _portfolio)
+    monkeypatch.setattr(principal, "Frenos", _frenos)
+    monkeypatch.setattr(principal, "BotRunner", _runner)
+    monkeypatch.setattr(principal, "BotRepo", _repo_falso)
+    monkeypatch.setattr(principal, "create_app", _create_app)
+
+    async def _gather_falso(*tareas, **kwargs):
+        for tarea in tareas:
+            capt.tareas.append(
+                getattr(getattr(tarea, "cr_code", None), "co_name", repr(tarea)))
+            tarea.close()  # ninguna llega a correr: aquí acaba el cableado
+        return []
+
+    monkeypatch.setattr(asyncio, "gather", _gather_falso)
+
+    await main(["--config", str(ruta)])
+    return capt
+
+
+def _hoy_utc():
+    from datetime import datetime, timezone
+    return datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+async def test_paper_arranca_las_mismas_tareas_de_siempre(monkeypatch, tmp_path):
+    """La red que protege lo que corre HOY en producción: ni bucle de saldo,
+    ni de sondeo, ni cliente autenticado, ni verificador de cuenta."""
+    capt = await _arrancar_main(monkeypatch, tmp_path,
+                                modo_config="paper", valor_env=None)
+
+    assert capt.tareas == ["run", "bucle_tickers", "bucle_evaluador",
+                           "bucle_outcomes", "bucle_mantenimiento", "serve"]
+    assert capt.runner_kwargs[1]["verificador"] is None
+    assert capt.runner_kwargs[1]["fill_de_cierre"] is None
+    assert capt.portfolio_kwargs[0][3] is None  # sin proveedor de saldo
+    assert capt.create_app_kwargs["modo"] == "paper"
+
+
+async def test_en_paper_la_parada_de_emergencia_esta_cableada(monkeypatch, tmp_path):
+    """I-3 de la revisión: `deploy/ENTORNO.md` documenta la parada de
+    emergencia como un control vivo, y hasta esta ronda era inerte en el
+    único modo que corre en producción. Solo actúa cuando un humano crea el
+    fichero, así que encenderla no cambia nada mientras no exista."""
+    parada = tmp_path / "parar_bot"
+    capt = await _arrancar_main(monkeypatch, tmp_path, modo_config="paper",
+                                valor_env=None, fichero_parada=parada)
+    frenos = capt.runner_kwargs[1]["frenos"]
+    assert frenos is not None
+
+    assert frenos.puede_abrir(0) is None  # sin fichero, inerte
+    parada.write_text("")
+    assert frenos.puede_abrir(0) == MOTIVO_PARADA_EMERGENCIA
+    parada.unlink()
+    assert frenos.puede_abrir(0) is None  # y se reanuda sin reiniciar
+
+
+async def test_en_paper_el_freno_de_perdida_diaria_no_se_evalua(monkeypatch, tmp_path):
+    """La otra mitad de I-3: la pérdida diaria SÍ actúa sola, y en `paper`
+    dejaría de abrir entradas que el backtest sí abre -rompiendo la
+    comparación para la que existe ese modo-. Ni se consulta el saldo ni se
+    persiste ninguna referencia del día."""
+    capt = await _arrancar_main(monkeypatch, tmp_path,
+                                modo_config="paper", valor_env=None)
+
+    assert capt.frenos.puede_abrir(0) is None
+    assert capt.repo.saldo_dia("paper", _hoy_utc()) is None
+
+
+@pytest.mark.parametrize("valor_env,modo", [("lectura", REAL_LECTURA),
+                                            ("ordenes", REAL)])
+async def test_el_arranque_real_persiste_el_saldo_y_la_referencia_del_dia(
+    monkeypatch, tmp_path, valor_env, modo,
+):
+    """Los dos pasos del arranque que ninguna mutación ponía en rojo:
+    `set_saldo_real` (sin él, el informe dice "sin dato todavia" para
+    siempre) y `registrar_saldo_del_dia` (la referencia del freno de pérdida
+    diaria, que debe quedar fijada ANTES de la primera consulta)."""
+    privado = PrivadoFalso(saldos=(1234.5,))
+    capt = await _arrancar_main(monkeypatch, tmp_path, modo_config="real",
+                                valor_env=valor_env, privado=privado)
+
+    assert capt.repo.saldo_real(modo) == pytest.approx(1234.5)
+    assert capt.repo.saldo_dia(modo, _hoy_utc()) == pytest.approx(1234.5)
+    assert privado.consultas_de_saldo == 1
+
+
+async def test_el_arranque_real_conecta_frenos_y_verificador(monkeypatch, tmp_path):
+    """`frenos=None` y `verificador=None` desconectan dos criterios de
+    aceptación de la fase (los frenos manuales y la verificación de cuenta) y
+    la suite seguía verde con ambas mutaciones."""
+    capt = await _arrancar_main(monkeypatch, tmp_path, modo_config="real",
+                                valor_env="ordenes", privado=PrivadoFalso())
+
+    assert capt.runner_kwargs[1]["frenos"] is not None
+    assert capt.runner_kwargs[1]["verificador"] is not None
+    assert capt.runner_kwargs[1]["fill_de_cierre"] is not None
+
+
+async def test_main_comparte_una_sola_instancia_de_proveedor_de_saldo(
+    monkeypatch, tmp_path,
+):
+    """I-2 de la revisión. El invariante de la Task 11 -la referencia del
+    freno y la medida del margen salen de la MISMA fuente- estaba probado
+    sobre un cableado construido a mano en el test, que demuestra que
+    compartir uno funciona pero nunca que `main()` lo comparta. Esto último
+    es lo que se comprueba aquí: la MISMA instancia, no una equivalente."""
+    capt = await _arrancar_main(monkeypatch, tmp_path, modo_config="real",
+                                valor_env="ordenes", privado=PrivadoFalso())
+
+    proveedor_cartera = capt.portfolio_kwargs[0][3]
+    proveedor_frenos = capt.frenos_args[0][3]
+    assert proveedor_cartera is not None
+    assert proveedor_frenos is proveedor_cartera
+
+
+@pytest.mark.parametrize("valor_env,modo", [("lectura", REAL_LECTURA),
+                                            ("ordenes", REAL)])
+async def test_el_modo_efectivo_llega_al_bot_y_al_panel(
+    monkeypatch, tmp_path, valor_env, modo,
+):
+    """`real` y `real_lectura` son dos libros contables distintos, y
+    `cfg.bot.modo` solo sabe decir "real". Si el modo efectivo no llega, el
+    panel avisaría de DINERO REAL en un modo que no puede mover un céntimo
+    (o, peor, dejaría de avisar en el que sí)."""
+    capt = await _arrancar_main(monkeypatch, tmp_path, modo_config="real",
+                                valor_env=valor_env, privado=PrivadoFalso())
+
+    assert capt.create_app_kwargs["modo"] == modo
+    assert capt.runner_kwargs[0][1].modo == modo   # la BotConfig del runner
+    assert capt.portfolio_kwargs[0][1].modo == modo
+    assert capt.frenos_args[0][2] == modo
+
+
+async def test_el_sondeo_y_la_reconciliacion_solo_ocurren_en_real(
+    monkeypatch, tmp_path,
+):
+    """En `real_lectura` el broker es el de paper: las posiciones de ese libro
+    son simuladas y no existen en Bitget. Ni se reconcilian contra el exchange
+    ni se sondean -"no está en el exchange" es su estado normal."""
+    privado_lectura = PrivadoFalso()
+    capt = await _arrancar_main(monkeypatch, tmp_path, modo_config="real",
+                                valor_env="lectura", privado=privado_lectura)
+    assert "bucle_sondeo" not in capt.tareas
+    assert "bucle_saldo" in capt.tareas          # el saldo sí se refresca
+    assert privado_lectura.consultas_de_posiciones == 0
+
+    otro = tmp_path / "real"
+    otro.mkdir()
+    privado_real = PrivadoFalso()
+    capt = await _arrancar_main(monkeypatch, otro,
+                                modo_config="real", valor_env="ordenes",
+                                privado=privado_real)
+    assert "bucle_sondeo" in capt.tareas
+    assert "bucle_saldo" in capt.tareas
+    assert privado_real.consultas_de_posiciones == 1  # reconcilió al arrancar
+
+
+async def test_main_no_arranca_si_no_consigue_el_primer_saldo(monkeypatch, tmp_path):
+    """La otra mitad del Step 2: que el proveedor lance sin saldo protege el
+    caché, pero nada protegía la exigencia del arranque -envolver el
+    `refrescar()` inicial en un `try/except: saldo = 0.0` dejaba la suite
+    verde y reintroducía justo el cero contra el que se diseñó el paso."""
+    privado = PrivadoFalso(saldos=(RuntimeError("Bitget no responde"),))
+
+    with pytest.raises(RuntimeError, match="Bitget no responde"):
+        await _arrancar_main(monkeypatch, tmp_path, modo_config="real",
+                             valor_env="ordenes", privado=privado)

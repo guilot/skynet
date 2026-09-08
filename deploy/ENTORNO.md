@@ -86,4 +86,31 @@ revés.
    `bot.fichero_parada` en `config.toml` (por defecto `data/parar_bot`, relativo
    al `WorkingDirectory` del servicio). Con él presente no se abren entradas
    nuevas; las posiciones abiertas se siguen gobernando. Se quita borrándolo.
-   Ninguna de las dos cosas exige reiniciar el proceso.
+   Ninguna de las dos cosas exige reiniciar el proceso, y funciona en **todos**
+   los modos, `paper` incluido.
+4. **Hoy el bot no sabe recuperar el precio de un cierre que ejecutó el
+   exchange.** Es la limitación más importante de este despliegue y la salida
+   por stop es la salida NORMAL de la estrategia, así que va a pasar:
+
+   - Qué ocurre: el sondeo detecta que la posición ya no está en Bitget, pero
+     no puede conseguir el fill real de ese cierre (haría falta una consulta
+     al historial de fills por símbolo que el cliente aún no tiene). Nunca
+     inventa un precio: deja la fila abierta, la marca `degradada` y grita en
+     el log.
+   - Cómo se ve: en el informe, la línea `Cierres SIN fill real (posiciones
+     varadas...)` y el contador de `(degradadas: N)` entre las abiertas.
+   - Por qué importa: cada posición varada sigue ocupando un hueco de
+     concurrencia. Con `max_concurrentes = 5`, cinco de ellas dejan al bot sin
+     abrir nada (`descartes tope concurrencia`), y sobreviven al reinicio.
+   - Qué hacer: cerrar esas filas a mano (o revisarlas) antes de que se
+     acumulen. **Vigila esa línea del informe a diario mientras el modo
+     `ordenes` esté encendido.**
+5. **Una orden mandada por un proceso que muere antes de registrarla veta su
+   símbolo.** El endpoint de posiciones de Bitget no devuelve el identificador
+   de cliente de la orden, así que el bot no puede reconocer como propia esa
+   posición. Hace lo conservador -no la toca y no abre nada más en ese
+   símbolo durante la sesión-, pero esa posición real puede estar **apalancada
+   y sin stop en el exchange**, porque el stop se coloca después de confirmar
+   la apertura. Se ve en el informe como `reserva sin correlacionar` en el log
+   y como un símbolo vetado. **Requiere mirar Bitget a mano**: o se le pone un
+   stop, o se cierra.

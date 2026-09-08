@@ -228,3 +228,30 @@ def test_en_real_lectura_tambien_aparece_el_bloque(repo):
     bloque = format_bloque_ejecucion(
         repo, "real_lectura", descartes={}, cierres_tardios=0, saldo_real=1000.0)
     assert "Modo real:" in bloque
+
+
+def test_en_real_se_ven_el_freno_de_saldo_y_las_posiciones_varadas(repo):
+    """Hallazgo de la ronda de revision de la Task 13: ninguna de las dos
+    cosas aparecia en el informe. Un bot frenado por no tener saldo fiable, o
+    con posiciones que el exchange cerro y el bot no pudo cerrar en su libro,
+    solo dejaba rastro en `journalctl` -y esas posiciones varadas ocupan hueco
+    de concurrencia hasta que el bot deja de abrir del todo."""
+    repo.set_equity_inicial("real", 1000.0)
+    repo.incrementar_contador("real", "saldo no fiable", 7)
+    repo.incrementar_contador("real", "sondeo sin fill real", 2)
+    bloque = format_bloque_ejecucion(
+        repo, "real", descartes={}, cierres_tardios=0, saldo_real=1000.0)
+    assert "Freno saldo no fiable activado: 7 veces" in bloque
+    assert ("Cierres SIN fill real (posiciones varadas, requieren revision "
+            "manual): 2") in bloque
+
+
+def test_en_paper_no_aparece_ninguna_de_esas_dos_lineas(repo):
+    """Son imposibles en `paper` (no hay proveedor de saldo que falle ni
+    exchange que sondear), y el informe de `paper` es el que corre hoy en
+    produccion: no puede ganar lineas."""
+    repo.set_equity_inicial("paper", 1000.0)
+    bloque = format_bloque_ejecucion(
+        repo, "paper", descartes={}, cierres_tardios=0, saldo_real=None)
+    assert "saldo no fiable" not in bloque
+    assert "varadas" not in bloque

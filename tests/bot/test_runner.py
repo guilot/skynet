@@ -1110,3 +1110,39 @@ async def test_un_fallo_al_verificar_descarta_solo_esa_entrada_y_se_reintenta(
     await runner.on_tick([tr(symbol="A", ts=MIN)], precios({"A": 100.0}), ahora=MIN)
     assert set(runner.abiertas) == {"A", "B"}
     assert repo.contadores("real").get("config cuenta") is None
+
+
+async def test_el_sondeo_sin_fill_real_marca_la_posicion_degradada(tmp_path, caplog):
+    """Hallazgo de la ronda de revision de la Task 13. Sin esta marca, el
+    informe presentaba las posiciones varadas -que ya no existen en el
+    exchange- entre las abiertas y con `degradadas: 0`, es decir, como sanas:
+    el operador leia posiciones fantasma en perfecto estado y un bot que
+    habia dejado de abrir por `tope concurrencia` sin ninguna explicacion.
+    `degradada` significa exactamente "sigue en la base, ocupa su hueco, y el
+    bot ya no la toca hasta que un humano intervenga"."""
+    runner, repo = _runner_real(tmp_path)
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+    posicion_id = runner.abiertas["A"].id
+
+    with caplog.at_level(logging.ERROR):
+        await runner.sondear_exchange([], ahora=5 * MIN)
+
+    assert runner.abiertas["A"].degradada is True
+    fila = repo.abiertas("real")[0]
+    assert fila["degradada"] == 1
+    assert fila["id"] == posicion_id
+    # y el contador que el informe enseña como "posiciones varadas"
+    assert repo.contadores("real")["sondeo sin fill real"] == 1
+
+
+async def test_una_posicion_varada_no_se_vuelve_a_degradar_en_cada_sondeo(tmp_path):
+    """El sondeo la reencuentra en cada ciclo (cada 30 s por defecto): la
+    marca es idempotente y no reescribe la fila una y otra vez."""
+    runner, repo = _runner_real(tmp_path)
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+
+    await runner.sondear_exchange([], ahora=5 * MIN)
+    await runner.sondear_exchange([], ahora=6 * MIN)
+
+    assert repo.abiertas("real")[0]["degradada"] == 1
+    assert repo.contadores("real")["sondeo sin fill real"] == 2

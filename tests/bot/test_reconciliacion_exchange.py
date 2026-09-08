@@ -274,7 +274,13 @@ async def test_client_oid_sin_correlacion_certera_no_se_cierra_como_no_ejecutada
     assert fila["confirmada"] == 0
     assert fila["abierta"] == 1
     assert "A" not in bot.abiertas
-    assert "A" not in bot.simbolos_vetados
+    # VETADO desde la ronda de revision de la Task 13 (antes se afirmaba lo
+    # contrario aqui): dejar la fila intacta protege el libro contable, pero
+    # por si solo no protegia el dinero -el bot no reconocia esa posicion, asi
+    # que abria OTRA encima del mismo simbolo en este mismo arranque, y otra
+    # en cada reinicio. Y como el stop se coloca DESPUES de confirmar, la
+    # posicion real de esa reserva puede estar apalancada y sin stop.
+    assert "A" in bot.simbolos_vetados
     assert repo.contadores("paper").get("reserva sin correlacionar") == 1
     # el motivo es distinto del de una reserva genuinamente no ejecutada.
     assert repo.contadores("paper").get("reserva sin ejecutar", 0) == 0
@@ -340,3 +346,43 @@ async def test_un_fallo_al_reconciliar_una_no_impide_las_demas_ni_arrancar(conn)
     assert "A" not in bot2.abiertas
     abiertas = {f["symbol"] for f in repo.abiertas("paper")}
     assert "A" in abiertas
+
+
+async def test_una_reserva_no_correlacionable_veta_el_simbolo(conn):
+    """Hallazgo de la ronda de revision de la Task 13, y la unica via por la
+    que el cableado podia AUMENTAR la exposicion real.
+
+    El endpoint de posiciones de Bitget no devuelve `client_oid`, asi que
+    ninguna posicion del exchange lo trae y esta rama se recorre SIEMPRE que
+    hay una reserva sin confirmar -la huella de un proceso que murio entre
+    mandar la orden y registrarla, plausible bajo `Restart=always`-. Dejar la
+    fila intacta protege el libro contable, pero sin el veto el bot abria
+    OTRA posicion encima de la real en el mismo arranque, y otra en cada
+    reinicio siguiente. Y como el stop se coloca DESPUES de confirmar, esa
+    posicion real puede estar apalancada y sin stop en el exchange."""
+    repo = BotRepo(conn)
+    repo.abrir(
+        modo="paper", symbol="A", direction=Direction.LONG, entry_ts=0,
+        entry_price=100.0, entry_price_senal=100.0, margin=20.0,
+        notional=400.0, size=4.0, fee_entrada=0.0,
+        client_oid="bot-huerfano", confirmada=False,
+    )
+    bot, _ = _nuevo_runner(conn)
+    # como en produccion: la posicion del exchange viene SIN client_oid.
+    exchange = [PosicionExchange(symbol="A", direction=Direction.LONG,
+                                 size=4.0, entry_price=100.0, entry_ts=0,
+                                 client_oid=None)]
+    await bot.reconciliar_con_exchange(
+        exchange,
+        transiciones_de=_sin_historial, velas_de=_sin_velas, precio_de=_sin_precio,
+        fill_de_cierre=_sin_cierre,
+        ahora=MIN,
+    )
+    assert "A" in bot.simbolos_vetados
+
+    # y una entrada posterior en ese simbolo NO abre una segunda posicion
+    await bot.on_tick([tr(symbol="A", ts=2 * MIN)], lambda s: 100.0, ahora=2 * MIN)
+
+    assert "A" not in bot.abiertas
+    assert len(repo.abiertas("paper")) == 1  # sigue solo la reserva original
+    assert repo.contadores("paper").get("simbolo vetado") == 1

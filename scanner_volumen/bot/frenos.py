@@ -40,6 +40,13 @@ cambia es que no se evalúan entradas nuevas.
   que se arregló: un `nan` colado en la primera consulta del día apagaba
   este freno hasta medianoche UTC, sobreviviendo incluso a un reinicio
   porque quedaba escrito en `bot_meta`.
+- **Saldo no fiable** (tercer freno, Task 13): en los modos reales el saldo
+  lo da un proveedor que LANZA cuando no tiene ninguna lectura real y
+  reciente (ver `ProveedorSaldo` en `__main__.py`). Sin saldo no se puede
+  medir la pérdida del día ni dimensionar una entrada, así que se frena -y
+  se frena CON NOMBRE (`MOTIVO_SALDO_NO_FIABLE`), con su contador y su línea
+  en el informe, en vez de dejar subir la excepción y que el operador solo
+  vea una traza en el log.
 - **Parada de emergencia**: si existe `fichero_parada` en disco, no se abre
   nada. Se comprueba con `os.stat()` en cada llamada -una consulta barata
   al sistema de ficheros-, lo que permite cortar desde SSH creando el
@@ -67,6 +74,24 @@ log = logging.getLogger(__name__)
 # añaden a `ETIQUETAS_DESCARTE` en `bot/model.py`.
 MOTIVO_PERDIDA_DIARIA = "perdida diaria"
 MOTIVO_PARADA_EMERGENCIA = "parada de emergencia"
+# Tercer motivo (Task 13, ronda de revisión): el proveedor de saldo de los
+# modos reales LANZA cuando no tiene un saldo que merezca ese nombre -nunca
+# ha leído ninguno, o el último es demasiado viejo (ver `ProveedorSaldo` en
+# `__main__.py`). Antes de esta ronda esa excepción subía hasta el manejador
+# genérico del bucle evaluador: el bot dejaba de abrir -correcto- pero el
+# único rastro era un `log.exception` con traza completa POR TICK, y el
+# informe no decía absolutamente nada de por qué se había parado, mientras
+# los otros dos frenos sí tienen contador y línea propia. Un tercer freno,
+# con su etiqueta, en vez de un fallo silencioso para el operador.
+MOTIVO_SALDO_NO_FIABLE = "saldo no fiable"
+# A diferencia de los otros dos, esta etiqueta NO se añade a
+# `ETIQUETAS_DESCARTE` (`bot/model.py`): esa tupla gobierna la lista de
+# descartes que el informe imprime en TODOS los modos, y este freno es
+# imposible en `paper` -no hay proveedor de saldo que pueda fallar-. Meterla
+# ahí solo añadiría una línea de ceros permanente al informe del proceso que
+# hoy corre en producción, que debe salir idéntico. Se muestra donde
+# significa algo: el bloque de modo real (`report._lineas_modo_real`), que
+# lee los contadores directamente del repositorio.
 
 
 def _dia_utc(ahora: int) -> str:
@@ -95,16 +120,41 @@ class Frenos:
     def __init__(
         self, cfg_bot: BotConfig, repo: BotRepo, modo: str,
         proveedor_saldo: Callable[[], float] | None = None,
+        perdida_diaria_activa: bool = True,
     ) -> None:
         """`proveedor_saldo` es el mismo tipo que recibe `LivePortfolio`
         (Task 11) y, en el cableado real, debe ser literalmente el MISMO
         callable inyectado ahí -no uno equivalente construido aparte-: es lo
         que garantiza que el freno y el tamaño de posición nunca lean cifras
-        de fuentes distintas. Ver `_saldo_actual`."""
+        de fuentes distintas. Ver `_saldo_actual`.
+
+        `perdida_diaria_activa` separa los dos frenos, que hasta la Task 13
+        iban siempre juntos, porque en `paper` NO se comportan igual:
+
+        - La **parada de emergencia** solo actúa cuando un humano crea el
+          fichero. Que cambie el comportamiento del proceso es exactamente lo
+          que se le pide, así que tiene sentido en cualquier modo -y con el
+          fichero ausente es inerte, byte a byte.
+        - La **pérdida diaria** actúa sola, sobre el equity contable, y en
+          `paper` dejaría de abrir entradas que el backtest sí abre: eso
+          rompe la comparación paper/backtest, que es para lo que existe el
+          modo paper. Por eso el cableado la desactiva ahí (Task 13) y la
+          deja encendida en los modos reales, donde hay dinero que proteger.
+
+        Desactivarla NO es "tolerar cualquier pérdida": es no evaluar ese
+        freno en absoluto -no se lee el saldo, no se fija ni se persiste
+        ninguna referencia del día."""
         self._cfg = cfg_bot
         self._repo = repo
         self._modo = modo
         self._proveedor_saldo = proveedor_saldo
+        self._perdida_diaria_activa = perdida_diaria_activa
+        # Se avisa UNA vez por episodio de "saldo no fiable", no una por
+        # tick: con la cadencia del evaluador (1 s) un corte de red de diez
+        # minutos serían ~600 mensajes idénticos ahogando el log. Se rearma
+        # en cuanto vuelve a haber un saldo bueno, para que un episodio
+        # NUEVO sí vuelva a avisar.
+        self._aviso_saldo_no_fiable_emitido = False
 
     def puede_abrir(self, ahora: int) -> str | None:
         """El nombre del freno que impide abrir ahora mismo, o `None` si
@@ -137,7 +187,32 @@ class Frenos:
         vía para anclarla a otra cosa -y sigue teniendo que llegar antes."""
         if self._parada_de_emergencia():
             return MOTIVO_PARADA_EMERGENCIA
-        if self._perdida_diaria_superada(ahora):
+        if not self._perdida_diaria_activa:
+            # `paper`: ver `perdida_diaria_activa` en el constructor. No se
+            # consulta el saldo ni se toca `bot_meta`.
+            return None
+        try:
+            saldo_actual = self._saldo_actual()
+        except Exception:
+            # El proveedor de saldo de los modos reales lanza cuando no tiene
+            # un saldo real y reciente que dar (`ProveedorSaldo`). Se traduce
+            # aquí a un freno CON NOMBRE en vez de dejarlo subir: el bot debe
+            # dejar de abrir -sin saldo fiable no hay con qué medir ni
+            # dimensionar-, pero el operador tiene que poder leer en el
+            # informe por qué se paró, igual que con los otros dos frenos.
+            # La excepción NO se deja propagar también porque hacerlo aborta
+            # el resto del tick: los contadores de este tick no se
+            # escribirían y el fallo aparecería como una traza suelta.
+            if not self._aviso_saldo_no_fiable_emitido:
+                log.exception(
+                    "bot: no se pudo obtener un saldo real fiable; se frenan "
+                    "las entradas nuevas (las posiciones abiertas se siguen "
+                    "gobernando) hasta que vuelva a haber uno"
+                )
+                self._aviso_saldo_no_fiable_emitido = True
+            return MOTIVO_SALDO_NO_FIABLE
+        self._aviso_saldo_no_fiable_emitido = False
+        if self._perdida_diaria_superada(ahora, saldo_actual):
             return MOTIVO_PERDIDA_DIARIA
         return None
 
@@ -223,8 +298,11 @@ class Frenos:
             return self._proveedor_saldo()
         return self._repo.equity(self._modo)
 
-    def _perdida_diaria_superada(self, ahora: int) -> bool:
-        saldo_actual = self._saldo_actual()
+    def _perdida_diaria_superada(self, ahora: int, saldo_actual: float) -> bool:
+        """`saldo_actual` lo lee `puede_abrir` (única llamadora), que es
+        quien puede distinguir "el proveedor no da saldo" -un freno propio,
+        `MOTIVO_SALDO_NO_FIABLE`- de "el saldo que da no vale", que es lo
+        que sigue tratándose aquí."""
         if not _saldo_valido(saldo_actual):
             # Hallazgo de revisión: un valor espurio de `proveedor_saldo`
             # (`nan`, `0.0`, negativo -un caché sin inicializar en el

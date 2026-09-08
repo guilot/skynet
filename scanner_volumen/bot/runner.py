@@ -738,12 +738,26 @@ class BotRunner:
         if client_oid is None or sin_identificador:
             self._repo.incrementar_contador(
                 self._cfg.modo, "reserva sin correlacionar")
+            # Y se VETA el símbolo (hallazgo de revisión de la Task 13). Dejar
+            # la fila intacta protege el libro contable -no se cierra como "no
+            # ejecutada" algo que quizá sigue vivo y apalancado-, pero por sí
+            # solo no protegía el dinero: el bot no adoptaba esa posición ni
+            # la reconocía, así que en el mismo arranque abría OTRA encima del
+            # mismo símbolo, y otra en cada reinicio siguiente. Y como el stop
+            # se coloca DESPUÉS de confirmar la apertura, la posición real de
+            # esa reserva puede estar apalancada y sin stop en el exchange.
+            # El veto es la misma respuesta que ya se da a una posición ajena:
+            # no se toca lo que no se entiende, y no se abre nada encima
+            # mientras dure la sesión.
+            self.simbolos_vetados.add(fila["symbol"])
             log.error(
                 "bot: reconciliacion: %s (client_oid=%r) reservada sin "
                 "confirmar, y no se pudo correlacionar con certeza contra "
                 "el exchange -hay posiciones sin identificador de orden, o "
-                "esta reserva no tiene uno propio-; se deja intacta -- "
-                "requiere revision manual", fila["symbol"], client_oid)
+                "esta reserva no tiene uno propio-; se deja intacta y el "
+                "simbolo queda VETADO el resto de la sesion (puede haber ahi "
+                "una posicion real sin stop) -- requiere revision manual",
+                fila["symbol"], client_oid)
             return
 
         self._repo.cerrar(fila["id"], close_ts=ahora, pnl=0.0,
@@ -912,10 +926,24 @@ class BotRunner:
         orden = await self._fill_de_cierre(symbol) if self._fill_de_cierre else None
         if orden is None:
             self._repo.incrementar_contador(self._cfg.modo, "sondeo sin fill real")
+            # Se marca DEGRADADA (hallazgo de revisión de la Task 13): la
+            # posición ya no existe en el exchange, así que su motor de
+            # reglas gobierna algo que no está -moverle el stop o mandar un
+            # cierre reduce-only solo produce errores contra una posición
+            # inexistente-. Sin esta marca, el informe la presentaba entre
+            # las abiertas con `degradadas: 0`, es decir, como sana: el
+            # operador leía cinco posiciones fantasma en perfecto estado y
+            # un bot que había dejado de abrir por `tope concurrencia` sin
+            # ninguna explicación visible. `degradada` es exactamente el
+            # estado que significa "sigue en la base, ocupa su hueco, y el
+            # bot ya no la toca hasta que un humano intervenga".
+            if not pos.degradada:
+                pos.degradada = True
+                self._repo.marcar_degradada(pos.id)
             log.error(
                 "bot: sondeo: %s desaparecio del exchange y no se encontro "
-                "el fill real de su cierre; se deja intacta -- requiere "
-                "revision manual", symbol)
+                "el fill real de su cierre; se marca degradada y se deja "
+                "intacta -- requiere revision manual", symbol)
             return
 
         restante = pos.reglas.restante
