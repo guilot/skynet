@@ -9,6 +9,12 @@ Type=simple
 User=__USER__
 WorkingDirectory=__APP_DIR__
 ExecStart=__APP_DIR__/.venv/bin/python -m scanner_volumen
+# Secretos y el interruptor del dinero real: SIEMPRE aqui por referencia,
+# NUNCA escritos en esta unidad -`systemctl cat scanner` la imprime entera-.
+# El fichero lleva permisos 600 y no esta en el repositorio. El guion inicial
+# lo hace opcional: en modo paper no hace falta ninguna credencial y el
+# servicio debe arrancar igual. Ver deploy/ENTORNO.md.
+EnvironmentFile=-/etc/scanner_volumen.env
 # El proceso esta disenado para reinicios baratos: al arrancar rellena los
 # huecos de velas y el perfil viene de la BD persistida, asi que Restart=
 # siempre es la politica correcta (crash -> reintento en 5s).

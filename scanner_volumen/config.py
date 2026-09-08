@@ -190,6 +190,14 @@ class BotConfig:
     Fase 3 (`bot/frenos.py`): cortan ENTRADAS nuevas -nunca la gestión de las
     posiciones abiertas- cuando la pérdida del día supera esa fracción del
     saldo de referencia, o cuando existe el fichero de parada de emergencia.
+
+    `sondeo_segundos` y `saldo_refresco_segundos` son las dos cadencias que
+    solo existen en los modos reales (Task 13, `__main__.py`): cada cuánto se
+    pregunta al exchange qué posiciones siguen vivas -para enterarse de un
+    stop que saltó mientras el bot miraba a otro lado- y cada cuánto se
+    refresca el saldo real que dimensiona el margen y mide el freno de
+    pérdida diaria. En `paper` no se arranca ninguno de esos dos bucles, así
+    que estos dos valores no cambian nada de lo que corre hoy en producción.
     """
 
     enabled: bool
@@ -198,6 +206,8 @@ class BotConfig:
     desvio_max_entrada: float
     perdida_diaria_max: float = 0.10
     fichero_parada: str = "data/parar_bot"
+    sondeo_segundos: float = 30.0
+    saldo_refresco_segundos: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -268,6 +278,17 @@ def _validar_bot(raw_bot: dict) -> None:
         raise ValueError(
             f"bot.perdida_diaria_max debe estar entre 0 y 1, llegó {perdida!r}"
         )
+    # Las dos cadencias de los modos reales: una cadencia <= 0 no es un ajuste
+    # agresivo sino un bucle que gira sin dormir, y con red de por medio eso
+    # significa martillear el exchange hasta que corte por límite de
+    # peticiones -justo el estado en el que el sondeo dejaría de detectar los
+    # cierres que existe para detectar. Se rechaza al cargar, como el resto de
+    # umbrales, en vez de fallar en caliente sin decir qué campo del TOML lo
+    # causó.
+    for campo in ("sondeo_segundos", "saldo_refresco_segundos"):
+        valor = raw_bot[campo]
+        if valor <= 0:
+            raise ValueError(f"bot.{campo} debe ser positivo, llegó {valor!r}")
 
 
 def _validar_backtest(raw_backtest: dict) -> None:

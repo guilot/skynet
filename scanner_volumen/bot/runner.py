@@ -44,6 +44,7 @@ from scanner_volumen.bot.frenos import Frenos
 from scanner_volumen.bot.model import OrdenEjecutada, PosicionAbierta, PosicionExchange
 from scanner_volumen.bot.portfolio import LivePortfolio
 from scanner_volumen.bot.repo import BotRepo
+from scanner_volumen.bot.verificacion_cuenta import VerificadorCuenta
 from scanner_volumen.config import BotConfig
 from scanner_volumen.models import Direction, State
 from scanner_volumen.strategy.entries import es_entrada
@@ -133,6 +134,7 @@ class BotRunner:
         broker: Broker, portfolio: LivePortfolio,
         fill_de_cierre: FillDeCierre | None = None,
         frenos: Frenos | None = None,
+        verificador: VerificadorCuenta | None = None,
     ) -> None:
         self._params = params
         self._cfg = cfg_bot
@@ -144,6 +146,15 @@ class BotRunner:
         # construcción anterior a esta tarea -sin frenos configurados,
         # `on_tick` nunca corta entradas por este motivo, igual que antes.
         self._frenos = frenos
+        # La verificación perezosa de la configuración de la cuenta (Task
+        # 11): se consulta justo antes de la PRIMERA entrada de cada símbolo,
+        # no en un bucle de arranque, porque en Bitget el apalancamiento es
+        # por símbolo y el bot no sabe qué pares va a operar hasta que dan
+        # señal.
+        # `None` en `paper` (no hay cuenta real que verificar) y en los tests
+        # que no la ejercitan: sin verificador, `on_tick` se comporta
+        # exactamente como antes de esta tarea.
+        self._verificador = verificador
         # El proveedor del fill real de un cierre que decidió el exchange
         # por su cuenta -mismo contrato que el parámetro homónimo de
         # `reconciliar_con_exchange`, pero inyectado aquí en el constructor
@@ -221,8 +232,13 @@ class BotRunner:
                 precio = precio_de(t.symbol)
                 if precio is None or precio <= 0:
                     continue  # sin precio observado no se entra; no es un descarte
-                if self.portfolio.evaluar_entrada(t, set(self.abiertas), precio) is None:
-                    await self._abrir(t, precio, ahora)
+                descarte = self.portfolio.evaluar_entrada(
+                    t, set(self.abiertas), precio)
+                if descarte is not None:
+                    continue
+                if await self._vetada_por_configuracion(t.symbol):
+                    continue
+                await self._abrir(t, precio, ahora)
             except Exception:
                 # aislar el fallo a esta entrada: no debe llevarse por
                 # delante las entradas de los demás símbolos de este tick.
@@ -253,6 +269,43 @@ class BotRunner:
                         t.symbol)
 
     # --- entradas ---
+
+    async def _vetada_por_configuracion(self, symbol: str) -> bool:
+        """True si la configuración de la cuenta para `symbol` no es la que
+        la estrategia asume, y por tanto NO se debe abrir aquí (Task 11).
+
+        Se consulta DESPUÉS de `evaluar_entrada` y ANTES de `_abrir`, y ese
+        orden es deliberado en los dos extremos:
+
+        - Después de `evaluar_entrada` porque esta comprobación cuesta una
+          llamada de red la primera vez que se ve un símbolo: preguntarle al
+          exchange por el apalancamiento de un par que se iba a descartar de
+          todos modos por "score bajo" sería gastar peticiones para nada, y
+          además contabilizaría DOS descartes por la misma transición,
+          falseando el reparto que el informe compara contra el backtest.
+        - Antes de `_abrir` porque un veto que llegara después no serviría de
+          nada: la orden ya estaría mandada con un apalancamiento que no es el
+          que la estrategia dimensionó.
+
+        El veto se contabiliza aquí como un descarte más, con su propia
+        etiqueta (`MOTIVO_VETO`, "config cuenta"): así lo exige el CONTRATO
+        CON LA TASK 13 escrito en `bot/verificacion_cuenta.py` -esa clase se
+        diseñó sin acceso al repositorio para poder probarse sin red, así que
+        devuelve el motivo pero no lo cuenta-. Una vez por transición
+        descartada, no una por símbolo, igual que hace
+        `LivePortfolio.evaluar_entrada` con los suyos.
+
+        Un fallo de la consulta (red, límite de peticiones) NO se traga aquí:
+        se deja propagar al `try/except` de la entrada, que descarta solo esta
+        transición. `VerificadorCuenta` no cachea los fallos, así que la
+        próxima transición de ese símbolo vuelve a intentarlo."""
+        if self._verificador is None:
+            return False
+        motivo = await self._verificador.verificar(symbol)
+        if motivo is None:
+            return False
+        self._repo.incrementar_contador(self._cfg.modo, motivo)
+        return True
 
     async def _abrir(self, t: TransitionRow, precio: float, ahora: int) -> None:
         margin = self.portfolio.margen()

@@ -159,3 +159,5 @@ equity_inicial = 1000.0
 desvio_max_entrada = 0.0   # fracción; 0 = desactivado
 perdida_diaria_max = 0.10  # fracción del saldo del día; freno de entradas
 fichero_parada = "data/parar_bot"  # si existe, freno de entradas (parada de emergencia)
+sondeo_segundos = 30.0          # cada cuanto se pregunta al exchange que posiciones siguen vivas (solo modos reales)
+saldo_refresco_segundos = 30.0  # cada cuanto se relee el saldo real de la subcuenta (solo modos reales)

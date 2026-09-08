@@ -2,11 +2,13 @@ import logging
 
 import pytest
 
+from scanner_volumen.bitget.private import ConfiguracionCuentaSymbol
 from scanner_volumen.bot.broker import PaperBroker, StopVivo
 from scanner_volumen.bot.model import OrdenEjecutada, PosicionExchange
 from scanner_volumen.bot.portfolio import LivePortfolio
 from scanner_volumen.bot.repo import BotRepo
 from scanner_volumen.bot.runner import BotRunner
+from scanner_volumen.bot.verificacion_cuenta import VerificadorCuenta
 from scanner_volumen.config import BotConfig
 from scanner_volumen.models import Direction, State
 from scanner_volumen.storage.db import open_db
@@ -971,3 +973,140 @@ async def test_un_fallo_al_sondear_una_no_impide_sondear_las_demas(tmp_path, cap
     assert "B" not in runner.abiertas
     assert "A" in runner.abiertas
     assert repo.cerradas("real")[0]["symbol"] == "B"
+
+
+# --- verificacion de la configuracion de cuenta antes de la primera entrada
+# (Task 11, cableada por la Task 13) ---
+#
+# `VerificadorCuenta.verificar(symbol)` devuelve el motivo del veto pero NO
+# lo contabiliza: se diseno sin acceso al repositorio para poder probarse sin
+# red, y su docstring deja escrito el CONTRATO CON LA TASK 13 -quien la
+# cablea es quien debe incrementar el contador. Estos tests fijan ese
+# contrato y, sobre todo, el ORDEN: verificar ANTES de abrir, nunca despues.
+
+
+def _config_cuenta(margen_aislado=True, apalancamiento=None):
+    lever = float(StrategyParams().apalancamiento if apalancamiento is None
+                  else apalancamiento)
+    return ConfiguracionCuentaSymbol(
+        margen_aislado=margen_aislado, apalancamiento_long=lever,
+        apalancamiento_short=lever,
+    )
+
+
+def _runner_con_verificador(tmp_path, lector):
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn)
+    repo.set_equity_inicial("real", 1000.0)
+    cfg = BotConfig(enabled=True, modo="real", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    params = StrategyParams(comision_taker=0.0)
+    runner = BotRunner(params, cfg, repo, PaperBroker(params),
+                       LivePortfolio(params, cfg, repo),
+                       verificador=VerificadorCuenta(params, lector))
+    return runner, repo
+
+
+async def test_un_simbolo_mal_configurado_no_se_abre_y_cuenta_como_descarte(tmp_path):
+    async def lector(symbol):
+        return _config_cuenta(margen_aislado=False)
+
+    runner, repo = _runner_con_verificador(tmp_path, lector)
+
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+
+    assert runner.abiertas == {}
+    assert repo.abiertas("real") == []          # ni siquiera se reservo fila
+    assert repo.contadores("real")["config cuenta"] == 1
+
+
+async def test_un_simbolo_bien_configurado_se_abre_con_normalidad(tmp_path):
+    async def lector(symbol):
+        return _config_cuenta()
+
+    runner, repo = _runner_con_verificador(tmp_path, lector)
+
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+
+    assert "A" in runner.abiertas
+    assert repo.contadores("real").get("config cuenta") is None
+
+
+async def test_la_verificacion_ocurre_antes_de_mandar_la_orden(tmp_path):
+    """El orden importa y es de una sola dirección: un veto que llegara
+    despues de `_abrir` no serviria de nada, porque la orden ya estaria
+    mandada con un apalancamiento que no es el que la estrategia dimensiono."""
+    llamadas = []
+
+    async def lector(symbol):
+        llamadas.append(("verifica", symbol))
+        return _config_cuenta()
+
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn)
+    repo.set_equity_inicial("real", 1000.0)
+    cfg = BotConfig(enabled=True, modo="real", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    params = StrategyParams(comision_taker=0.0)
+
+    class BrokerQueAnota(PaperBroker):
+        async def abrir(self, **kwargs):
+            llamadas.append(("abre", kwargs["symbol"]))
+            return await super().abrir(**kwargs)
+
+    runner = BotRunner(params, cfg, repo, BrokerQueAnota(params),
+                       LivePortfolio(params, cfg, repo),
+                       verificador=VerificadorCuenta(params, lector))
+
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+
+    assert llamadas == [("verifica", "A"), ("abre", "A")]
+    conn.close()
+
+
+async def test_no_se_consulta_la_cuenta_por_una_transicion_ya_descartada(tmp_path):
+    """La consulta cuesta una llamada de red la primera vez que se ve un
+    simbolo: no se gasta en un par que se iba a descartar de todos modos -y
+    ademas se contabilizarian DOS descartes por la misma transicion."""
+    consultas = []
+
+    async def lector(symbol):
+        consultas.append(symbol)
+        return _config_cuenta()
+
+    runner, repo = _runner_con_verificador(tmp_path, lector)
+
+    await runner.on_tick([tr(score=50.0)], precios({"A": 100.0}), ahora=0)
+
+    assert consultas == []
+    assert repo.contadores("real")["score bajo"] == 1
+    assert repo.contadores("real").get("config cuenta") is None
+
+
+async def test_un_fallo_al_verificar_descarta_solo_esa_entrada_y_se_reintenta(
+    tmp_path, caplog,
+):
+    """Un fallo transitorio (red, limite de peticiones) no veta el simbolo
+    para siempre: `VerificadorCuenta` no cachea los fallos, asi que la
+    siguiente transicion vuelve a intentarlo de verdad."""
+    intentos = {"n": 0}
+
+    async def lector(symbol):
+        intentos["n"] += 1
+        if intentos["n"] == 1:
+            raise RuntimeError("Bitget no responde")
+        return _config_cuenta()
+
+    runner, repo = _runner_con_verificador(tmp_path, lector)
+
+    with caplog.at_level(logging.ERROR):
+        await runner.on_tick([tr(symbol="A"), tr(symbol="B")],
+                             precios({"A": 100.0, "B": 100.0}), ahora=0)
+
+    # A se descarto por el fallo, B entro con normalidad: el fallo no se
+    # llevo por delante las demas entradas del tick
+    assert set(runner.abiertas) == {"B"}
+    # y A no quedo vetado: en el tick siguiente se reintenta y entra
+    await runner.on_tick([tr(symbol="A", ts=MIN)], precios({"A": 100.0}), ahora=MIN)
+    assert set(runner.abiertas) == {"A", "B"}
+    assert repo.contadores("real").get("config cuenta") is None
