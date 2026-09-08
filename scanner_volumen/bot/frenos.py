@@ -241,11 +241,17 @@ class Frenos:
             # aquí significa NO escribir nada en `bot_meta` con este valor
             # -ni siquiera como referencia por defecto-, para que la
             # próxima consulta con un saldo válido pueda fijarla bien.
+            # El mensaje nombra la fuente REAL del valor: sin proveedor
+            # inyectado (el caso de `paper`) el saldo sale del equity
+            # contable, y decir "proveedor_saldo" mandaría a quien depura a
+            # buscar un proveedor que no existe.
+            origen = ("proveedor_saldo" if self._proveedor_saldo is not None
+                      else "el equity contable de la base")
             log.error(
-                "bot: proveedor_saldo devolvio un saldo invalido (%r) al "
-                "medir la perdida diaria; se frena por precaucion sin "
-                "fijar ni persistir ninguna referencia con ese valor",
-                saldo_actual,
+                "bot: %s devolvio un saldo invalido (%r) al medir la "
+                "perdida diaria; se frena por precaucion sin fijar ni "
+                "persistir ninguna referencia con ese valor",
+                origen, saldo_actual,
             )
             return True
         referencia = self._referencia_del_dia(ahora, saldo_actual)
