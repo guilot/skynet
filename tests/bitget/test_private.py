@@ -200,6 +200,63 @@ async def test_el_saldo_falla_si_no_hay_usdt():
         await priv.get_saldo()
 
 
+# --- Configuración de cuenta por símbolo (Task 11) -------------------------
+#
+# Estos tests fijan la TRADUCCIÓN que hace `get_configuracion_symbol`, no la
+# forma real de la respuesta de Bitget: los nombres de campo (`marginMode`,
+# `isolatedLongLever`, `isolatedShortLever`) son un supuesto sin verificar
+# -documentado en `ConfiguracionCuentaSymbol`- pendiente de confirmar contra
+# la cuenta de simulación en la Task 12. Si esos nombres resultan ser otros,
+# lo que hay que corregir es el payload de estos tests y el punto único de
+# traducción en `get_configuracion_symbol`, no la lógica que los consume
+# (`VerificadorCuenta`, que ya está probada contra el tipo traducido, sin
+# tocar red).
+
+
+async def test_configuracion_symbol_margen_aislado():
+    priv, _ = _privado({"code": "00000", "data": {
+        "marginMode": "isolated", "isolatedLongLever": "20",
+        "isolatedShortLever": "20",
+    }})
+    config = await priv.get_configuracion_symbol("BTCUSDT")
+    assert config.margen_aislado is True
+    assert config.apalancamiento_long == pytest.approx(20.0)
+    assert config.apalancamiento_short == pytest.approx(20.0)
+
+
+async def test_configuracion_symbol_margen_cruzado():
+    priv, _ = _privado({"code": "00000", "data": {
+        "marginMode": "crossed", "isolatedLongLever": "20",
+        "isolatedShortLever": "20",
+    }})
+    config = await priv.get_configuracion_symbol("BTCUSDT")
+    assert config.margen_aislado is False
+
+
+async def test_configuracion_symbol_apalancamiento_distinto_por_lado():
+    # Bitget permite apalancamiento distinto para long y short en margen
+    # aislado: la traducción debe conservar los dos valores por separado,
+    # no colapsarlos en uno solo.
+    priv, _ = _privado({"code": "00000", "data": {
+        "marginMode": "isolated", "isolatedLongLever": "20",
+        "isolatedShortLever": "10",
+    }})
+    config = await priv.get_configuracion_symbol("BTCUSDT")
+    assert config.apalancamiento_long == pytest.approx(20.0)
+    assert config.apalancamiento_short == pytest.approx(10.0)
+
+
+async def test_configuracion_symbol_manda_symbol_y_margin_coin():
+    priv, cliente = _privado({"code": "00000", "data": {
+        "marginMode": "isolated", "isolatedLongLever": "20",
+        "isolatedShortLever": "20",
+    }})
+    await priv.get_configuracion_symbol("BTCUSDT")
+    url_enviada = cliente.peticiones[0]["url"]
+    assert "symbol=BTCUSDT" in url_enviada
+    assert "marginCoin=USDT" in url_enviada
+
+
 # --- Escrituras (Task 6) --------------------------------------------------
 
 

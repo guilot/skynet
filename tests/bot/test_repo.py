@@ -125,6 +125,34 @@ def test_el_equity_inicial_no_se_mezcla_entre_modos(repo):
     assert repo.equity_inicial("real", defecto=0.0) == pytest.approx(50.0)
 
 
+def test_saldo_real_sin_dato_devuelve_none(repo):
+    # a diferencia de equity_inicial, saldo_real no tiene un "defecto" que
+    # tenga sentido inventar: None es la señal de "el proceso en vivo
+    # todavia no ha persistido ninguno" que el informe necesita distinguir
+    # de un saldo real de 0.
+    assert repo.saldo_real("real") is None
+
+
+def test_saldo_real_persiste(repo):
+    repo.set_saldo_real("real", 850.0)
+    assert repo.saldo_real("real") == pytest.approx(850.0)
+
+
+def test_saldo_real_se_puede_actualizar(repo):
+    # cada tick en real sobreescribe el anterior: el informe solo quiere el
+    # ULTIMO saldo conocido, no un historial.
+    repo.set_saldo_real("real", 850.0)
+    repo.set_saldo_real("real", 830.0)
+    assert repo.saldo_real("real") == pytest.approx(830.0)
+
+
+def test_saldo_real_no_se_mezcla_entre_modos(repo):
+    # "paper" nunca deberia tener un saldo_real persistido, pero si algo lo
+    # hiciera, no debe contaminar la lectura de "real".
+    repo.set_saldo_real("real", 850.0)
+    assert repo.saldo_real("paper") is None
+
+
 def test_los_modos_no_se_mezclan(repo):
     repo.set_equity_inicial("paper", 1000.0)
     pid = repo.abrir(modo="real", symbol="B", direction=Direction.LONG, entry_ts=0,

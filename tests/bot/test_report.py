@@ -133,3 +133,82 @@ def test_un_fill_tardio_en_una_posicion_abierta_tambien_cuenta(repo):
                         tardio=True)
     bloque = format_bloque_ejecucion(repo, "paper", descartes={}, cierres_tardios=0)
     assert "Cierres tardios por reinicio: 1" in bloque
+
+
+# --- Bloque de modo real (Task 11) -----------------------------------------
+
+
+def test_en_paper_no_aparece_el_bloque_de_modo_real(repo):
+    # Restriccion del brief: en paper el bloque no cambia EN ABSOLUTO -ni
+    # siquiera para añadir una linea nueva-, porque hay tests (los de
+    # arriba) que fijan el formato actual carácter a carácter.
+    _trade(repo)
+    bloque = format_bloque_ejecucion(
+        repo, "paper", descartes={}, cierres_tardios=0, saldo_real=850.0)
+    assert "Modo real" not in bloque
+
+
+def test_en_real_sin_saldo_persistido_no_finge_una_diferencia(repo):
+    repo.set_equity_inicial("real", 1000.0)
+    bloque = format_bloque_ejecucion(
+        repo, "real", descartes={}, cierres_tardios=0, saldo_real=None)
+    assert "Modo real:" in bloque
+    assert "sin dato todavia" in bloque
+    assert "Diferencia" not in bloque
+
+
+def test_en_real_con_saldo_muestra_la_diferencia_con_el_equity_calculado(repo):
+    # `_trade` abre siempre en "paper" (ver su definición); aquí hace falta
+    # una posición cerrada en "real" para que `repo.equity("real")` no se
+    # quede en el inicial, así que se abre y cierra a mano.
+    repo.set_equity_inicial("real", 1000.0)
+    pid = repo.abrir(modo="real", symbol="A", direction=Direction.LONG,
+                     entry_ts=0, entry_price=100.0, entry_price_senal=100.0,
+                     margin=20.0, notional=400.0, size=4.0, fee_entrada=0.0)
+    repo.registrar_fill(pid, ts=MIN, reason=ExitReason.STOP, fraction=1.0,
+                        precio_referencia=110.0, precio=110.0, comision=0.0,
+                        precio_regla=110.0)
+    repo.cerrar(pid, close_ts=MIN, pnl=10.0, fees=0.0, max_rank=4)
+    # equity calculado: 1000 (inicial) + 10 (pnl) = 1010
+    bloque = format_bloque_ejecucion(
+        repo, "real", descartes={}, cierres_tardios=0, saldo_real=1005.0)
+    assert "Saldo real: 1005.00" in bloque
+    assert "Equity calculado: 1010.00" in bloque
+    assert "Diferencia (funding, comisiones no modeladas, redondeos): -5.00" in bloque
+
+
+def test_en_real_los_cierres_de_sondeo_y_reconciliacion_se_cuentan_por_separado(repo):
+    # Son dos caminos que detectan lo mismo -el exchange cerro por su cuenta-
+    # en momentos distintos (con el bot vivo, o al arrancar tras una caida):
+    # deben aparecer en lineas distintas, no sumados en un solo numero.
+    repo.set_equity_inicial("real", 1000.0)
+    repo.incrementar_contador("real", "cierres detectados por sondeo", 2)
+    repo.incrementar_contador("real", "posiciones cerradas en el exchange", 1)
+    bloque = format_bloque_ejecucion(
+        repo, "real", descartes={}, cierres_tardios=0, saldo_real=1000.0)
+    assert "Cierres ejecutados por el exchange (sondeo en vivo): 2" in bloque
+    assert "Cierres ejecutados por el exchange (detectados al arrancar): 1" in bloque
+
+
+def test_en_real_muestra_posiciones_ajenas_vetados_y_frenos(repo):
+    repo.set_equity_inicial("real", 1000.0)
+    repo.incrementar_contador("real", "posiciones ajenas", 2)
+    repo.incrementar_contador("real", "simbolo vetado", 5)
+    repo.incrementar_contador("real", "perdida diaria", 3)
+    repo.incrementar_contador("real", "parada de emergencia", 1)
+    bloque = format_bloque_ejecucion(
+        repo, "real", descartes={}, cierres_tardios=0, saldo_real=1000.0)
+    assert "Posiciones ajenas detectadas: 2" in bloque
+    assert "Simbolos vetados: 5" in bloque
+    assert "Freno perdida diaria activado: 3 veces" in bloque
+    assert "Freno parada de emergencia activado: 1 veces" in bloque
+
+
+def test_en_real_lectura_tambien_aparece_el_bloque(repo):
+    # "real_lectura" tambien es dinero conectado de verdad (solo que sin
+    # mandar ordenes): el bloque debe aparecer igual que en "real", no solo
+    # en el modo exacto "real".
+    repo.set_equity_inicial("real_lectura", 1000.0)
+    bloque = format_bloque_ejecucion(
+        repo, "real_lectura", descartes={}, cierres_tardios=0, saldo_real=1000.0)
+    assert "Modo real:" in bloque

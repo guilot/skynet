@@ -32,6 +32,21 @@ def test_margen_es_el_2_por_ciento_del_equity(cartera):
     assert cartera.margen() == pytest.approx(20.0)
 
 
+def test_con_proveedor_de_saldo_el_margen_sale_del_saldo_real(tmp_path):
+    # Task 11, Step 1: con un proveedor que devuelve 850, el margen es
+    # 17,00 (2% de 850) -NO el equity de la base (1000, fijado en el
+    # fixture `cartera`), que es justo lo que se descarta al inyectar uno.
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn)
+    repo.set_equity_inicial("real", 1000.0)
+    cfg = BotConfig(enabled=True, modo="real", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    cartera = LivePortfolio(StrategyParams(), cfg, repo, proveedor_saldo=lambda: 850.0)
+    assert cartera.equity() == pytest.approx(850.0)
+    assert cartera.margen() == pytest.approx(17.0)
+    conn.close()
+
+
 def test_una_entrada_valida_no_se_descarta(cartera):
     assert cartera.evaluar_entrada(tr(), abiertos=set(), precio_mercado=100.0) is None
 

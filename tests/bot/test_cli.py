@@ -46,6 +46,23 @@ def test_main_publica_los_contadores_persistidos_y_la_ventana(tmp_path, capsys):
     assert "+51.3 bps" in salida  # (97.5 - 97.0) / 97.5 * 10000
 
 
+def test_main_publica_el_saldo_real_persistido_en_modo_real(tmp_path, capsys):
+    """Task 11: el CLI (solo lectura, sin red) debe leer el saldo real que
+    el proceso en vivo dejo persistido con `BotRepo.set_saldo_real` y
+    pasarselo al informe -sin esto, el bloque de modo real siempre diria
+    "sin dato todavia", incluso con el bot corriendo de verdad."""
+    db = tmp_path / "scanner.db"
+    conn = open_db(db)
+    repo = BotRepo(conn)
+    repo.set_equity_inicial("real", 1000.0)
+    repo.set_saldo_real("real", 995.0)
+    conn.close()
+
+    main(["--db", str(db), "--modo", "real"])
+    salida = capsys.readouterr().out
+    assert "Saldo real: 995.00" in salida
+
+
 def test_main_no_revienta_contra_una_base_sin_bot_contadores(tmp_path, capsys):
     """`open_readonly` (el que usa este CLI) nunca migra la base que abre
     -no debe arriesgarse a escribir en una base que puede estar en uso-, así

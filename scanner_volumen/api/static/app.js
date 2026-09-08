@@ -134,7 +134,15 @@ function pintarBot(datos) {
   const seccion = document.getElementById("bot");
   if (!datos.activo) { seccion.hidden = true; return; }
   seccion.hidden = false;
-  document.getElementById("bot-modo").textContent = datos.modo;
+  // Task 11: dinero real en juego solo cuando el modo efectivo es "real"
+  // (a diferencia de "real_lectura", que conecta con Bitget pero no manda
+  // ordenes) -distinto de un vistazo es la mitigacion mas barata contra
+  // confundir una sesion de pruebas con una que mueve dinero de verdad.
+  const dineroReal = datos.modo === "real";
+  seccion.classList.toggle("dinero-real", dineroReal);
+  const modoEl = document.getElementById("bot-modo");
+  modoEl.textContent = dineroReal ? `${datos.modo} — DINERO REAL` : datos.modo;
+  modoEl.className = "pastilla" + (dineroReal ? " real" : "");
   document.getElementById("bot-equity").textContent = num(datos.equity);
   document.querySelector("#bot-abiertas tbody").innerHTML = datos.abiertas
     .map((p) => `<tr>

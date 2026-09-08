@@ -25,6 +25,14 @@ def _clave_equity_inicial(modo: str) -> str:
     return f"equity_inicial:{modo}"
 
 
+def _clave_saldo_real(modo: str) -> str:
+    """El último saldo real conocido (Task 11), segmentado por modo igual
+    que `equity_inicial`: en `paper` esta clave nunca se escribe, así que
+    leerla sin haberla fijado nunca debe devolver `None`, no un dato de
+    `real` filtrado por error."""
+    return f"saldo_real:{modo}"
+
+
 def _clave_saldo_dia(modo: str, dia: str) -> str:
     """El saldo de referencia del freno de pérdida diaria (`bot/frenos.py`),
     segmentado por modo -igual que `equity_inicial`- y por día (`dia` en
@@ -253,6 +261,38 @@ class BotRepo:
             (modo,),
         ).fetchone()
         return self.equity_inicial(modo, defecto=0.0) + float(fila["total"])
+
+    def set_saldo_real(self, modo: str, valor: float) -> None:
+        """Persiste el último saldo real conocido de la subcuenta (Task 11):
+        `equity()` deriva su cifra de la propia base y no necesita red, pero
+        el informe también quiere mostrar el saldo REAL -el de Bitget- para
+        compararlo contra ese equity calculado (la diferencia mide funding,
+        comisiones no modeladas y redondeos). El proceso en vivo es el único
+        que tiene una conexión abierta al exchange; esto es lo que le permite
+        al CLI de informe (solo lectura, sin red) enseñarlo igualmente -lee
+        el último valor que el proceso en vivo dejó aquí.
+
+        CONTRATO CON LA TASK 13: debe llamarse en cada tick en el que el modo
+        efectivo sea real (con el `realizado` de `BitgetPrivate.get_saldo()`,
+        el mismo valor que alimenta a `LivePortfolio` vía `proveedor_saldo`).
+        En `paper` nunca se llama -no hay saldo real que persistir-, y por
+        eso `format_bloque_ejecucion` no muestra este bloque en `paper`."""
+        self._conn.execute(
+            "INSERT INTO bot_meta (clave, valor) VALUES (?, ?) "
+            "ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor",
+            (_clave_saldo_real(modo), repr(float(valor))),
+        )
+        self._conn.commit()
+
+    def saldo_real(self, modo: str) -> float | None:
+        """El último saldo real persistido por `set_saldo_real`, o `None` si
+        todavía no se ha guardado ninguno -por ejemplo, un informe pedido
+        antes de que el proceso en vivo complete su primer tick en real."""
+        fila = self._conn.execute(
+            "SELECT valor FROM bot_meta WHERE clave = ?",
+            (_clave_saldo_real(modo),),
+        ).fetchone()
+        return None if fila is None else float(fila["valor"])
 
     # --- frenos (Task 10) ---
 

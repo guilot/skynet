@@ -44,6 +44,29 @@ class PosicionExchange:
 
 
 @dataclass(frozen=True)
+class ConfiguracionCuentaSymbol:
+    """Configuración de margen y apalancamiento de UN símbolo en Bitget
+    (Task 11). En Bitget el apalancamiento no es una propiedad de la cuenta:
+    es por `symbol` + `marginCoin` + `holdSide`, así que esta consulta se
+    hace símbolo a símbolo, nunca una vez "para toda la cuenta" (ver
+    `scanner_volumen.bot.verificacion_cuenta`, que es quien decide qué hacer
+    con esta información -este cliente solo la reporta, fielmente).
+
+    SUPUESTO SIN VERIFICAR (pendiente de confirmar contra la cuenta de
+    simulación en la Task 12): el endpoint candidato es
+    `GET /api/v2/mix/account/account` (singular, con `symbol` + `marginCoin`
+    + `productType`). Se asume que devuelve `marginMode` con valores
+    "isolated" / "crossed", y que el apalancamiento aislado viaja en dos
+    campos separados, `isolatedLongLever` e `isolatedShortLever` -Bitget
+    permite apalancamiento distinto por lado en margen aislado-. Ninguno de
+    estos tres nombres de campo se ha probado contra la API real.
+    """
+    margen_aislado: bool
+    apalancamiento_long: float
+    apalancamiento_short: float
+
+
+@dataclass(frozen=True)
 class FillOrden:
     """Resultado agregado de los fills reales de una orden.
 
@@ -247,6 +270,27 @@ class BitgetPrivate:
             )
 
         return posiciones
+
+    async def get_configuracion_symbol(self, symbol: str) -> ConfiguracionCuentaSymbol:
+        """Consulta la configuración de margen/apalancamiento de UN símbolo.
+        Es una lectura pura: este método, como el resto del cliente, nunca
+        cambia nada en la cuenta -eso es responsabilidad exclusiva de un
+        humano en el propio Bitget.
+
+        Ver el docstring de `ConfiguracionCuentaSymbol` para el supuesto sin
+        verificar sobre el endpoint y los nombres de campo; se aíslan aquí,
+        en un único punto de traducción, a propósito.
+        """
+        payload = await self._pedir(
+            "GET", "/api/v2/mix/account/account",
+            params={"symbol": symbol, "marginCoin": "USDT"},
+        )
+        data = payload.get("data", {})
+        return ConfiguracionCuentaSymbol(
+            margen_aislado=(data.get("marginMode") == "isolated"),
+            apalancamiento_long=float(data.get("isolatedLongLever", 0)),
+            apalancamiento_short=float(data.get("isolatedShortLever", 0)),
+        )
 
     @staticmethod
     def _hold_side_desde_lado(lado: str) -> str:
