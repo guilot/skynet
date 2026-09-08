@@ -2,6 +2,8 @@
 y que nunca modifica nada -solo veta la entrada de un símbolo mal
 configurado. Los dobles de `lector` no tocan red ni `BitgetPrivate`: es
 justo la garantía que el brief pide ("función pura y testeable")."""
+import pytest
+
 from scanner_volumen.bitget.private import ConfiguracionCuentaSymbol
 from scanner_volumen.bot.verificacion_cuenta import MOTIVO_VETO, VerificadorCuenta
 from scanner_volumen.strategy.model import StrategyParams
@@ -24,6 +26,22 @@ class LectorFalso:
     async def __call__(self, symbol: str) -> ConfiguracionCuentaSymbol:
         self.llamadas.append(symbol)
         return self._respuestas[symbol]
+
+
+class LectorQueFallaLaPrimeraVez:
+    """Lanza en la primera llamada para un símbolo dado, y responde
+    normalmente a partir de la segunda -simula un fallo transitorio de red
+    seguido de un reintento con éxito."""
+
+    def __init__(self, respuesta: ConfiguracionCuentaSymbol):
+        self._respuesta = respuesta
+        self.llamadas = 0
+
+    async def __call__(self, symbol: str) -> ConfiguracionCuentaSymbol:
+        self.llamadas += 1
+        if self.llamadas == 1:
+            raise RuntimeError("simulado: fallo transitorio de red")
+        return self._respuesta
 
 
 async def test_configuracion_correcta_no_veta():
@@ -78,3 +96,29 @@ async def test_un_simbolo_no_afecta_al_cacheo_de_otro():
     assert await verificador.verificar("AAAUSDT") == MOTIVO_VETO
     assert await verificador.verificar("BBBUSDT") is None
     assert sorted(lector.llamadas) == ["AAAUSDT", "BBBUSDT"]
+
+
+async def test_un_fallo_transitorio_del_lector_no_se_cachea_y_se_reintenta():
+    # Hallazgo de revision: si el fallo se cacheara, un problema puntual de
+    # red condenaria al simbolo a un veto permanente que ni siquiera pasa
+    # por la logica de "corrigelo y reinicia" -no habria nada que corregir.
+    lector = LectorQueFallaLaPrimeraVez(_config(aislado=True, long_=20.0, short=20.0))
+    verificador = VerificadorCuenta(StrategyParams(apalancamiento=20.0), lector)
+    with pytest.raises(RuntimeError, match="fallo transitorio"):
+        await verificador.verificar("AAAUSDT")
+    # la segunda llamada REINTENTA de verdad -no devuelve nada cacheado del
+    # intento fallido- y esta vez el lector responde con exito.
+    assert await verificador.verificar("AAAUSDT") is None
+    assert lector.llamadas == 2
+
+
+async def test_pequenas_diferencias_de_punto_flotante_no_vetan():
+    # El apalancamiento sale de parsear una cadena JSON con float() (ver
+    # BitgetPrivate.get_configuracion_symbol): una comparacion "!=" exacta
+    # vetaria un simbolo por un residuo de representacion, no por una
+    # configuracion real distinta.
+    lector = LectorFalso({
+        "AAAUSDT": _config(aislado=True, long_=20.00000000001, short=19.99999999999),
+    })
+    verificador = VerificadorCuenta(StrategyParams(apalancamiento=20.0), lector)
+    assert await verificador.verificar("AAAUSDT") is None

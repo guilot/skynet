@@ -150,7 +150,10 @@ def test_api_bot_sin_bot_devuelve_desactivado(cliente):
     responder desactivada sin reventar."""
     r = cliente.get("/api/bot")
     assert r.status_code == 200
-    assert r.json() == {"activo": False, "equity": None, "abiertas": [], "cerradas": []}
+    assert r.json() == {
+        "activo": False, "equity": None, "saldo_real": None,
+        "abiertas": [], "cerradas": [],
+    }
 
 
 def test_api_bot_publica_equity_y_abiertas(tmp_path):
@@ -186,6 +189,7 @@ def test_api_bot_publica_equity_y_abiertas(tmp_path):
     assert datos["activo"] is True
     assert datos["modo"] == "paper"
     assert datos["equity"] == pytest.approx(1025.0)
+    assert datos["saldo_real"] is None  # nunca se persiste en paper
     assert len(datos["abiertas"]) == 1
     assert datos["abiertas"][0]["symbol"] == "AAAUSDT"
     assert datos["abiertas"][0]["precio"] is None
@@ -193,6 +197,25 @@ def test_api_bot_publica_equity_y_abiertas(tmp_path):
         {"symbol": "BBBUSDT", "close_ts": 60_000, "pnl": pytest.approx(25.0),
          "max_rank": 3},
     ]
+
+
+def test_api_bot_publica_el_saldo_real_persistido_en_modo_real(tmp_path):
+    """Task 11, ronda de arreglo: el panel avisa de "DINERO REAL" (Step 4)
+    junto a un número que, sin este campo, era el equity CONTABLE -exponer
+    el saldo real es lo que le permite al frontend mostrar el número
+    correcto en vez de uno que parece real pero no lo es."""
+    estado = ScannerState()
+    conn = open_db(tmp_path / "scanner.db")
+    signal_repo = SignalRepo(conn)
+    bot_repo = BotRepo(conn)
+    bot_repo.set_equity_inicial("real", 1000.0)
+    bot_repo.set_saldo_real("real", 995.0)
+    app = create_app(estado, signal_repo, bot_repo=bot_repo, modo="real")
+    with TestClient(app) as cliente:
+        datos = cliente.get("/api/bot").json()
+    conn.close()
+
+    assert datos["saldo_real"] == pytest.approx(995.0)
 
 
 def test_api_bot_recorta_cerradas_a_veinte_mas_recientes(tmp_path):

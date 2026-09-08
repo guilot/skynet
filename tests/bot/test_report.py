@@ -148,6 +148,17 @@ def test_en_paper_no_aparece_el_bloque_de_modo_real(repo):
     assert "Modo real" not in bloque
 
 
+def test_un_modo_desconocido_no_dispara_el_bloque_de_modo_real(repo):
+    # Hallazgo de revision: antes se comprobaba `modo != "paper"`, asi que
+    # un typo (`--modo pape`) imprimia el bloque entero con todo a cero en
+    # vez de comportarse como el "paper" que probablemente se queria decir.
+    # Ahora se comprueba pertenencia explicita a los modos reales de
+    # bot/modo.py.
+    bloque = format_bloque_ejecucion(
+        repo, "pape", descartes={}, cierres_tardios=0, saldo_real=850.0)
+    assert "Modo real" not in bloque
+
+
 def test_en_real_sin_saldo_persistido_no_finge_una_diferencia(repo):
     repo.set_equity_inicial("real", 1000.0)
     bloque = format_bloque_ejecucion(
@@ -194,12 +205,17 @@ def test_en_real_muestra_posiciones_ajenas_vetados_y_frenos(repo):
     repo.set_equity_inicial("real", 1000.0)
     repo.incrementar_contador("real", "posiciones ajenas", 2)
     repo.incrementar_contador("real", "simbolo vetado", 5)
+    repo.incrementar_contador("real", "config cuenta", 4)
     repo.incrementar_contador("real", "perdida diaria", 3)
     repo.incrementar_contador("real", "parada de emergencia", 1)
     bloque = format_bloque_ejecucion(
         repo, "real", descartes={}, cierres_tardios=0, saldo_real=1000.0)
     assert "Posiciones ajenas detectadas: 2" in bloque
-    assert "Simbolos vetados: 5" in bloque
+    # Dos lineas distintas a proposito (hallazgo de revision): un simbolo
+    # vetado por posicion ajena y uno vetado por config de cuenta piden
+    # acciones opuestas del operador, y sumarlas escondería cual hace falta.
+    assert "Simbolos vetados (posicion ajena): 5" in bloque
+    assert "Simbolos vetados (config de cuenta): 4" in bloque
     assert "Freno perdida diaria activado: 3 veces" in bloque
     assert "Freno parada de emergencia activado: 1 veces" in bloque
 

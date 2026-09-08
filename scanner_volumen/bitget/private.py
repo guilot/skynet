@@ -228,7 +228,24 @@ class BitgetPrivate:
         que es la moneda sobre la que dimensiona el bot.
 
         El `realizado` es accountEquity - unrealizedPL, la cifra que replica
-        la semántica del backtest.
+        la semántica del backtest -y la que gobierna el margen de cada
+        entrada en modo real (Task 11), así que un fallo aquí no puede
+        quedar en silencio.
+
+        FALLA CERRADO (hallazgo de revisión, Task 11): `accountEquity` y
+        `unrealizedPL` son OBLIGATORIOS en la respuesta -si Bitget cambiara
+        alguno de esos dos nombres de campo (ver la lista de supuestos sin
+        verificar en el informe de la tarea), la versión anterior de este
+        método calculaba con `0` como si el campo faltante valiera cero,
+        lo que en el caso de `unrealizedPL` ausente da un `realizado` IGUAL
+        al equity CON PnL no realizado incluido -exactamente lo que el Step
+        1 de esta tarea existe para evitar (infla el tamaño de posición con
+        ganancias que todavía no existen), y sin ninguna excepción ni log
+        que lo delatara. `available` se deja con `0` por defecto a
+        propósito: es puramente informativo (`SaldoCuenta.disponible` no
+        alimenta ningún cálculo de margen, ver el docstring de
+        `LivePortfolio.margen`), así que perderlo no es un riesgo de
+        dinero.
         """
         payload = await self._pedir("GET", "/api/v2/mix/account/accounts")
         data_list = payload.get("data", [])
@@ -243,8 +260,18 @@ class BitgetPrivate:
         if data is None:
             raise RuntimeError("No se encontró saldo en USDT en Bitget")
 
-        equity = float(data.get("accountEquity", 0))
-        pnl_no_realizado = float(data.get("unrealizedPL", 0))
+        if "accountEquity" not in data or "unrealizedPL" not in data:
+            # NO se rellena con 0: un campo crítico ausente es una API que
+            # cambió de forma, no una cuenta con saldo cero -y calcular con
+            # un 0 inventado aquí movería dinero real sobre una cifra falsa.
+            raise RuntimeError(
+                "Bitget no devolvió 'accountEquity' o 'unrealizedPL' en el "
+                "saldo de USDT; no se puede calcular el saldo realizado con "
+                "seguridad"
+            )
+
+        equity = float(data["accountEquity"])
+        pnl_no_realizado = float(data["unrealizedPL"])
         disponible = float(data.get("available", 0))
 
         return SaldoCuenta(

@@ -8,7 +8,9 @@ consigues del que la regla pedía.
 from __future__ import annotations
 
 from scanner_volumen.bot.model import ETIQUETAS_DESCARTE
+from scanner_volumen.bot.modo import REAL, REAL_LECTURA
 from scanner_volumen.bot.repo import BotRepo
+from scanner_volumen.bot.verificacion_cuenta import MOTIVO_VETO as VETO_CONFIG_CUENTA
 from scanner_volumen.models import Direction
 from scanner_volumen.strategy.model import (
     ExitReason, Fill, ResumenOperativa, TradeResumen,
@@ -154,8 +156,13 @@ def format_bloque_ejecucion(
     # Bloque de modo real (Task 11): en `paper` no hay saldo real que
     # comparar ni exchange que reconcilie nada, así que el bloque NO
     # aparece -ni una línea distinta- para no romper el formato que los
-    # tests de `paper` fijan como referencia.
-    if modo != "paper":
+    # tests de `paper` fijan como referencia. Se comprueba PERTENENCIA a
+    # los modos reales de `bot/modo.py` (hallazgo de revisión), no
+    # `modo != "paper"`: con esa desigualdad, un modo mal escrito o
+    # desconocido (`--modo pape`, un typo) imprimía el bloque entero con
+    # todo a cero en vez de tratarse como el `paper` que probablemente se
+    # quería decir.
+    if modo in (REAL, REAL_LECTURA):
         lineas.extend(_lineas_modo_real(repo, modo, saldo_real))
     return "\n".join(lineas)
 
@@ -205,7 +212,19 @@ def _lineas_modo_real(
         f"{contadores.get('posiciones cerradas en el exchange', 0)}"
     )
     lineas.append(f"  Posiciones ajenas detectadas: {contadores.get('posiciones ajenas', 0)}")
-    lineas.append(f"  Simbolos vetados: {contadores.get('simbolo vetado', 0)}")
+    # Dos etiquetas DISTINTAS a propósito (hallazgo de revisión): una
+    # posición ajena y un apalancamiento mal configurado piden acciones
+    # opuestas del operador (investigar de quién es la posición, frente a
+    # corregir la configuración de ESE símbolo en Bitget y reiniciar el
+    # bot) -sumarlas en un único "Simbolos vetados: N" le escondería cuál
+    # de las dos hace falta. Ver `bot/verificacion_cuenta.py`.
+    lineas.append(
+        f"  Simbolos vetados (posicion ajena): {contadores.get('simbolo vetado', 0)}"
+    )
+    lineas.append(
+        f"  Simbolos vetados (config de cuenta): "
+        f"{contadores.get(VETO_CONFIG_CUENTA, 0)}"
+    )
     lineas.append(
         f"  Freno perdida diaria activado: {contadores.get('perdida diaria', 0)} veces"
     )

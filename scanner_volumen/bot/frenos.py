@@ -8,13 +8,28 @@ que estos frenos existen para evitar. `BotRunner.on_tick` sigue avanzando el
 bucle de las abiertas exactamente igual, freno activo o no; lo único que
 cambia es que no se evalúan entradas nuevas.
 
-- **Pérdida diaria máxima**: si el equity actual (`BotRepo.equity`, el saldo
-  vivo del bot) ha caído más de `perdida_diaria_max` desde el saldo de
-  referencia del día, no se abre nada más hasta que cambie el día UTC. La
-  referencia se PERSISTE en `bot_meta` (nunca en un atributo de esta clase):
-  bajo `Restart=always`, un reinicio en pleno frenazo que recalculara la
-  referencia en memoria la fijaría sobre el saldo YA castigado -justo el día
-  en que hace falta que no se mueva- y el bot seguiría operando.
+- **Pérdida diaria máxima**: si el saldo actual ha caído más de
+  `perdida_diaria_max` desde el saldo de referencia del día, no se abre nada
+  más hasta que cambie el día UTC. La referencia se PERSISTE en `bot_meta`
+  (nunca en un atributo de esta clase): bajo `Restart=always`, un reinicio
+  en pleno frenazo que recalculara la referencia en memoria la fijaría sobre
+  el saldo YA castigado -justo el día en que hace falta que no se mueva- y
+  el bot seguiría operando.
+
+  **De dónde sale "el saldo actual" (Task 11, corrección de un hallazgo de
+  revisión):** `Frenos` acepta el mismo `proveedor_saldo` opcional que
+  `LivePortfolio`. Sin él, tanto la referencia como la medida salen de
+  `BotRepo.equity` (el saldo contable), igual que siempre. Con él, las DOS
+  puntas -la referencia que se fija la primera vez que se consulta un día,
+  y el saldo con el que se compara en cada llamada posterior- salen de la
+  MISMA fuente. Esto no es cosmético: antes de este cambio, `_perdida_
+  diaria_superada` medía siempre contra `BotRepo.equity`, así que un bot en
+  modo real que dimensiona el margen sobre el saldo REAL del exchange
+  (Step 1 de esta misma tarea) podía perder dinero de verdad por encima del
+  tope configurado sin que el freno se enterase -el freno miraba una cifra
+  y el dinero se regía por otra. Ver `_saldo_actual` y el docstring de
+  `puede_abrir` para el efecto que esto tiene sobre el contrato de orden con
+  `registrar_saldo_del_dia`.
 - **Parada de emergencia**: si existe `fichero_parada` en disco, no se abre
   nada. Se comprueba con `os.stat()` en cada llamada -una consulta barata
   al sistema de ficheros-, lo que permite cortar desde SSH creando el
@@ -27,6 +42,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 from scanner_volumen.bot.repo import BotRepo
@@ -55,10 +71,19 @@ class Frenos:
     """Los dos frenos manuales. `puede_abrir` es la única consulta que
     necesita el runner antes de evaluar entradas nuevas en cada tick."""
 
-    def __init__(self, cfg_bot: BotConfig, repo: BotRepo, modo: str) -> None:
+    def __init__(
+        self, cfg_bot: BotConfig, repo: BotRepo, modo: str,
+        proveedor_saldo: Callable[[], float] | None = None,
+    ) -> None:
+        """`proveedor_saldo` es el mismo tipo que recibe `LivePortfolio`
+        (Task 11) y, en el cableado real, debe ser literalmente el MISMO
+        callable inyectado ahí -no uno equivalente construido aparte-: es lo
+        que garantiza que el freno y el tamaño de posición nunca lean cifras
+        de fuentes distintas. Ver `_saldo_actual`."""
         self._cfg = cfg_bot
         self._repo = repo
         self._modo = modo
+        self._proveedor_saldo = proveedor_saldo
 
     def puede_abrir(self, ahora: int) -> str | None:
         """El nombre del freno que impide abrir ahora mismo, o `None` si
@@ -69,17 +94,26 @@ class Frenos:
         querer que gane siempre, sin depender de en qué estado ande la
         pérdida diaria.
 
-        CONTRATO DE ORDEN con `registrar_saldo_del_dia`: la primera vez que
-        se llama en un día UTC nuevo -desde este método o desde ese otro,
-        el que llegue primero-, la referencia del día queda fijada. Si nadie
-        llamó antes a `registrar_saldo_del_dia`, ESTE método la fija con el
-        equity derivado del bot (`BotRepo.equity`). Si el cableador quiere
-        anclar la referencia a otro saldo -p. ej. el saldo real del
-        exchange en modo real, más fiable que la contabilidad reconstruida
-        cuando hay dinero de verdad en juego-, tiene que llamar a
-        `registrar_saldo_del_dia` ANTES de la primera llamada a este método
-        en ese día: si llega después, ya no tiene ningún efecto (ver el
-        docstring de `registrar_saldo_del_dia`)."""
+        SOBRE EL CONTRATO DE ORDEN con `registrar_saldo_del_dia` (matizado
+        en la Task 11): la primera vez que se llama en un día UTC nuevo
+        -desde este método o desde ese otro, el que llegue primero-, la
+        referencia del día queda fijada con `_saldo_actual()` si nadie la
+        fijó ya explícitamente. CON `proveedor_saldo` inyectado, ese valor
+        por defecto es la MISMA fuente que usa `registrar_saldo_del_dia`
+        cuando el cableador la invoca con el saldo real del exchange (que,
+        para ser coherente, también debería salir de `proveedor_saldo`) -
+        así que si `puede_abrir` corre primero un día, la referencia que
+        fija por su cuenta ya no es una cifra distinta (el equity contable
+        de antes), sino la misma que `registrar_saldo_del_dia` habría
+        fijado. El orden dejó de poder producir el desajuste real
+        (referencia de una fuente, medida de otra) que motivó este
+        contrato en la Task 10 -sigue quedando la diferencia, sin
+        importancia práctica, de que dos llamadas del mismo tick puedan leer
+        el proveedor con un instante de por medio-. SIN `proveedor_saldo`
+        (paper, o un cableado real que olvidó inyectarlo), el contrato
+        ORIGINAL sigue aplicando tal cual: la referencia por defecto sale de
+        `BotRepo.equity`, y `registrar_saldo_del_dia` sigue siendo la única
+        vía para anclarla a otra cosa -y sigue teniendo que llegar antes."""
         if self._parada_de_emergencia():
             return MOTIVO_PARADA_EMERGENCIA
         if self._perdida_diaria_superada(ahora):
@@ -95,16 +129,18 @@ class Frenos:
         a llamar ni con qué `saldo` -incluido tras un reinicio, que es
         justo el caso que garantiza que esto sea seguro con dinero real.
 
-        ORDEN OBLIGATORIO: esta llamada debe llegar ANTES que la primera
-        llamada a `puede_abrir` del día. Si `puede_abrir` corre primero, ya
-        fija la referencia por su cuenta -con el equity derivado del bot,
-        no con el `saldo` que se le pase aquí después-, y esta llamada,
-        aunque traiga un valor distinto (el saldo real del exchange, por
-        ejemplo), NO TIENE NINGÚN EFECTO: llega tarde a una referencia que
-        ya quedó fijada. Ninguno de los dos métodos puede detectar ese
-        orden incorrecto desde dentro de esta clase -comparten la misma
-        regla de "quien pregunta primero, fija"-, así que respetar el orden
-        es responsabilidad de quien cablea el bucle del bot."""
+        ORDEN OBLIGATORIO (matizado, no eliminado, por la Task 11): esta
+        llamada debería llegar ANTES que la primera llamada a `puede_abrir`
+        del día. Si `puede_abrir` corre primero SIN que este freno tenga un
+        `proveedor_saldo` inyectado, fija la referencia con el equity
+        contable, y esta llamada -aunque traiga el saldo real del
+        exchange- NO TIENE NINGÚN EFECTO. CON `proveedor_saldo` inyectado
+        (y si `saldo` se saca de ese mismo proveedor, como debe), el orden
+        deja de importar en la práctica: `puede_abrir` ya fijaría por su
+        cuenta el mismo valor que esta llamada traería. La responsabilidad
+        de que las dos puntas usen la misma fuente sigue siendo de quien
+        cablea el bucle del bot -esta clase no puede verificar de dónde
+        sale el `saldo` que se le pasa aquí."""
         self._referencia_del_dia(ahora, saldo)
 
     def _parada_de_emergencia(self) -> bool:
@@ -144,8 +180,17 @@ class Frenos:
             return True
         return True
 
+    def _saldo_actual(self) -> float:
+        """La cifra que gobierna el freno: la MISMA que `LivePortfolio.
+        equity()` usaría en este instante, para que referencia y medida no
+        puedan salir de fuentes distintas (ver el docstring de la clase).
+        Sin `proveedor_saldo`, cae al equity contable, igual que siempre."""
+        if self._proveedor_saldo is not None:
+            return self._proveedor_saldo()
+        return self._repo.equity(self._modo)
+
     def _perdida_diaria_superada(self, ahora: int) -> bool:
-        saldo_actual = self._repo.equity(self._modo)
+        saldo_actual = self._saldo_actual()
         referencia = self._referencia_del_dia(ahora, saldo_actual)
         if referencia <= 0:
             # sin saldo de referencia positivo no hay sobre qué medir una

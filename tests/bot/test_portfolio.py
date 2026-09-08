@@ -47,6 +47,62 @@ def test_con_proveedor_de_saldo_el_margen_sale_del_saldo_real(tmp_path):
     conn.close()
 
 
+def _cartera_real(tmp_path, proveedor_saldo):
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn)
+    repo.set_equity_inicial("real", 1000.0)
+    cfg = BotConfig(enabled=True, modo="real", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    return LivePortfolio(StrategyParams(), cfg, repo, proveedor_saldo=proveedor_saldo), conn
+
+
+@pytest.mark.parametrize("saldo_invalido", [
+    float("nan"), float("inf"), float("-inf"), -300.0, 0.0,
+])
+def test_un_saldo_invalido_del_proveedor_lanza(tmp_path, saldo_invalido):
+    # Hallazgo de revision: -300 se propagaba tal cual hasta un margen
+    # negativo y una orden real sin ninguna guarda. Un saldo que no sea
+    # finito y positivo no puede dimensionar nada.
+    cartera, conn = _cartera_real(tmp_path, lambda: saldo_invalido)
+    with pytest.raises(ValueError):
+        cartera.equity()
+    conn.close()
+
+
+def test_modo_real_sin_proveedor_registra_un_aviso(tmp_path, caplog):
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn)
+    repo.set_equity_inicial("real", 1000.0)
+    cfg = BotConfig(enabled=True, modo="real", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    cartera = LivePortfolio(StrategyParams(), cfg, repo)  # sin proveedor_saldo
+    with caplog.at_level("ERROR"):
+        cartera.equity()
+    assert any("proveedor_saldo" in r.message for r in caplog.records)
+    conn.close()
+
+
+def test_modo_real_sin_proveedor_solo_avisa_una_vez(tmp_path, caplog):
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn)
+    repo.set_equity_inicial("real", 1000.0)
+    cfg = BotConfig(enabled=True, modo="real", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    cartera = LivePortfolio(StrategyParams(), cfg, repo)
+    with caplog.at_level("ERROR"):
+        cartera.equity()
+        cartera.equity()
+        cartera.equity()
+    assert len(caplog.records) == 1
+    conn.close()
+
+
+def test_paper_sin_proveedor_no_avisa(cartera, caplog):
+    with caplog.at_level("ERROR"):
+        cartera.equity()
+    assert caplog.records == []
+
+
 def test_una_entrada_valida_no_se_descarta(cartera):
     assert cartera.evaluar_entrada(tr(), abiertos=set(), precio_mercado=100.0) is None
 

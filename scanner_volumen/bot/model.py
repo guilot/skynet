@@ -97,6 +97,11 @@ class PosicionExchange:
 # el backtest no existe). "simbolo vetado" es exclusiva de la Fase 3: la
 # reconciliación de arranque (Task 8) veta un símbolo que el exchange tiene
 # abierto y el bot no reconoce, para no volver a tocarlo en toda la sesión.
+# "config cuenta" (Task 11, `bot/verificacion_cuenta.py`) es una etiqueta
+# DISTINTA a propósito, aunque las dos "veten" un símbolo para el resto de
+# la sesión: una posición ajena y un apalancamiento mal configurado piden
+# ACCIONES OPUESTAS del operador, y mezclarlas en un solo número le
+# esconde cuál de las dos tiene que tomar.
 # "perdida diaria" y "parada de emergencia" son los frenos manuales de la
 # Fase 3 (Task 10, `bot/frenos.py`): a diferencia de las demás etiquetas, que
 # se contabilizan transición a transición, estas cuentan una vez por tick en
@@ -109,6 +114,7 @@ ETIQUETAS_DESCARTE = (
     "par congelado",
     "desvio",
     "simbolo vetado",
+    "config cuenta",
     "perdida diaria",
     "parada de emergencia",
 )

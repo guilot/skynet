@@ -143,7 +143,19 @@ function pintarBot(datos) {
   const modoEl = document.getElementById("bot-modo");
   modoEl.textContent = dineroReal ? `${datos.modo} — DINERO REAL` : datos.modo;
   modoEl.className = "pastilla" + (dineroReal ? " real" : "");
-  document.getElementById("bot-equity").textContent = num(datos.equity);
+  // Ronda de arreglo: con dinero real de verdad, mostrar el SALDO REAL
+  // (persistido por el proceso en vivo, `BotRepo.set_saldo_real`) en vez
+  // del equity contable -el mismo numero que el aviso "DINERO REAL" de
+  // arriba estaria contradiciendo si siguiera mostrando el contable. Si el
+  // proceso aun no lo ha persistido (`null`), se cae al contable con la
+  // misma honestidad que ya usa el informe (nunca fingir un dato que no
+  // se tiene).
+  const equityEl = document.getElementById("bot-equity");
+  if (dineroReal && datos.saldo_real !== null && datos.saldo_real !== undefined) {
+    equityEl.textContent = `${num(datos.saldo_real)} (contable: ${num(datos.equity)})`;
+  } else {
+    equityEl.textContent = num(datos.equity);
+  }
   document.querySelector("#bot-abiertas tbody").innerHTML = datos.abiertas
     .map((p) => `<tr>
         <td>${p.symbol}</td>

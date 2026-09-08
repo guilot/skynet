@@ -58,9 +58,19 @@ def create_app(
 
         `precio` va siempre a `None`: `ScannerState` no expone un precio en
         vivo por símbolo (solo lo tiene el `Orchestrator`, vía `_precio_de`
-        en `__main__`), y esta tarea no le añade ese método."""
+        en `__main__`), y esta tarea no le añade ese método.
+
+        `saldo_real` (Task 11, ronda de arreglo): el último saldo real
+        persistido por `BotRepo.set_saldo_real` -`None` en `paper` (nunca se
+        persiste) y en `real` hasta el primer tick del proceso en vivo. Sin
+        esto, el panel avisaba de "DINERO REAL" junto a un número que en
+        realidad era el equity CONTABLE, no el saldo real -exactamente la
+        confusión que el aviso visual existe para evitar."""
         if bot_repo is None:
-            return {"activo": False, "equity": None, "abiertas": [], "cerradas": []}
+            return {
+                "activo": False, "equity": None, "saldo_real": None,
+                "abiertas": [], "cerradas": [],
+            }
         abiertas = [
             {
                 "symbol": fila["symbol"], "direction": fila["direction"],
@@ -83,6 +93,7 @@ def create_app(
         ]
         return {
             "activo": True, "modo": modo, "equity": bot_repo.equity(modo),
+            "saldo_real": bot_repo.saldo_real(modo),
             "abiertas": abiertas, "cerradas": cerradas,
         }
 

@@ -200,6 +200,51 @@ async def test_el_saldo_falla_si_no_hay_usdt():
         await priv.get_saldo()
 
 
+# --- get_saldo falla cerrado ante un campo critico ausente (Task 11, ronda
+# de arreglo) -----------------------------------------------------------
+#
+# Antes de este arreglo, un campo ausente se rellenaba con 0 en silencio:
+# con "unrealizedPL" ausente (p.ej. renombrado por la API a algo distinto),
+# `realizado` salia identico al equity CON pnl no realizado -exactamente lo
+# que el Step 1 de la Task 11 dice que nunca debe pasar ("infla el tamano
+# con ganancias que aun no existen")- sin ninguna excepcion que lo delatara.
+
+
+async def test_el_saldo_falla_si_falta_account_equity():
+    priv, _ = _privado({"code": "00000", "data": [{
+        "marginCoin": "USDT", "unrealizedPL": "50.0", "available": "800.0",
+        # sin "accountEquity"
+    }]})
+    with pytest.raises(RuntimeError, match="accountEquity"):
+        await priv.get_saldo()
+
+
+async def test_el_saldo_falla_si_falta_unrealized_pl():
+    # Reproduce el caso B de la revision: el campo llega renombrado
+    # (p.ej. "unrealisedPL", con "s" britanica) y antes de este arreglo
+    # `realizado` habria salido igual al equity CON pnl no realizado.
+    priv, _ = _privado({"code": "00000", "data": [{
+        "marginCoin": "USDT", "accountEquity": "1000.0",
+        "unrealisedPL": "300.0",  # nombre distinto a proposito: no se lee
+        "available": "800.0",
+    }]})
+    with pytest.raises(RuntimeError, match="unrealizedPL"):
+        await priv.get_saldo()
+
+
+async def test_el_saldo_no_falla_si_falta_available():
+    # "available" es puramente informativo (no alimenta ningun calculo de
+    # margen, ver LivePortfolio.margen): que falte no debe impedir calcular
+    # el saldo realizado, a diferencia de los dos campos criticos de arriba.
+    priv, _ = _privado({"code": "00000", "data": [{
+        "marginCoin": "USDT", "accountEquity": "1000.0", "unrealizedPL": "50.0",
+        # sin "available"
+    }]})
+    saldo = await priv.get_saldo()
+    assert saldo.realizado == pytest.approx(950.0)
+    assert saldo.disponible == pytest.approx(0.0)
+
+
 # --- Configuración de cuenta por símbolo (Task 11) -------------------------
 #
 # Estos tests fijan la TRADUCCIÓN que hace `get_configuracion_symbol`, no la

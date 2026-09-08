@@ -36,8 +36,7 @@ tr.obsoleta td:nth-child(2)::after { content: " ⏱"; color: #d29922; }
   margin: .5rem 0 0; }
 #detalle dt { color: #8b949e; } #detalle dd { margin: 0; text-align: right; }
 
-#bot { margin-top: 1.5rem; padding: .5rem; border: 1px solid transparent;
-  border-radius: 8px; }
+#bot { margin-top: 1.5rem; }
 #bot h2 { font-size: .95rem; letter-spacing: .1em; margin: 0 0 .5rem;
   display: flex; gap: .6rem; align-items: center; }
 #bot table td:first-child, #bot table th:first-child,
@@ -46,8 +45,12 @@ tr.obsoleta td:nth-child(2)::after { content: " ⏱"; color: #d29922; }
 
 /* Task 11: dinero real en juego. Deliberadamente llamativo -el mismo rojo
    que ya usa el resto del dashboard para "mal"/negativo (--rojo)-, para que
-   nadie confunda un vistazo rapido con una sesion de paper o de lectura. */
+   nadie confunda un vistazo rapido con una sesion de paper o de lectura.
+   El padding/border viven SOLO en .dinero-real (hallazgo de revision): en
+   la regla base de #bot desplazaban el panel tambien en paper -el unico
+   cambio visible en paper de una tarea cuya restriccion era que paper no
+   cambiara nada-. */
 .pastilla.real { border-color: var(--rojo); color: var(--rojo);
   background: rgba(248, 81, 73, .15); font-weight: bold; }
-#bot.dinero-real { border-color: var(--rojo);
-  background: rgba(248, 81, 73, .06); }
+#bot.dinero-real { padding: .5rem; border: 1px solid var(--rojo);
+  border-radius: 8px; background: rgba(248, 81, 73, .06); }

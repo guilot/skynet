@@ -208,6 +208,65 @@ def test_parada_de_emergencia_frena_ante_un_oserror_generico(
     assert frenos.puede_abrir(DIA_1) == MOTIVO_PARADA_EMERGENCIA
 
 
+# --- proveedor_saldo (Task 11, ronda de arreglo) ---------------------------
+
+
+def test_sin_proveedor_el_freno_mide_solo_el_equity_contable(repo, tmp_path):
+    # Regresion explicita del comportamiento SIN proveedor -el de paper, y
+    # el de cualquier real mal cableado-: sigue siendo BotRepo.equity, tal
+    # cual antes de este cambio.
+    frenos = Frenos(_cfg(tmp_path), repo, "paper")
+    assert frenos.puede_abrir(DIA_1) is None
+    _perder(repo, 150.0)  # equity contable: 850 -> 15% > 10%
+    assert frenos.puede_abrir(DIA_1 + MIN) == MOTIVO_PERDIDA_DIARIA
+
+
+def test_con_proveedor_el_freno_mide_la_perdida_real_no_la_contable(repo, tmp_path):
+    """Reproduce el hallazgo de revision: el equity CONTABLE (BD) puede
+    caer menos que el saldo REAL del exchange -funding, comisiones no
+    modeladas, redondeos, exactamente lo que el Step 1 de esta tarea existe
+    para medir-. Sin `proveedor_saldo`, el freno mediria 4.5% (955 sobre
+    1000, solo el pnl que ve la contabilidad) y NO saltaria, aunque el
+    saldo real ya haya perdido un 7% -por encima del limite del 5%-. Con
+    `proveedor_saldo`, el freno mide la cifra que de verdad gobierna el
+    dinero."""
+    repo.set_equity_inicial("real", 1000.0)
+    cfg = _cfg(tmp_path, perdida_diaria_max=0.05)
+    saldo_real = {"valor": 1000.0}
+    frenos = Frenos(cfg, repo, "real", proveedor_saldo=lambda: saldo_real["valor"])
+    assert frenos.puede_abrir(DIA_1) is None  # fija la referencia REAL: 1000
+
+    # el equity contable baja a 955 (perdida contable: 4.5%, bajo el limite)
+    pid = repo.abrir(
+        modo="real", symbol="A", direction=Direction.LONG, entry_ts=DIA_1,
+        entry_price=100.0, entry_price_senal=100.0, margin=20.0,
+        notional=400.0, size=4.0, fee_entrada=0.0,
+    )
+    repo.cerrar(pid, close_ts=DIA_1, pnl=-45.0, fees=0.0, max_rank=0)
+    # pero el saldo REAL cae a 930 (7% de perdida real, por encima del 5%)
+    saldo_real["valor"] = 930.0
+    assert frenos.puede_abrir(DIA_1 + MIN) == MOTIVO_PERDIDA_DIARIA
+
+
+def test_con_proveedor_referencia_y_medida_salen_siempre_de_la_misma_fuente(
+    repo, tmp_path,
+):
+    """El otro lado del mismo hallazgo: si referencia y medida pudieran
+    salir de fuentes distintas (una real, otra contable), un desajuste
+    entre las dos se leeria como una "ganancia" que nunca ocurrio -la
+    "ganancia fantasma" que el coordinador reprodujo-. Con `proveedor_saldo`
+    inyectado, las DOS puntas leen siempre de el: el equity contable
+    (deliberadamente distinto aqui, 1000 sin tocar) no puede colarse en el
+    calculo aunque el proveedor diga otra cosa."""
+    repo.set_equity_inicial("real", 1000.0)  # equity contable: se queda en 1000
+    cfg = _cfg(tmp_path, perdida_diaria_max=0.05)
+    frenos = Frenos(cfg, repo, "real", proveedor_saldo=lambda: 850.0)
+    assert frenos.puede_abrir(DIA_1) is None  # referencia: 850 (del proveedor, no 1000)
+    # el saldo real no se ha movido -sigue en 850-: 0% de perdida real, pese
+    # a que el equity contable (1000) diverja de la referencia.
+    assert frenos.puede_abrir(DIA_1 + MIN) is None
+
+
 def test_la_parada_de_emergencia_no_impide_gobernar_lo_ya_abierto(repo, tmp_path):
     """Los frenos son responsabilidad exclusiva de `puede_abrir`: no exponen
     nada que pueda usarse para tocar la gestión de lo ya abierto. Este test
