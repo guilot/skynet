@@ -102,6 +102,53 @@ async def test_el_stop_cierra_la_posicion_y_registra_el_fill(bot):
     assert fills[0]["precio"] == pytest.approx(97.0)
 
 
+async def test_un_fallo_al_leer_equity_para_el_log_de_cierre_no_degrada_la_posicion(
+    tmp_path, caplog,
+):
+    """Task 11, ronda de arreglo: `BotRunner._cerrar` llama a
+    `portfolio.equity()` SOLO para el log informativo, después de que la
+    posición ya quedó cerrada en la base y fuera de `self.abiertas`. Antes
+    de esta ronda, un fallo ahí (un `proveedor_saldo` que empieza a
+    devolver un valor inválido, Task 11) se propagaba hasta el
+    `try/except` que gobierna `self.abiertas` en `on_tick`, que marcaba
+    `degradada` una posición que YA estaba cerrada -un estado sin sentido
+    que le mentía al operador en el informe. Este test reproduce
+    exactamente ese camino: abre en un tick con un saldo válido, el
+    proveedor empieza a fallar, y el siguiente tick cruza el stop -que
+    dispara `_cerrar` y, dentro, el log que llama a `equity()`."""
+    conn = open_db(tmp_path / "scanner.db")
+    repo = BotRepo(conn)
+    repo.set_equity_inicial("real", 1000.0)
+    cfg = BotConfig(enabled=True, modo="real", equity_inicial=1000.0,
+                    desvio_max_entrada=0.0)
+    params = StrategyParams(comision_taker=0.0)
+    saldo = {"valor": 1000.0}
+    cartera = LivePortfolio(params, cfg, repo, proveedor_saldo=lambda: saldo["valor"])
+    runner = BotRunner(params, cfg, repo, PaperBroker(params), cartera)
+
+    await runner.on_tick([tr()], precios({"A": 100.0}), ahora=0)
+    assert "A" in runner.abiertas
+
+    saldo["valor"] = float("nan")  # el proveedor empieza a fallar
+    with caplog.at_level("ERROR"):
+        # cae por debajo del stop (100 * 0.975 = 97.5): dispara _cerrar
+        await runner.on_tick([], precios({"A": 97.0}), ahora=MIN)
+
+    # la posicion SI queda cerrada correctamente...
+    assert runner.abiertas == {}
+    cerradas = repo.cerradas("real")
+    assert len(cerradas) == 1
+    assert cerradas[0]["pnl"] == pytest.approx(-12.0)
+    # ...Y NO se marca degradada pese al fallo al leer equity() para el log
+    assert not cerradas[0]["degradada"]
+    # el fallo se registro localmente (mensaje del guard de _cerrar), no
+    # via el try/except externo que habria dicho "se marca degradada"
+    mensajes = [r.getMessage() for r in caplog.records]
+    assert any("no se pudo leer el equity" in m for m in mensajes)
+    assert not any("se marca degradada" in m for m in mensajes)
+    conn.close()
+
+
 async def test_una_transicion_a_signal_escala_dos_tramos(bot):
     runner, repo = bot
     await runner.on_tick([tr(new=State.WATCH)], precios({"A": 100.0}), ahora=0)

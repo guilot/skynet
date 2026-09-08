@@ -30,6 +30,16 @@ cambia es que no se evalúan entradas nuevas.
   y el dinero se regía por otra. Ver `_saldo_actual` y el docstring de
   `puede_abrir` para el efecto que esto tiene sobre el contrato de orden con
   `registrar_saldo_del_dia`.
+
+  **Un `proveedor_saldo` puede fallar, y este freno no puede permitírselo**
+  (segundo hallazgo de revisión, misma ronda): un valor no finito o no
+  positivo (`nan`, `0.0`, negativo) NUNCA se usa para fijar ni persistir la
+  referencia del día -ni desde `_saldo_actual` ni desde
+  `registrar_saldo_del_dia`-, y en su lugar el freno se activa por
+  precaución. La alternativa (dejar pasar un `nan` hasta el cálculo) es lo
+  que se arregló: un `nan` colado en la primera consulta del día apagaba
+  este freno hasta medianoche UTC, sobreviviendo incluso a un reinicio
+  porque quedaba escrito en `bot_meta`.
 - **Parada de emergencia**: si existe `fichero_parada` en disco, no se abre
   nada. Se comprueba con `os.stat()` en cada llamada -una consulta barata
   al sistema de ficheros-, lo que permite cortar desde SSH creando el
@@ -41,6 +51,7 @@ cambia es que no se evalúan entradas nuevas.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -65,6 +76,16 @@ def _dia_utc(ahora: int) -> str:
     del exchange -el `ahora` que recibe `on_tick`-, no en el de la máquina
     donde corre el proceso."""
     return datetime.fromtimestamp(ahora / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def _saldo_valido(saldo: float) -> bool:
+    """Mismo criterio que `LivePortfolio.equity()` (Task 11): un saldo con
+    el que se pueda medir algo tiene que ser un número finito y positivo.
+    Compartido aquí porque `Frenos` tiene DOS puntos donde un `saldo`
+    externo puede colarse -`_saldo_actual` (vía `proveedor_saldo`) y
+    `registrar_saldo_del_dia` (vía su parámetro explícito)- y los dos deben
+    fallar cerrado del mismo modo ante el mismo tipo de valor espurio."""
+    return math.isfinite(saldo) and saldo > 0
 
 
 class Frenos:
@@ -140,7 +161,20 @@ class Frenos:
         cuenta el mismo valor que esta llamada traería. La responsabilidad
         de que las dos puntas usen la misma fuente sigue siendo de quien
         cablea el bucle del bot -esta clase no puede verificar de dónde
-        sale el `saldo` que se le pasa aquí."""
+        sale el `saldo` que se le pasa aquí.
+
+        Mismo criterio de validez que `_saldo_actual` (ver el hallazgo de
+        revisión ahí): un `saldo` no finito o no positivo NO se persiste
+        como referencia -se ignora con un `log.error`, dejando la
+        referencia del día sin fijar para que una llamada posterior (de
+        aquí o de `puede_abrir`) con un valor válido pueda fijarla bien."""
+        if not _saldo_valido(saldo):
+            log.error(
+                "bot: registrar_saldo_del_dia recibio un saldo invalido "
+                "(%r); se ignora sin persistir ninguna referencia con ese "
+                "valor", saldo,
+            )
+            return
         self._referencia_del_dia(ahora, saldo)
 
     def _parada_de_emergencia(self) -> bool:
@@ -191,6 +225,29 @@ class Frenos:
 
     def _perdida_diaria_superada(self, ahora: int) -> bool:
         saldo_actual = self._saldo_actual()
+        if not _saldo_valido(saldo_actual):
+            # Hallazgo de revisión: un valor espurio de `proveedor_saldo`
+            # (`nan`, `0.0`, negativo -un caché sin inicializar en el
+            # cableado, una lectura fallida que no se aisló antes de
+            # llegar aquí-) NO puede fijar ni tocar la referencia del día.
+            # Antes de esta guarda, un `nan` colado en la PRIMERA consulta
+            # del día se persistía como referencia en `bot_meta`: a partir
+            # de ahí `referencia <= 0` daba `False`, `perdida` salía `nan`,
+            # y `nan >= tope` TAMBIÉN da `False` en Python -así que el
+            # freno quedaba desactivado el resto del día UTC, y sobrevivía
+            # a un reinicio porque la referencia envenenada ya estaba en
+            # disco. Es un freno de emergencia: ante la duda, se frena (la
+            # misma regla que ya rige `_parada_de_emergencia`), y frenar
+            # aquí significa NO escribir nada en `bot_meta` con este valor
+            # -ni siquiera como referencia por defecto-, para que la
+            # próxima consulta con un saldo válido pueda fijarla bien.
+            log.error(
+                "bot: proveedor_saldo devolvio un saldo invalido (%r) al "
+                "medir la perdida diaria; se frena por precaucion sin "
+                "fijar ni persistir ninguna referencia con ese valor",
+                saldo_actual,
+            )
+            return True
         referencia = self._referencia_del_dia(ahora, saldo_actual)
         if referencia <= 0:
             # sin saldo de referencia positivo no hay sobre qué medir una

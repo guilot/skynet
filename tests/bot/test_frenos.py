@@ -7,6 +7,7 @@ la referencia sobre el saldo YA castigado -el mismo día en que el freno está
 saltando- y el bot volvería a operar justo cuando no debe.
 """
 import os
+from datetime import datetime, timezone
 
 import pytest
 
@@ -24,6 +25,13 @@ MIN = 60_000
 # medianoche UTC, no la del reloj local.
 DIA_1 = 1_700_000_000_000
 DIA_2 = DIA_1 + 24 * 60 * 60 * 1000
+
+
+def _dia(ts_ms: int) -> str:
+    """Mismo cálculo que el `_dia_utc` privado de `frenos.py` -se
+    reimplementa aquí en vez de importarlo para no acoplar el test a un
+    símbolo privado del módulo bajo prueba."""
+    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
 def _cfg(tmp_path, perdida_diaria_max: float = 0.10) -> BotConfig:
@@ -265,6 +273,58 @@ def test_con_proveedor_referencia_y_medida_salen_siempre_de_la_misma_fuente(
     # el saldo real no se ha movido -sigue en 850-: 0% de perdida real, pese
     # a que el equity contable (1000) diverja de la referencia.
     assert frenos.puede_abrir(DIA_1 + MIN) is None
+
+
+@pytest.mark.parametrize("saldo_invalido", [float("nan"), 0.0, -50.0])
+def test_un_saldo_invalido_del_proveedor_frena_sin_persistir_referencia(
+    repo, tmp_path, saldo_invalido,
+):
+    """Hallazgo de revisión (ronda 2): antes de esta guarda, un `nan`
+    colado en la PRIMERA consulta del día se persistía tal cual como
+    referencia en `bot_meta`. A partir de ahí `referencia <= 0` daba
+    `False`, `perdida` salía `nan`, y `nan >= tope` TAMBIÉN da `False` en
+    Python -así que el freno de pérdida diaria quedaba desactivado el
+    resto del día UTC, y sobrevivía a un reinicio porque la referencia
+    envenenada ya estaba en disco. `0.0` y un negativo envenenan la
+    jornada por el mismo camino (`referencia <= 0`). La guarda debe frenar
+    (no dejar pasar, "ante la duda se frena") Y no escribir nada en
+    `bot_meta` con ese valor."""
+    repo.set_equity_inicial("real", 1000.0)
+    cfg = _cfg(tmp_path, perdida_diaria_max=0.05)
+    frenos = Frenos(cfg, repo, "real", proveedor_saldo=lambda: saldo_invalido)
+    assert frenos.puede_abrir(DIA_1) == MOTIVO_PERDIDA_DIARIA
+    assert repo.saldo_dia("real", _dia(DIA_1)) is None  # nada persistido
+
+
+def test_tras_un_saldo_invalido_una_consulta_posterior_valida_fija_bien_la_referencia(
+    repo, tmp_path,
+):
+    """Complementa el test de arriba: la referencia envenenada no debe
+    quedar "atascada" en ningún estado intermedio -la primera consulta
+    válida del día, aunque llegue después de una inválida, tiene que fijar
+    la referencia con normalidad, como si la consulta inválida no hubiera
+    pasado."""
+    repo.set_equity_inicial("real", 1000.0)
+    cfg = _cfg(tmp_path, perdida_diaria_max=0.05)
+    saldo = {"valor": float("nan")}
+    frenos = Frenos(cfg, repo, "real", proveedor_saldo=lambda: saldo["valor"])
+    assert frenos.puede_abrir(DIA_1) == MOTIVO_PERDIDA_DIARIA  # invalido: frena
+
+    saldo["valor"] = 1000.0  # ahora si es valido
+    assert frenos.puede_abrir(DIA_1 + MIN) is None  # fija la referencia: 1000
+    assert repo.saldo_dia("real", _dia(DIA_1)) == pytest.approx(1000.0)
+
+    saldo["valor"] = 900.0  # 10% de perdida sobre la referencia de 1000
+    assert frenos.puede_abrir(DIA_1 + 2 * MIN) == MOTIVO_PERDIDA_DIARIA
+
+
+@pytest.mark.parametrize("saldo_invalido", [float("nan"), 0.0, -50.0])
+def test_registrar_saldo_del_dia_con_valor_invalido_no_persiste_nada(
+    repo, tmp_path, saldo_invalido,
+):
+    frenos = Frenos(_cfg(tmp_path), repo, "paper")
+    frenos.registrar_saldo_del_dia(DIA_1, saldo_invalido)
+    assert repo.saldo_dia("paper", _dia(DIA_1)) is None
 
 
 def test_la_parada_de_emergencia_no_impide_gobernar_lo_ya_abierto(repo, tmp_path):

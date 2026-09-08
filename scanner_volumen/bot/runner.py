@@ -1058,8 +1058,30 @@ class BotRunner:
                           fees=pos.fees_acumuladas, max_rank=pos.reglas.max_rank)
         self.portfolio.registrar_cierre(pos.symbol, ahora, pos.pnl_acumulado)
         self.abiertas.pop(pos.symbol, None)
+        # `equity()` aquí es puramente informativo para el log: la posición
+        # YA está cerrada en la base y fuera de `self.abiertas` en las tres
+        # líneas de arriba, así que un fallo al leerla (Task 11: un
+        # `proveedor_saldo` que devuelve un valor inválido lanza
+        # `ValueError`) NUNCA debe propagarse desde aquí. Si se dejara
+        # propagar, el `try/except` de `on_tick` que gobierna
+        # `self.abiertas` (línea ~184) lo capturaría y marcaría esta MISMA
+        # posición -ya cerrada- como `degradada`: un estado sin sentido
+        # para una fila que ya no está abierta, y que el operador leería
+        # como una posición viva sin gobierno cuando en realidad ya se
+        # liquidó correctamente (hallazgo de revisión). Aislado aquí en vez
+        # de arriba porque el problema es específico de este log, no del
+        # cierre en sí.
+        try:
+            equity = self.portfolio.equity()
+        except Exception:
+            log.exception(
+                "bot: cierra %s pnl %.2f (no se pudo leer el equity para "
+                "este log; la posicion SI quedo cerrada correctamente)",
+                pos.symbol, pos.pnl_acumulado,
+            )
+            return
         log.info("bot: cierra %s pnl %.2f (equity %.2f)",
-                 pos.symbol, pos.pnl_acumulado, self.portfolio.equity())
+                 pos.symbol, pos.pnl_acumulado, equity)
 
     async def _cancelar_stop(self, pos: PosicionAbierta) -> None:
         """Cancela el stop del exchange al cerrar la posición, por cualquier

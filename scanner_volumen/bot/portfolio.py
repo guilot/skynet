@@ -65,9 +65,26 @@ class LivePortfolio:
         puede dimensionar nada -antes de esta validación, un `-300` se
         propagaba tal cual hasta un margen negativo, un tamaño de posición
         negativo, y una orden real mandada sin ninguna guarda. Se lanza
-        `ValueError` en vez de devolver algo: quien llama a esto desde
-        `on_tick` ya aísla el fallo de CADA entrada por separado, así que
-        una excepción aquí descarta solo esa entrada, no tumba el bot.
+        `ValueError` en vez de devolver algo.
+
+        OJO CON QUÉ HACE QUIEN LLAMA A ESTO (corregido tras un hallazgo de
+        revisión posterior, que demostró que la frase anterior aquí era
+        FALSA en general): esta función no controla ni garantiza cómo se
+        aísla su propia excepción -eso depende de cada llamador-. En el
+        bucle de entradas de `on_tick` sí es cierto que cada entrada está
+        aislada en su propio `try/except`, así que ahí un fallo descarta
+        solo esa entrada. Pero `equity()` tiene OTRO llamador con una
+        isolación muy distinta: el log informativo de `BotRunner._cerrar`
+        tras cerrar una posición. Antes de que ese call site se corrigiera
+        también en esta ronda, un fallo aquí se propagaba hasta el
+        `try/except` que gobierna `self.abiertas` en `on_tick` y marcaba
+        `degradada` una posición que YA estaba cerrada -un estado sin
+        sentido que le mentía al operador en el informe-, justo lo
+        contrario de "descarta solo esa entrada". `_cerrar` ya aísla ese
+        fallo localmente, pero la lección se queda documentada aquí:
+        cualquier llamador NUEVO de `equity()` tiene que decidir
+        explícitamente qué hacer si lanza, no asumir que "se aísla solo"
+        porque otro llamador lo hace.
 
         AVISA si el modo es real y no hay `proveedor_saldo` (una sola vez
         por instancia): es el error de cableado más probable de la Task 13
