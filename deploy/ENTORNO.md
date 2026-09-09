@@ -103,12 +103,18 @@ revés.
    ser normalmente cero; si sube, hay filas que revisar a mano, y cada una
    ocupa un hueco de concurrencia.
 
-5. **Una orden mandada por un proceso que muere antes de registrarla veta su
-   símbolo.** El endpoint de posiciones de Bitget no devuelve el identificador
-   de cliente de la orden, así que el bot no puede reconocer como propia esa
-   posición. Hace lo conservador -no la toca y no abre nada más en ese
-   símbolo durante la sesión-, pero esa posición real puede estar **apalancada
-   y sin stop en el exchange**, porque el stop se coloca después de confirmar
-   la apertura. Se ve en el informe como `reserva sin correlacionar` en el log
-   y como un símbolo vetado. **Requiere mirar Bitget a mano**: o se le pone un
-   stop, o se cierra.
+5. **Una orden mandada por un proceso que muere antes de registrarla.**
+   Puede pasar bajo `Restart=always`: la orden llega a Bitget pero el bot no
+   la registra. El endpoint de posiciones no devuelve el identificador de
+   cliente, así que por esa vía el bot no la reconoce como suya -pero el
+   historial de órdenes SÍ lo devuelve, así que la busca ahí por su
+   identificador y, si aparece ejecutada, **la adopta con sus datos reales**
+   y pasa a gestionarla como cualquier otra (le colocará su stop). Se ve en
+   el log como `reserva adoptada por historial`.
+
+   Si tampoco aparece en el historial, no se puede afirmar que se ejecutara:
+   la fila se deja intacta y el símbolo queda **vetado** el resto de la
+   sesión, contado como `reserva sin correlacionar`. Ese caso sí **requiere
+   mirar Bitget a mano**: puede haber ahí una posición real apalancada y sin
+   stop, porque el stop se coloca después de confirmar la apertura; o se le
+   pone uno, o se cierra.
