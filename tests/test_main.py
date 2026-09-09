@@ -785,6 +785,37 @@ def test_las_posiciones_del_exchange_se_traducen_al_vocabulario_del_bot():
     assert traducidas[0].client_oid is None
 
 
+def test_las_posiciones_de_tamano_no_positivo_se_descartan():
+    """Una fila de tamaño 0 traducida sería una posición FANTASMA, con dos
+    efectos contrarios y ambos malos: el sondeo creería que sigue abierta y
+    no detectaría nunca su cierre, y la reconciliación de arranque la
+    vetaría como ajena.
+
+    El filtro es seguro se comporte como se comporte Bitget -si nunca
+    devolviera filas así, no descarta nada-, pero sin este test nada impide
+    quitarlo: se comprobó que eliminarlo dejaba la suite entera en verde."""
+    traducidas = posiciones_del_bot([
+        PosicionExchangeBitget(symbol="AAAUSDT", lado="long", tamano=0.0,
+                               precio_entrada=100.0),
+        PosicionExchangeBitget(symbol="BBBUSDT", lado="long", tamano=-1.0,
+                               precio_entrada=100.0),
+        PosicionExchangeBitget(symbol="CCCUSDT", lado="long", tamano=4.0,
+                               precio_entrada=100.0),
+    ])
+
+    assert [p.symbol for p in traducidas] == ["CCCUSDT"]
+
+
+def test_un_lado_desconocido_en_una_fila_de_tamano_cero_no_llega_a_lanzar():
+    """El descarte va ANTES de interpretar el lado, a propósito: una fila
+    vacía con el lado en blanco no debe tumbar la lectura entera del
+    exchange -que es lo que haría el `ValueError` del lado desconocido."""
+    assert posiciones_del_bot([
+        PosicionExchangeBitget(symbol="AAAUSDT", lado="", tamano=0.0,
+                               precio_entrada=0.0),
+    ]) == []
+
+
 def test_una_posicion_con_lado_desconocido_no_se_interpreta():
     """Interpretar mal el lado de una posición apalancada es peor que no
     interpretarlo: quien llama lo trata como "no se pudo leer el exchange"."""

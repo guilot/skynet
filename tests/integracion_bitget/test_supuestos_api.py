@@ -29,6 +29,16 @@ camino feliz nunca los pone a prueba:
   de en el paso 1 del ciclo), porque `get_saldo()` es la pieza que más
   bloquearía el resto del banco si fallase, y conviene poder diagnosticarla
   sola.
+
+
+SUPUESTO 11 (anadido tras la Task 13, sin sonda propia todavia): que
+`/api/v2/mix/position/all-position` devuelve filas con `total = 0` para
+simbolos SIN posicion viva, en vez de omitir esos simbolos.
+`scanner_volumen.__main__.posiciones_del_bot` las descarta por si acaso -el
+filtro es seguro se comporte como se comporte Bitget-, pero el
+comportamiento real no esta confirmado. Quien ejecute este banco con claves
+de demo: mira si `get_posiciones()` devuelve entradas de tamano 0 para
+simbolos que nunca has operado, y anotalo.
 """
 from __future__ import annotations
 

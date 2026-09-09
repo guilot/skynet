@@ -499,12 +499,16 @@ def posiciones_del_bot(
       (se comprobó uno a uno); se pone a 0 antes que un instante inventado que
       alguien pudiera tomar por real más adelante.
 
-    Se DESCARTAN las posiciones de tamaño no positivo: Bitget devuelve en este
-    endpoint filas con `total = 0` para símbolos sin posición viva, y una fila
-    así traducida sería una posición fantasma con dos efectos contrarios y
-    ambos malos -el sondeo creería que la posición sigue abierta y nunca
-    detectaría su cierre, y la reconciliación de arranque la vetaría como
-    ajena.
+    Se DESCARTAN las posiciones de tamaño no positivo. El motivo es un
+    SUPUESTO SIN VERIFICAR (el nº11 de la lista de la Task 12, pendiente de
+    confirmar contra la cuenta de simulación): que este endpoint devuelve
+    filas con `total = 0` para símbolos sin posición viva, en vez de omitir
+    esos símbolos. **El filtro es seguro se comporte como se comporte
+    Bitget** -si nunca devolviera filas así, no descarta nada-, y por eso se
+    aplica pese a no estar confirmado: una fila así traducida sería una
+    posición fantasma con dos efectos contrarios y ambos malos -el sondeo
+    creería que la posición sigue abierta y nunca detectaría su cierre, y la
+    reconciliación de arranque la vetaría como ajena.
 
     Un lado que no sea "long" ni "short" lanza en vez de elegir una dirección
     por defecto: interpretar mal el lado de una posición apalancada es peor
