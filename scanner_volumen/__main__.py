@@ -47,7 +47,7 @@ from scanner_volumen.bitget.ws import BitgetWebsocket
 from scanner_volumen.bot.bitget_broker import BitgetBroker
 from scanner_volumen.bot.broker import Broker, PaperBroker
 from scanner_volumen.bot.frenos import Frenos
-from scanner_volumen.bot.model import PosicionExchange
+from scanner_volumen.bot.model import OrdenEjecutada, PosicionExchange
 from scanner_volumen.bot.modo import PAPER, REAL, REAL_LECTURA, resolver_modo
 from scanner_volumen.bot.portfolio import LivePortfolio
 from scanner_volumen.bot.repo import BotRepo
@@ -535,44 +535,44 @@ def posiciones_del_bot(
     return traducidas
 
 
-async def fill_de_cierre_no_disponible(symbol: str) -> None:
-    """El proveedor del fill real de un cierre que decidió el exchange... que
-    esta tarea NO puede construir todavía, y por eso dice que no en vez de
-    inventar un precio.
+def hacer_fill_de_cierre(privado, ventana_horas: float = 24.0):
+    """Construye el proveedor del fill real de un cierre que decidió el
+    exchange (saltó el stop) o de una apertura que quedó sin registrar.
 
-    `BotRunner` (tareas 8 y 9) pide este dato cuando descubre que una posición
-    que creía abierta ya no está en el exchange, y por diseño NUNCA inventa el
-    precio de cierre: si no se consigue el fill real, deja la posición abierta,
-    la marca `degradada`, la cuenta (`"sondeo sin fill real"`) y grita en el
-    log pidiendo revisión manual. Este proveedor devuelve `None` siempre, así
-    que ese es exactamente el camino que se toma.
+    **La correlación es exacta, y eso es lo que hace esto posible.**
+    Observado contra la cuenta de simulación: cuando un plan order se
+    ejecuta, la orden que Bitget crea lleva como `clientOid` el `orderId`
+    del propio plan order -es decir, el `stop_id` que el bot ya tiene
+    guardado- y su `orderSource` es `"loss_market"`. Así que no hay que
+    adivinar cuál de los fills recientes era el nuestro por ventana de
+    tiempo: se busca por identificador, y o aparece o no aparece.
 
-    **LA CONSECUENCIA OPERATIVA NO ES MENOR** (corregido tras la ronda de
-    revisión, que cuantificó lo que la primera versión de este docstring
-    despachaba como "ruidoso"): la salida por stop es la salida NORMAL de la
-    estrategia, así que esto pasa a menudo. Cada posición varada sigue
-    ocupando su hueco de concurrencia; con `max_concurrentes = 5`, cinco de
-    ellas dejan al bot sin abrir nada, y sobreviven al reinicio. Por eso el
-    informe tiene ahora una línea propia para contarlas
-    (`report._lineas_modo_real`) y `deploy/ENTORNO.md` le pide al operador que
-    la vigile a diario: la alternativa -inventar un precio- falsificaría el
-    libro contable en silencio, que es peor, pero "no falsificar" no es lo
-    mismo que "no hace falta hacer nada".
+    Antes de esto el proveedor devolvía siempre `None` y la posición se
+    quedaba varada: ocupando su hueco de concurrencia, sobreviviendo al
+    reinicio, y con `max_concurrentes = 5` bastaban cinco stops -la salida
+    NORMAL de la estrategia- para que el bot dejara de operar.
 
-    **Por qué no se implementa aquí.** `BitgetPrivate.get_fill` consulta los
-    fills DE UNA ORDEN (`symbol` + `orderId`), y en este escenario no hay
-    orderId: la orden la ejecutó el exchange por su cuenta (saltó el stop, o
-    hubo liquidación). Resolverlo de verdad exige una consulta nueva al
-    historial de fills por símbolo y una regla para elegir cuál de ellos es el
-    cierre buscado -es decir, endpoint, forma de respuesta y semántica nuevos,
-    ninguno verificado contra la API real (los diez supuestos de la Task 12
-    siguen sin confirmar porque hacen falta claves de demo). Escribir esa
-    heurística a ciegas significaría arriesgarse a escribir en el libro
-    contable el precio de un fill que no es, que es peor que no escribir
-    ninguno: un precio equivocado no se distingue después de uno correcto,
-    mientras que una posición marcada para revisión manual salta a la vista.
+    Sigue devolviendo `None` cuando no hay con qué correlacionar (una
+    posición sin `stop_id`, p. ej. una degradada a la que nunca se le pudo
+    colocar el stop) o cuando la orden no aparece en la ventana. Ese camino
+    -dejar la fila intacta, contarla y pedir revisión manual- no
+    desaparece: inventar un precio falsificaría el libro en silencio, que
+    es peor que una posición marcada para mirar a mano.
     """
-    return None
+    async def fill_de_cierre(symbol: str, client_oid: str | None):
+        if client_oid is None:
+            return None
+        desde = ahora_ms() - int(ventana_horas * 3600 * 1000)
+        fill = await privado.get_orden_por_client_oid(symbol, client_oid, desde)
+        if fill is None:
+            return None
+        return OrdenEjecutada(
+            # el instante que dice el exchange, no el reloj local
+            ts=fill.ts or ahora_ms(),
+            precio=fill.precio, cantidad=fill.cantidad, comision=fill.comision,
+        )
+
+    return fill_de_cierre
 
 
 async def paso_saldo(proveedor: ProveedorSaldo, repo: BotRepo, modo: str) -> None:
@@ -795,7 +795,7 @@ async def main(argv: list[str] | None = None) -> None:
             bot = BotRunner(
                 params, cfg_bot, bot_repo, piezas.broker,
                 LivePortfolio(params, cfg_bot, bot_repo, proveedor_saldo),
-                fill_de_cierre=(fill_de_cierre_no_disponible
+                fill_de_cierre=(hacer_fill_de_cierre(piezas.privado)
                                 if piezas.privado is not None else None),
                 frenos=frenos, verificador=verificador,
             )
@@ -867,7 +867,7 @@ async def main(argv: list[str] | None = None) -> None:
                         await piezas.privado.get_posiciones())
                     await bot.reconciliar_con_exchange(
                         posiciones, _transiciones_de, _velas_de,
-                        _precio_de(orq), fill_de_cierre_no_disponible,
+                        _precio_de(orq), hacer_fill_de_cierre(piezas.privado),
                         ahora_arranque)
                 else:
                     await bot.reconstruir(_transiciones_de, _velas_de,

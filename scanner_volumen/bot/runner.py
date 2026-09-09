@@ -65,7 +65,14 @@ PrecioDe = Callable[[str], float | None]
 # `await` sobre el broker en el resto del fichero -envolver esa llamada en
 # una fachada síncrona no aportaría nada y solo trasladaría la curvatura a
 # quien cablee esto contra el exchange de verdad (Task 13).
-FillDeCierre = Callable[[str], Awaitable[OrdenEjecutada | None]]
+# `(symbol, client_oid)` -> el fill real de ese cierre, o `None` si no se
+# encuentra. El segundo argumento es lo que hace posible la correlación
+# EXACTA: para un cierre que disparó el stop del exchange es el `stop_id`
+# (Bitget pone el id del plan order como `clientOid` de la orden que
+# genera); para una apertura que quedó sin registrar, el `client_oid` que
+# el bot le puso. Puede ser `None` cuando no hay con qué correlacionar, y
+# entonces el proveedor debe devolver `None` en vez de adivinar.
+FillDeCierre = Callable[[str, str | None], Awaitable[OrdenEjecutada | None]]
 
 # Máximo número de intentos de cierre para manejar fills parciales.
 # Con 3 intentos se cubre el 87.5% de los casos de dos fills parciales
@@ -779,7 +786,7 @@ class BotRunner:
         para revisión manual en vez de arriesgar un PnL fantasma.
         """
         symbol = fila["symbol"]
-        orden = await fill_de_cierre(symbol)
+        orden = await fill_de_cierre(symbol, fila.get("stop_id"))
         if orden is None:
             log.error(
                 "bot: reconciliacion: %s figura abierta en la base pero no "
@@ -923,7 +930,8 @@ class BotRunner:
         motor ya tiene descontada cualquier parcial cobrada antes de este
         sondeo."""
         pos = self.abiertas[symbol]
-        orden = await self._fill_de_cierre(symbol) if self._fill_de_cierre else None
+        orden = (await self._fill_de_cierre(symbol, pos.stop_id)
+                 if self._fill_de_cierre else None)
         if orden is None:
             self._repo.incrementar_contador(self._cfg.modo, "sondeo sin fill real")
             # Se marca DEGRADADA (hallazgo de revisión de la Task 13): la

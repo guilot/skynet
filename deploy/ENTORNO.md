@@ -88,23 +88,21 @@ revés.
    nuevas; las posiciones abiertas se siguen gobernando. Se quita borrándolo.
    Ninguna de las dos cosas exige reiniciar el proceso, y funciona en **todos**
    los modos, `paper` incluido.
-4. **Hoy el bot no sabe recuperar el precio de un cierre que ejecutó el
-   exchange.** Es la limitación más importante de este despliegue y la salida
-   por stop es la salida NORMAL de la estrategia, así que va a pasar:
+4. **Cuando el stop salta en el exchange, el bot ya sabe leer ese cierre.**
+   Lo hace correlacionando por identificador, no por ventana de tiempo: al
+   ejecutarse un plan order, Bitget crea una orden cuyo `clientOid` es el
+   `orderId` del propio plan order -o sea, el `stop_id` que el bot tiene
+   guardado- y cuyo `orderSource` es `loss_market`. Verificado contra la
+   cuenta de simulación con un stop disparado de verdad.
 
-   - Qué ocurre: el sondeo detecta que la posición ya no está en Bitget, pero
-     no puede conseguir el fill real de ese cierre (haría falta una consulta
-     al historial de fills por símbolo que el cliente aún no tiene). Nunca
-     inventa un precio: deja la fila abierta, la marca `degradada` y grita en
-     el log.
-   - Cómo se ve: en el informe, la línea `Cierres SIN fill real (posiciones
-     varadas...)` y el contador de `(degradadas: N)` entre las abiertas.
-   - Por qué importa: cada posición varada sigue ocupando un hueco de
-     concurrencia. Con `max_concurrentes = 5`, cinco de ellas dejan al bot sin
-     abrir nada (`descartes tope concurrencia`), y sobreviven al reinicio.
-   - Qué hacer: cerrar esas filas a mano (o revisarlas) antes de que se
-     acumulen. **Vigila esa línea del informe a diario mientras el modo
-     `ordenes` esté encendido.**
+   Sigue habiendo un camino degradado, y conviene conocerlo: si la posición
+   no tiene `stop_id` (una degradada a la que nunca se le pudo colocar el
+   stop) o la orden no aparece en la ventana consultada, el bot **no
+   inventa un precio**: deja la fila intacta, la marca `degradada` y la
+   cuenta en la línea `Cierres SIN fill real` del informe. Esa línea debería
+   ser normalmente cero; si sube, hay filas que revisar a mano, y cada una
+   ocupa un hueco de concurrencia.
+
 5. **Una orden mandada por un proceso que muere antes de registrarla veta su
    símbolo.** El endpoint de posiciones de Bitget no devuelve el identificador
    de cliente de la orden, así que el bot no puede reconocer como propia esa

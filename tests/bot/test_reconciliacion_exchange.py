@@ -69,7 +69,7 @@ async def _sin_cierre(symbol):
 def _cierre_para(**fills: OrdenEjecutada):
     """Fábrica de un `fill_de_cierre` async que solo conoce los símbolos
     pasados por nombre; el resto devuelve `None`, igual que `_sin_cierre`."""
-    async def _fill_de_cierre(symbol):
+    async def _fill_de_cierre(symbol, client_oid=None):
         return fills.get(symbol)
     return _fill_de_cierre
 

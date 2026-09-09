@@ -891,7 +891,7 @@ def _pos_exchange(symbol, size=4.0, entry_price=100.0):
 
 async def test_una_posicion_que_desaparece_del_exchange_se_cierra(tmp_path):
     """El stop del exchange se ejecuto mientras el bot miraba a otro lado."""
-    async def _fill_de_cierre(symbol):
+    async def _fill_de_cierre(symbol, client_oid=None):
         return OrdenEjecutada(ts=5 * MIN, precio=97.0, cantidad=4.0, comision=0.0)
 
     runner, repo = _runner_real(tmp_path, fill_de_cierre=_fill_de_cierre)
@@ -957,7 +957,7 @@ async def test_el_sondeo_sin_fill_real_no_inventa_precio_y_deja_la_posicion_inta
 
 
 async def test_un_fallo_al_sondear_una_no_impide_sondear_las_demas(tmp_path, caplog):
-    async def _fill_de_cierre(symbol):
+    async def _fill_de_cierre(symbol, client_oid=None):
         if symbol == "A":
             raise RuntimeError("boom: el broker no responde para A")
         return OrdenEjecutada(ts=5 * MIN, precio=95.0, cantidad=4.0, comision=0.0)

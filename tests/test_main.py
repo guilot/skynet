@@ -21,7 +21,8 @@ import pytest
 
 from scanner_volumen.__main__ import (
     MANTENIMIENTO_REINTENTO_MS, ProveedorSaldo, ahora_ms,
-    construir_piezas_del_bot, main, marcar_ws_conectado, parse_args,
+    construir_piezas_del_bot, hacer_fill_de_cierre, main,
+    marcar_ws_conectado, parse_args,
     paso_evaluador, paso_mantenimiento, paso_outcomes, paso_saldo,
     paso_sondeo, paso_tickers, posiciones_del_bot,
 )
@@ -853,7 +854,7 @@ class BrokerQueSeQueda(PaperBroker):
         return await super().cerrar(**kwargs)
 
 
-async def _fill_de_cierre_falso(symbol):
+async def _fill_de_cierre_falso(symbol, client_oid=None):
     return OrdenEjecutada(ts=MINUTO, precio=97.0, cantidad=4.0, comision=0.0)
 
 
@@ -1229,3 +1230,65 @@ async def test_main_no_arranca_si_no_consigue_el_primer_saldo(monkeypatch, tmp_p
     with pytest.raises(RuntimeError, match="Bitget no responde"):
         await _arrancar_main(monkeypatch, tmp_path, modo_config="real",
                              valor_env="ordenes", privado=privado)
+
+
+# --- el fill de un cierre que ejecuto el exchange (Task 12, banco real) ---
+
+
+class PrivadoConHistorial:
+    """Doble de `BitgetPrivate` para el proveedor de fills de cierre.
+
+    La forma de los datos NO es inventada: reproduce lo observado contra la
+    cuenta de simulacion al dispararse un stop de verdad -la orden que crea
+    Bitget lleva como `clientOid` el `orderId` del plan order, y su
+    `orderSource` es `loss_market`."""
+
+    def __init__(self, ordenes):
+        self._ordenes = ordenes
+        self.consultas = []
+
+    async def get_orden_por_client_oid(self, symbol, client_oid, desde_ms):
+        self.consultas.append((symbol, client_oid, desde_ms))
+        return self._ordenes.get(client_oid)
+
+
+async def test_el_fill_de_cierre_se_correlaciona_por_el_id_del_stop():
+    """La correlacion es por identificador, no por ventana de tiempo: el
+    `clientOid` de la orden que Bitget genera al saltar el stop es el
+    `orderId` de nuestro plan order, o sea el `stop_id` que el bot guarda."""
+    from scanner_volumen.bitget.private import FillOrden
+
+    privado = PrivadoConHistorial({
+        "stop-abc": FillOrden(precio=78177.8, cantidad=0.0335, comision=1.57),
+    })
+    proveedor = hacer_fill_de_cierre(privado)
+
+    orden = await proveedor("SBTCSUSDT", "stop-abc")
+
+    assert orden is not None
+    assert orden.precio == pytest.approx(78177.8)
+    assert orden.cantidad == pytest.approx(0.0335)
+    assert orden.comision == pytest.approx(1.57)
+    assert privado.consultas[0][:2] == ("SBTCSUSDT", "stop-abc")
+
+
+async def test_sin_id_con_el_que_correlacionar_no_se_inventa_nada():
+    """Una posicion sin `stop_id` -una degradada a la que nunca se le pudo
+    colocar el stop- no tiene con que correlacionar. Debe devolver `None` y
+    NO consultar el historial: devolver el ultimo cierre del simbolo seria
+    escribir en el libro el precio de una orden que puede no ser la nuestra,
+    y un precio equivocado no se distingue despues de uno correcto."""
+    privado = PrivadoConHistorial({})
+    proveedor = hacer_fill_de_cierre(privado)
+
+    assert await proveedor("SBTCSUSDT", None) is None
+    assert privado.consultas == []
+
+
+async def test_si_la_orden_no_aparece_en_el_historial_devuelve_none():
+    """El camino degradado sigue existiendo: la fila se deja intacta para
+    revision manual en vez de arriesgar un PnL fantasma."""
+    privado = PrivadoConHistorial({})
+    proveedor = hacer_fill_de_cierre(privado)
+
+    assert await proveedor("SBTCSUSDT", "stop-que-no-aparece") is None

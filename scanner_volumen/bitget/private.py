@@ -88,6 +88,11 @@ class FillOrden:
     precio: float
     cantidad: float
     comision: float
+    # Instante del fill segun el exchange (`cTime`), en ms. Por defecto 0
+    # cuando quien construye esto no lo tiene a mano; nadie lo lee hoy, pero
+    # llevarlo cuando SI se conoce evita que alguien lo rellene mas adelante
+    # con la hora local creyendo que es la del exchange.
+    ts: int = 0
 
 
 def _formato_decimal(valor: float) -> str:
@@ -531,6 +536,65 @@ class BitgetPrivate:
             "planType": PLAN_TYPE_STOP,
         }
         await self._pedir("POST", "/api/v2/mix/order/cancel-plan-order", body=cuerpo)
+
+    async def get_orden_por_client_oid(
+        self, symbol: str, client_oid: str, desde_ms: int,
+    ) -> FillOrden | None:
+        """Busca en el historial de órdenes la que se mandó con ese
+        `clientOid` y devuelve su fill agregado, o `None` si no aparece.
+
+        **Para qué existe.** Cuando el stop salta en el exchange, el bot no
+        tiene el `orderId` de la orden que Bitget creó -esa orden la generó
+        el exchange, no nosotros-, así que `get_fill` (que exige `orderId`)
+        no sirve. Sin esto, la posición se quedaba varada: el bot detectaba
+        que ya no está en el exchange pero no podía saber a qué precio se
+        cerró, y nunca inventa uno.
+
+        **La correlación es exacta, no una heurística.** Observado contra la
+        simulación: cuando un plan order (stop) se ejecuta, la orden
+        resultante lleva como `clientOid` el `orderId` DEL PROPIO PLAN ORDER
+        -es decir, el `stop_id` que el bot ya tiene guardado-, y su
+        `orderSource` es `"loss_market"`. Así que no hay que adivinar cuál
+        de los fills recientes era el nuestro por ventana de tiempo: se
+        busca por identificador.
+
+        Sirve igual para el otro caso que lo necesitaba: una orden de
+        APERTURA mandada por un proceso que murió antes de registrarla. Ahí
+        el `clientOid` es el que generó el bot, y `all-position` no lo
+        devuelve -por eso la reconciliación no podía reconocer su propia
+        posición.
+
+        `desde_ms` acota la ventana del historial; Bitget exige un rango.
+        """
+        payload = await self._pedir(
+            "GET", "/api/v2/mix/order/orders-history",
+            params={
+                "symbol": symbol,
+                "startTime": str(int(desde_ms)),
+                "endTime": str(int(time.time() * 1000)),
+            },
+        )
+        data = payload.get("data") or {}
+        for orden in data.get("entrustedList") or []:
+            if orden.get("clientOid") != client_oid:
+                continue
+            if orden.get("status") != "filled":
+                # existe pero no llegó a ejecutarse: no es un cierre real,
+                # y devolver un precio de una orden a medias sería peor que
+                # decir que no se encontró.
+                return None
+            cantidad = float(orden.get("baseVolume") or 0)
+            precio = float(orden.get("priceAvg") or 0)
+            if cantidad <= 0 or precio <= 0:
+                return None
+            # `fee` viene NEGATIVO (lo que cobró el exchange); el resto del
+            # bot trata la comisión como un coste positivo.
+            return FillOrden(
+                precio=precio, cantidad=cantidad,
+                comision=abs(float(orden.get("fee") or 0)),
+                ts=int(orden.get("cTime") or 0),
+            )
+        return None
 
     async def get_fill(self, symbol: str, order_id: str) -> FillOrden:
         """Consulta los fills reales de una orden y los agrega en un único
