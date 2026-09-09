@@ -60,7 +60,7 @@ def _sin_precio(symbol):
     return None
 
 
-async def _sin_cierre(symbol):
+async def _sin_cierre(symbol, client_oid=None):
     """`fill_de_cierre` es async (la consulta real al exchange es de red);
     este doble no encuentra nunca el fill real de cierre de nadie."""
     return None
@@ -68,7 +68,14 @@ async def _sin_cierre(symbol):
 
 def _cierre_para(**fills: OrdenEjecutada):
     """Fábrica de un `fill_de_cierre` async que solo conoce los símbolos
-    pasados por nombre; el resto devuelve `None`, igual que `_sin_cierre`."""
+    pasados por nombre; el resto devuelve `None`, igual que `_sin_cierre`.
+
+    El mismo proveedor sirve a DOS preguntas distintas -"¿a que precio se
+    cerro esto?" y "¿llego a ejecutarse mi orden de apertura?"- porque en el
+    exchange ambas son la misma consulta: buscar la orden con este
+    `clientOid`. Aqui se responde por simbolo, que basta para estos tests;
+    las pruebas de resolucion de reservas usan `_sin_cierre`, que no
+    encuentra nada, para no mezclar los dos caminos."""
     async def _fill_de_cierre(symbol, client_oid=None):
         return fills.get(symbol)
     return _fill_de_cierre
@@ -386,3 +393,74 @@ async def test_una_reserva_no_correlacionable_veta_el_simbolo(conn):
     assert "A" not in bot.abiertas
     assert len(repo.abiertas("paper")) == 1  # sigue solo la reserva original
     assert repo.contadores("paper").get("simbolo vetado") == 1
+
+
+async def test_una_reserva_huerfana_que_SI_se_ejecuto_se_adopta_por_el_historial(conn):
+    """La mejora sobre el veto, posible tras verificar la API de verdad.
+
+    El endpoint de POSICIONES no devuelve `client_oid`, pero el de ORDENES
+    si (comprobado contra la cuenta de simulacion). Asi que la pregunta que
+    de verdad importa -"¿llego a ejecutarse mi orden?"- tiene respuesta.
+
+    Si se ejecuto, hay una posicion REAL apalancada y sin stop, porque el
+    stop se coloca DESPUES de confirmar la apertura. Vetar el simbolo evita
+    abrir otra encima, pero deja esa posicion sin gobierno; adoptarla con
+    sus datos reales es estrictamente mejor, porque a partir de ahi el bot
+    le pone su stop y la gestiona como cualquier otra."""
+    repo = BotRepo(conn)
+    posicion_id = repo.abrir(
+        modo="paper", symbol="A", direction=Direction.LONG, entry_ts=0,
+        entry_price=100.0, entry_price_senal=100.0, margin=20.0,
+        notional=400.0, size=4.0, fee_entrada=0.0,
+        client_oid="bot-huerfano", confirmada=False,
+    )
+
+    async def _historial(symbol, client_oid=None):
+        # solo responde al identificador de ESA reserva: la correlacion en
+        # produccion es por `clientOid`, no por simbolo.
+        if client_oid == "bot-huerfano":
+            return OrdenEjecutada(ts=0, precio=101.5, cantidad=3.9, comision=0.21)
+        return None
+
+    bot, _ = _nuevo_runner(conn)
+    exchange = [PosicionExchange(symbol="A", direction=Direction.LONG,
+                                 size=3.9, entry_price=101.5, entry_ts=0,
+                                 client_oid=None)]
+    await bot.reconciliar_con_exchange(
+        exchange,
+        transiciones_de=_sin_historial, velas_de=_sin_velas, precio_de=_sin_precio,
+        fill_de_cierre=_historial,
+        ahora=MIN,
+    )
+
+    fila = next(f for f in repo.abiertas("paper") if f["id"] == posicion_id)
+    assert fila["confirmada"] == 1
+    # se adopta con los datos REALES del exchange, no con los provisionales
+    assert fila["entry_price"] == pytest.approx(101.5)
+    assert fila["size"] == pytest.approx(3.9)
+    assert fila["fee_entrada"] == pytest.approx(0.21)
+    # y ya NO se veta: la posicion pasa a estar gobernada
+    assert "A" not in bot.simbolos_vetados
+
+
+async def test_si_el_historial_tampoco_la_encuentra_se_sigue_vetando(conn):
+    """El camino conservador no desaparece: si la orden no aparece en el
+    historial, no se puede afirmar que se ejecutara, y se mantiene el veto."""
+    repo = BotRepo(conn)
+    repo.abrir(
+        modo="paper", symbol="A", direction=Direction.LONG, entry_ts=0,
+        entry_price=100.0, entry_price_senal=100.0, margin=20.0,
+        notional=400.0, size=4.0, fee_entrada=0.0,
+        client_oid="bot-huerfano", confirmada=False,
+    )
+    bot, _ = _nuevo_runner(conn)
+    exchange = [PosicionExchange(symbol="A", direction=Direction.LONG,
+                                 size=4.0, entry_price=100.0, entry_ts=0,
+                                 client_oid=None)]
+    await bot.reconciliar_con_exchange(
+        exchange,
+        transiciones_de=_sin_historial, velas_de=_sin_velas, precio_de=_sin_precio,
+        fill_de_cierre=_sin_cierre,
+        ahora=MIN,
+    )
+    assert "A" in bot.simbolos_vetados

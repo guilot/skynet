@@ -629,7 +629,8 @@ class BotRunner:
 
         for fila in self._repo.reservadas_sin_confirmar(modo):
             try:
-                self._resolver_reserva(fila, posiciones_exchange, ahora)
+                await self._resolver_reserva(
+                    fila, posiciones_exchange, fill_de_cierre, ahora)
             except Exception:
                 log.exception(
                     "bot: reconciliacion: fallo al resolver la reserva de "
@@ -682,9 +683,9 @@ class BotRunner:
                     "bot: reconciliacion: fallo al registrar %s como ajena",
                     symbol)
 
-    def _resolver_reserva(
+    async def _resolver_reserva(
         self, fila: dict, posiciones_exchange: list[PosicionExchange],
-        ahora: int,
+        buscar_orden: FillDeCierre, ahora: int,
     ) -> None:
         """Resuelve una fila `confirmada = 0`: la huella de un proceso que
         murió entre mandar la orden y registrar su resultado.
@@ -743,6 +744,29 @@ class BotRunner:
 
         sin_identificador = any(p.client_oid is None for p in posiciones_exchange)
         if client_oid is None or sin_identificador:
+            # Antes de rendirse: el endpoint de POSICIONES no devuelve el
+            # `clientOid`, pero el de ÓRDENES sí (verificado contra la
+            # simulación). Así que la pregunta "¿llegó a ejecutarse mi
+            # orden?" tiene respuesta, y es la que de verdad importa: si se
+            # ejecutó, hay una posición REAL apalancada -y sin stop, porque
+            # el stop se coloca después de confirmar-. Adoptarla con sus
+            # datos reales es mucho mejor que vetar el símbolo y dejarla sin
+            # gobierno: adoptada, el bot le pondrá su stop y la gestionará.
+            orden = await buscar_orden(fila["symbol"], client_oid)
+            if orden is not None:
+                self._repo.confirmar_apertura(
+                    fila["id"], entry_price=orden.precio,
+                    size=orden.cantidad, fee_entrada=orden.comision,
+                )
+                self._repo.incrementar_contador(
+                    self._cfg.modo, "reserva adoptada por historial")
+                log.warning(
+                    "bot: reconciliacion: %s (client_oid=%r) no se pudo "
+                    "correlacionar contra las posiciones, pero SI aparece "
+                    "ejecutada en el historial de ordenes; se adopta con sus "
+                    "datos reales (precio %.6g, tamano %.6g)",
+                    fila["symbol"], client_oid, orden.precio, orden.cantidad)
+                return
             self._repo.incrementar_contador(
                 self._cfg.modo, "reserva sin correlacionar")
             # Y se VETA el símbolo (hallazgo de revisión de la Task 13). Dejar
