@@ -251,7 +251,8 @@ async def test_ciclo_completo_abrir_stop_mover_cerrar_cancelar(broker, privado):
             "supuesto 5 (si modify-tpsl-order conserva el orderId)",
         ):
             stop_id_tras_mover = await broker.mover_stop(
-                symbol=SYMBOL_DEMO, stop_id=stop_id, precio_disparo=precio_stop_2,
+                symbol=SYMBOL_DEMO, stop_id=stop_id,
+                precio_disparo=precio_stop_2, cantidad=orden.cantidad,
             )
         stop_ids_vistos.append(stop_id_tras_mover)
         assert stop_id_tras_mover, (

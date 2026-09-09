@@ -56,9 +56,10 @@ class FakeBitgetPrivate:
         })
         return stop_id
 
-    async def mover_stop(self, symbol, stop_id, precio_disparo) -> str:
+    async def mover_stop(self, symbol, stop_id, precio_disparo, cantidad) -> str:
         self.stops_movidos.append({
             "symbol": symbol, "stop_id": stop_id, "precio_disparo": precio_disparo,
+            "cantidad": cantidad,
         })
         return stop_id
 
@@ -181,7 +182,7 @@ async def test_colocar_stop_rechaza_precio_de_disparo_no_positivo():
 async def test_mover_stop_delega_en_el_cliente_y_devuelve_su_id():
     broker, fake = _broker()
     nuevo_id = await broker.mover_stop(symbol="BTCUSDT", stop_id="exchange-order-1",
-                                       precio_disparo=99.0)
+                                       precio_disparo=99.0, cantidad=4.0)
     assert nuevo_id == "exchange-order-1"
     assert fake.stops_movidos[0]["precio_disparo"] == pytest.approx(99.0)
 
@@ -192,7 +193,7 @@ async def test_mover_stop_de_id_que_no_corresponde_a_un_stop_vivo_lanza_valueerr
     traducirlo a ValueError, igual que PaperBroker."""
 
     class PrivadoQueRechaza(FakeBitgetPrivate):
-        async def mover_stop(self, symbol, stop_id, precio_disparo) -> str:
+        async def mover_stop(self, symbol, stop_id, precio_disparo, cantidad) -> str:
             raise RuntimeError(
                 "Bitget devolvió code=40768 msg=order does not exist "
                 "en /api/v2/mix/order/modify-tpsl-order"
@@ -201,7 +202,7 @@ async def test_mover_stop_de_id_que_no_corresponde_a_un_stop_vivo_lanza_valueerr
     broker, _ = _broker(PrivadoQueRechaza())
     with pytest.raises(ValueError):
         await broker.mover_stop(symbol="BTCUSDT", stop_id="id-que-no-existe",
-                                precio_disparo=99.0)
+                                precio_disparo=99.0, cantidad=4.0)
 
 
 async def test_cancelar_stop_normal_delega_en_el_cliente():

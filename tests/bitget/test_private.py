@@ -369,7 +369,15 @@ async def test_colocar_orden_de_cierre_va_reduce_only():
 
 async def test_colocar_stop_siempre_va_reduce_only_y_traduce_el_hold_side():
     """Un stop que cierra un LONG manda lado 'sell'; BitgetPrivate lo traduce
-    a holdSide='long' para place-tpsl-order y marca reduceOnly='YES'."""
+    a holdSide='buy' para place-tpsl-order y marca reduceOnly='YES'.
+
+    OJO con el vocabulario, que es contraintuitivo y costo una ronda:
+    `holdSide` NO es "long"/"short" sino "buy"/"sell", donde "buy" es la
+    posicion LARGA. Mandar "long" hace que Bitget rechace con code=43011
+    (observado contra la simulacion). Y no es un simple error de validacion:
+    mandar el contrario coloca el stop sobre el otro lado -sobre una
+    posicion larga, holdSide="sell" devuelve code=45122 hablando de la
+    posicion CORTA."""
     priv, cliente = _privado({"code": "00000", "data": {"orderId": "stop-1"}})
     stop_id = await priv.colocar_stop(
         symbol="BTCUSDT", lado="sell", cantidad=4.0,
@@ -377,24 +385,26 @@ async def test_colocar_stop_siempre_va_reduce_only_y_traduce_el_hold_side():
     )
     assert stop_id == "stop-1"
     cuerpo = json.loads(cliente.peticiones[0]["content"])
-    assert cuerpo["holdSide"] == "long"
+    assert cuerpo["holdSide"] == "buy"
     assert cuerpo["reduceOnly"] == "YES"
     assert cuerpo["triggerPrice"] == "97.5"
 
 
-async def test_colocar_stop_de_un_short_traduce_hold_side_short():
+async def test_colocar_stop_de_un_short_traduce_hold_side_sell():
     priv, cliente = _privado({"code": "00000", "data": {"orderId": "stop-2"}})
     await priv.colocar_stop(
         symbol="BTCUSDT", lado="buy", cantidad=4.0,
         precio_disparo=105.0, client_oid="oid-stop-2",
     )
     cuerpo = json.loads(cliente.peticiones[0]["content"])
-    assert cuerpo["holdSide"] == "short"
+    # cerrar un SHORT es comprar -> la posicion se identifica como "sell"
+    assert cuerpo["holdSide"] == "sell"
 
 
 async def test_mover_stop_manda_el_order_id_y_el_nuevo_precio():
     priv, cliente = _privado({"code": "00000", "data": {"orderId": "stop-1"}})
-    nuevo_id = await priv.mover_stop(symbol="BTCUSDT", stop_id="stop-1", precio_disparo=99.0)
+    nuevo_id = await priv.mover_stop(symbol="BTCUSDT", stop_id="stop-1", precio_disparo=99.0,
+                                    cantidad=4.0)
     assert nuevo_id == "stop-1"
     cuerpo = json.loads(cliente.peticiones[0]["content"])
     assert cuerpo["orderId"] == "stop-1"
@@ -403,7 +413,8 @@ async def test_mover_stop_manda_el_order_id_y_el_nuevo_precio():
 
 async def test_mover_stop_sin_order_id_en_la_respuesta_conserva_el_recibido():
     priv, _ = _privado({"code": "00000", "data": {}})
-    nuevo_id = await priv.mover_stop(symbol="BTCUSDT", stop_id="stop-1", precio_disparo=99.0)
+    nuevo_id = await priv.mover_stop(symbol="BTCUSDT", stop_id="stop-1", precio_disparo=99.0,
+                                    cantidad=4.0)
     assert nuevo_id == "stop-1"
 
 

@@ -136,6 +136,7 @@ class BitgetBroker:
 
     async def mover_stop(
         self, *, symbol: str, stop_id: str, precio_disparo: float,
+        cantidad: float,
     ) -> str:
         """Modifica el precio de un stop vivo. Si Bitget rechaza la
         modificación porque `stop_id` no corresponde a un plan order vivo
@@ -152,6 +153,7 @@ class BitgetBroker:
         try:
             return await self._privado.mover_stop(
                 symbol=symbol, stop_id=stop_id, precio_disparo=precio_disparo,
+                cantidad=cantidad,
             )
         except RuntimeError as exc:
             raise ValueError(

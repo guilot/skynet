@@ -50,6 +50,7 @@ class Broker(Protocol):
 
     async def mover_stop(
         self, *, symbol: str, stop_id: str, precio_disparo: float,
+        cantidad: float,
     ) -> str: ...
 
     async def cancelar_stop(self, *, symbol: str, stop_id: str) -> None: ...
@@ -130,8 +131,16 @@ class PaperBroker:
 
     async def mover_stop(
         self, *, symbol: str, stop_id: str, precio_disparo: float,
+        cantidad: float,
     ) -> str:
         """Sustituye el stop vivo de `symbol` por uno nuevo al precio dado.
+
+        `cantidad` no se usa aquí -este broker no tiene un libro que
+        dimensionar- pero es obligatoria en la firma porque Bitget la exige
+        al modificar un stop (`code=400172 "Order quantity cannot be empty"`,
+        observado): si fuera opcional, el broker de papel aceptaría llamadas
+        que el real rechaza, y la diferencia solo aparecería con dinero
+        delante.
 
         En un exchange real mover un stop es cancelar el viejo y colocar
         otro -no hay una orden "editar"-, así que el `stop_id` cambia. Aquí

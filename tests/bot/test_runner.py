@@ -515,13 +515,14 @@ class _BrokerConRegistroDeStops:
         ))
         return stop_id
 
-    async def mover_stop(self, *, symbol, stop_id, precio_disparo):
+    async def mover_stop(self, *, symbol, stop_id, precio_disparo, cantidad):
         nuevo_id = await self._interno.mover_stop(
             symbol=symbol, stop_id=stop_id, precio_disparo=precio_disparo,
+            cantidad=cantidad,
         )
         self.stops_movidos.append(StopVivo(
             stop_id=nuevo_id, symbol=symbol, precio_disparo=precio_disparo,
-            cantidad=0.0,
+            cantidad=cantidad,
         ))
         return nuevo_id
 

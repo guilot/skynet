@@ -112,6 +112,11 @@ def _formato_decimal(valor: float) -> str:
 # no ha dimensionado.
 MODO_MARGEN = "isolated"
 
+# El tipo de plan order de los stops de pérdida. CONFIRMADO contra la
+# simulación: `place-tpsl-order` y `modify-tpsl-order` lo aceptan con este
+# valor. Este bot solo coloca stops de pérdida, nunca de beneficio.
+PLAN_TYPE_STOP = "loss_plan"
+
 
 def _moneda_de_margen(venue: str) -> str:
     """La moneda de margen que corresponde a un `productType`.
@@ -395,23 +400,30 @@ class BitgetPrivate:
 
     @staticmethod
     def _hold_side_desde_lado(lado: str) -> str:
-        """Traduce el lado de una orden de cierre/stop ("buy"/"sell") al lado
-        de la POSICIÓN que cierra ("long"/"short"), que es lo que exige el
-        endpoint de plan orders (place-tpsl-order y afines) vía `holdSide`.
+        """Traduce el lado de una orden de cierre/stop ("buy"/"sell") al
+        `holdSide` que identifica la POSICIÓN sobre la que actúa el stop.
 
-        Una orden de venta reduce-only cierra un LONG; una de compra
-        reduce-only cierra un SHORT. Es la misma relación que usa
-        `BitgetBroker` para decidir el lado de la orden de cierre a partir
-        de `Direction`, solo que en sentido inverso.
+        CORREGIDO tras ejecutar el banco contra la simulación: `holdSide` NO
+        usa el vocabulario de posición ("long"/"short") sino el de orden
+        ("buy"/"sell"), donde **"buy" identifica la posición larga y "sell"
+        la corta** -es decir, el lado con el que se ABRIÓ la posición, no el
+        de la orden que la cierra-. Mandar "long"/"short" hace que Bitget
+        rechace con `code=43011 "The parameter does not meet the
+        specification holdSide error"` (observado).
 
-        SUPUESTO SIN VERIFICAR (ver informe de la tarea): que
-        `place-tpsl-order` identifica el lado por `holdSide` y no por
-        `side`. Pendiente de confirmar contra la cuenta de simulación.
+        Que discrimina de verdad también está comprobado: sobre una posición
+        LARGA, un `holdSide="sell"` no se ignora, se interpreta como la
+        posición CORTA y Bitget contesta `code=45122 "Short position stop
+        loss price please > mark price"`. Equivocar este campo no da un
+        error de validación: coloca el stop sobre el lado contrario.
+
+        Una orden de venta reduce-only cierra un LONG -> holdSide "buy";
+        una de compra reduce-only cierra un SHORT -> holdSide "sell".
         """
         if lado == "sell":
-            return "long"
+            return "buy"
         if lado == "buy":
-            return "short"
+            return "sell"
         raise ValueError(f"lado desconocido: {lado!r} (se esperaba 'buy' o 'sell')")
 
     async def colocar_orden(
@@ -456,7 +468,7 @@ class BitgetPrivate:
             **self._product_params,
             "symbol": symbol,
             "marginCoin": self._margin_coin,
-            "planType": "loss_plan",
+            "planType": PLAN_TYPE_STOP,
             "triggerPrice": _formato_decimal(precio_disparo),
             "triggerType": "mark_price",
             "holdSide": self._hold_side_desde_lado(lado),
@@ -470,15 +482,17 @@ class BitgetPrivate:
         payload = await self._pedir("POST", "/api/v2/mix/order/place-tpsl-order", body=cuerpo)
         return payload.get("data", {}).get("orderId", "")
 
-    async def mover_stop(self, symbol: str, stop_id: str, precio_disparo: float) -> str:
+    async def mover_stop(
+        self, symbol: str, stop_id: str, precio_disparo: float, cantidad: float,
+    ) -> str:
         """Modifica el precio de disparo de un stop vivo. Devuelve el
         `orderId` del stop tras la modificación.
 
-        SUPUESTO SIN VERIFICAR: que `modify-tpsl-order` conserva el mismo
-        `orderId` tras modificar el precio (a diferencia del `PaperBroker`,
-        donde mover = cancelar + recolocar y el id cambia). Si Bitget
-        devolviera un `orderId` distinto en `data`, se usa ese; si no viene
-        en la respuesta, se conserva el `stop_id` recibido.
+        CONFIRMADO contra la simulación: `modify-tpsl-order` **conserva el
+        mismo `orderId`** tras modificar el precio (a diferencia del
+        `PaperBroker`, donde mover = cancelar + recolocar y el id cambia).
+        Se sigue leyendo el `orderId` de la respuesta por si algún día
+        cambiara; si no viene, se conserva el `stop_id` recibido.
         """
         cuerpo = {
             **self._product_params,
@@ -486,6 +500,15 @@ class BitgetPrivate:
             "marginCoin": self._margin_coin,
             "orderId": stop_id,
             "triggerPrice": _formato_decimal(precio_disparo),
+            # `size` y `planType` son OBLIGATORIOS aunque solo se cambie el
+            # precio: sin `size`, Bitget responde `code=400172 "Order
+            # quantity cannot be empty"` (observado contra la simulación).
+            # Que haya que remandarlos tiene una ventaja: el stop del
+            # exchange queda siempre dimensionado a lo que de verdad sigue
+            # abierto, en vez de conservar la cantidad original tras una
+            # salida parcial.
+            "size": _formato_decimal(cantidad),
+            "planType": PLAN_TYPE_STOP,
         }
         payload = await self._pedir("POST", "/api/v2/mix/order/modify-tpsl-order", body=cuerpo)
         return payload.get("data", {}).get("orderId") or stop_id
@@ -505,7 +528,7 @@ class BitgetPrivate:
             "symbol": symbol,
             "marginCoin": self._margin_coin,
             "orderId": stop_id,
-            "planType": "loss_plan",
+            "planType": PLAN_TYPE_STOP,
         }
         await self._pedir("POST", "/api/v2/mix/order/cancel-plan-order", body=cuerpo)
 

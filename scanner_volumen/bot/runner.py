@@ -1033,6 +1033,11 @@ class BotRunner:
         try:
             nuevo_id = await self._broker.mover_stop(
                 symbol=pos.symbol, stop_id=pos.stop_id, precio_disparo=nuevo_precio,
+                # Lo que de VERDAD sigue abierto, no el tamaño original:
+                # tras una salida parcial el stop del exchange debe cubrir
+                # solo el resto. Bitget obliga a remandar la cantidad al
+                # modificar, así que aquí se aprovecha para mantenerlo al día.
+                cantidad=pos.size * pos.reglas.restante,
             )
         except Exception:
             log.exception(
