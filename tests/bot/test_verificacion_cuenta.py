@@ -21,12 +21,14 @@ class LectorFalso:
     cacheo sin ninguna dependencia de red."""
 
     def __init__(self, respuestas: dict[str, ConfiguracionCuentaSymbol]):
-        self._respuestas = respuestas
+        # publico: el doble del ajustador lo muta para simular que el
+        # exchange aplico el cambio, y asi poder probar la RELECTURA.
+        self.configs = respuestas
         self.llamadas: list[str] = []
 
     async def __call__(self, symbol: str) -> ConfiguracionCuentaSymbol:
         self.llamadas.append(symbol)
-        return self._respuestas[symbol]
+        return self.configs[symbol]
 
 
 class LectorQueFallaLaPrimeraVez:
@@ -169,3 +171,83 @@ async def test_un_simbolo_bien_configurado_en_una_via_no_se_veta():
     v = VerificadorCuenta(p, lector)
 
     assert await v.verificar("AAAUSDT") is None
+
+
+# --- ajuste automatico de la configuracion del simbolo ---
+
+
+class AjustadorFalso:
+    """Doble del ajustador: apunta lo que se le pide y muta la configuracion
+    que devolvera el lector, para poder comprobar la RELECTURA."""
+
+    def __init__(self, lector, config_tras_ajuste=None):
+        self._lector = lector
+        self._config_tras_ajuste = config_tras_ajuste
+        self.llamadas = []
+
+    async def __call__(self, symbol, apalancamiento):
+        self.llamadas.append((symbol, apalancamiento))
+        if self._config_tras_ajuste is not None:
+            self._lector.configs[symbol] = self._config_tras_ajuste
+
+
+async def test_un_simbolo_mal_configurado_se_ajusta_y_deja_de_vetarse():
+    """El caso que motiva todo esto: el margen y el apalancamiento son por
+    simbolo y no se heredan, asi que sin ajuste el bot vetaria casi todos
+    los pares en los que el escaner encuentra senal."""
+    p = StrategyParams()
+    lector = LectorFalso({"AAAUSDT": _config(aislado=False, long_=10.0, short=10.0)})
+    ajustador = AjustadorFalso(
+        lector, _config(aislado=True, long_=p.apalancamiento, short=p.apalancamiento))
+    v = VerificadorCuenta(p, lector, ajustador)
+
+    assert await v.verificar("AAAUSDT") is None
+    assert ajustador.llamadas == [("AAAUSDT", p.apalancamiento)]
+
+
+async def test_si_tras_ajustar_sigue_sin_coincidir_se_veta_igual():
+    """La verificacion mantiene la ULTIMA PALABRA: ajustar no es dar por
+    bueno. Si el exchange acepta la peticion pero la configuracion real no
+    cambia, el simbolo se veta como antes."""
+    p = StrategyParams()
+    lector = LectorFalso({"AAAUSDT": _config(aislado=False, long_=10.0, short=10.0)})
+    ajustador = AjustadorFalso(lector, config_tras_ajuste=None)  # no cambia nada
+    v = VerificadorCuenta(p, lector, ajustador)
+
+    assert await v.verificar("AAAUSDT") == MOTIVO_VETO
+    assert ajustador.llamadas == [("AAAUSDT", p.apalancamiento)]
+
+
+async def test_un_simbolo_ya_correcto_no_se_toca():
+    """Solo se escribe cuando hace falta: si la configuracion ya coincide,
+    el bot no manda ninguna peticion de escritura sobre la cuenta."""
+    p = StrategyParams()
+    lector = LectorFalso({"AAAUSDT": _config(
+        aislado=True, long_=p.apalancamiento, short=p.apalancamiento)})
+    ajustador = AjustadorFalso(lector)
+    v = VerificadorCuenta(p, lector, ajustador)
+
+    assert await v.verificar("AAAUSDT") is None
+    assert ajustador.llamadas == []
+
+
+async def test_el_modo_de_posicion_NO_se_ajusta_nunca():
+    """El modo de posicion es de CUENTA, no de simbolo: cambiarlo afectaria
+    a toda la operativa del usuario, incluida la manual. Se veta y se avisa,
+    pero no se toca -ni siquiera con el ajustador conectado."""
+    p = StrategyParams()
+    lector = LectorFalso({"AAAUSDT": _config(
+        una_via=False, aislado=True, long_=p.apalancamiento, short=p.apalancamiento)})
+    ajustador = AjustadorFalso(lector)
+    v = VerificadorCuenta(p, lector, ajustador)
+
+    assert await v.verificar("AAAUSDT") == MOTIVO_VETO
+    assert ajustador.llamadas == []
+
+
+async def test_sin_ajustador_el_comportamiento_es_el_de_siempre():
+    """El ajustador es opcional: sin el, solo verifica y veta."""
+    lector = LectorFalso({"AAAUSDT": _config(aislado=False)})
+    v = VerificadorCuenta(StrategyParams(), lector)
+
+    assert await v.verificar("AAAUSDT") == MOTIVO_VETO

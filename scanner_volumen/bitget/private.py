@@ -431,6 +431,39 @@ class BitgetPrivate:
             return "sell"
         raise ValueError(f"lado desconocido: {lado!r} (se esperaba 'buy' o 'sell')")
 
+    async def ajustar_configuracion_symbol(
+        self, symbol: str, apalancamiento: float,
+    ) -> None:
+        """Pone UN símbolo en margen aislado y al apalancamiento dado.
+
+        **Es la única escritura de este cliente que no es una orden**, y por
+        eso lleva este aviso: el resto del bot asume que nada toca la
+        configuración de la cuenta salvo por esta vía, que solo se invoca
+        desde `VerificadorCuenta` y solo para el símbolo en el que el bot va
+        a entrar.
+
+        Por qué existe: en Bitget el margen y el apalancamiento son POR
+        SÍMBOLO y no se heredan -verificado: cambiar BTC dejó ETH y XRP como
+        estaban-. El escáner entra en el par que dé señal, de entre cientos,
+        así que exigir que estén todos preconfigurados a mano significaba,
+        en la práctica, no operar ninguno.
+
+        No comprueba el resultado: de eso se encarga quien llama, releyendo
+        la configuración después. Si Bitget rechaza el cambio -por ejemplo
+        porque hay una posición abierta en ese símbolo- la excepción sube,
+        y el veto de `VerificadorCuenta` sigue siendo la última palabra.
+        """
+        base = {**self._product_params, "symbol": symbol,
+                "marginCoin": self._margin_coin}
+        await self._pedir(
+            "POST", "/api/v2/mix/account/set-margin-mode",
+            body={**base, "marginMode": MODO_MARGEN},
+        )
+        await self._pedir(
+            "POST", "/api/v2/mix/account/set-leverage",
+            body={**base, "leverage": _formato_decimal(apalancamiento)},
+        )
+
     async def colocar_orden(
         self, symbol: str, lado: str, cantidad: float, reduce_only: bool, client_oid: str,
     ) -> str:

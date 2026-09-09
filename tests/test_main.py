@@ -495,6 +495,7 @@ class PrivadoFalso:
         self._posiciones = list(posiciones)
         self.consultas_de_saldo = 0
         self.consultas_de_posiciones = 0
+        self.ajustes = []
 
     async def get_saldo(self):
         self.consultas_de_saldo += 1
@@ -515,6 +516,11 @@ class PrivadoFalso:
             apalancamiento_short=float(StrategyParams().apalancamiento),
             modo_una_via=True,
         )
+
+    async def ajustar_configuracion_symbol(self, symbol, apalancamiento):
+        # la unica escritura de este cliente que no es una orden; se apunta
+        # para que los tests puedan comprobar QUIEN la recibe y en que modo.
+        self.ajustes.append((symbol, apalancamiento))
 
 
 def _entorno_con_claves():
@@ -1292,3 +1298,36 @@ async def test_si_la_orden_no_aparece_en_el_historial_devuelve_none():
     proveedor = hacer_fill_de_cierre(privado)
 
     assert await proveedor("SBTCSUSDT", "stop-que-no-aparece") is None
+
+
+# --- el ajuste de la configuracion solo existe en `real` ---
+
+
+async def test_en_real_el_verificador_puede_ajustar_la_configuracion(
+    monkeypatch, tmp_path,
+):
+    """El bot corrige la configuracion del simbolo en el que va a entrar.
+
+    Hizo falta porque en Bitget el margen y el apalancamiento son POR
+    SIMBOLO y no se heredan (verificado contra la cuenta real: cambiar BTC
+    dejo ETH y XRP como estaban), y el escaner entra en el par que de senal
+    de entre cientos: sin esto el bot vetaba practicamente todo."""
+    capt = await _arrancar_main(monkeypatch, tmp_path, modo_config="real",
+                                valor_env="ordenes", privado=PrivadoFalso())
+
+    verificador = capt.runner_kwargs[1]["verificador"]
+    assert verificador._ajustador is not None
+
+
+async def test_en_real_lectura_el_verificador_NO_puede_ajustar_nada(
+    monkeypatch, tmp_path,
+):
+    """El escalon intermedio existe para ensayar SIN tocar nada, y eso
+    incluye la configuracion de la cuenta, no solo las ordenes. Si alguien
+    rompe esto, `real_lectura` empezaria a escribir en la cuenta creyendo
+    que solo lee."""
+    capt = await _arrancar_main(monkeypatch, tmp_path, modo_config="real",
+                                valor_env="lectura", privado=PrivadoFalso())
+
+    verificador = capt.runner_kwargs[1]["verificador"]
+    assert verificador._ajustador is None

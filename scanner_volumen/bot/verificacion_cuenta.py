@@ -75,6 +75,10 @@ log = logging.getLogger(__name__)
 MOTIVO_VETO = "config cuenta"
 
 LectorConfiguracionCuenta = Callable[[str], Awaitable[ConfiguracionCuentaSymbol]]
+# `(symbol, apalancamiento) -> None`. Pone el símbolo en margen aislado al
+# apalancamiento de la estrategia. Opcional: sin él, el verificador solo
+# verifica y veta, que es como nació.
+AjustadorConfiguracionCuenta = Callable[[str, float], Awaitable[None]]
 
 # Tolerancia para comparar apalancamientos en punto flotante: vienen de
 # cadenas JSON parseadas con `float()` (ver `BitgetPrivate.
@@ -95,9 +99,31 @@ class VerificadorCuenta:
     asume. Cachea el resultado por símbolo para no repetir la consulta al
     exchange en cada entrada."""
 
-    def __init__(self, params: StrategyParams, lector: LectorConfiguracionCuenta) -> None:
+    def __init__(
+        self, params: StrategyParams, lector: LectorConfiguracionCuenta,
+        ajustador: AjustadorConfiguracionCuenta | None = None,
+    ) -> None:
+        """`ajustador` es opcional. Sin él, este verificador solo verifica y
+        veta -como nació-. Con él, intenta CORREGIR la configuración del
+        símbolo antes de vetarlo.
+
+        **Por qué se le permite escribir**, cuando el resto de la fase se
+        construyó sobre la regla contraria: el margen y el apalancamiento en
+        Bitget son por símbolo y no se heredan, y el escáner entra en el par
+        que dé señal de entre cientos. Con la regla estricta el bot vetaba
+        casi todo, así que la regla protegía la cuenta de un modo perfecto e
+        inútil. El ajuste queda acotado a lo mínimo: solo el símbolo en el
+        que se va a entrar, solo a los valores de la estrategia, y solo
+        sobre símbolos SIN posición abierta -el bot únicamente entra donde
+        no tiene nada, así que no puede alterar el margen de una posición
+        que alguien lleve a mano.
+
+        Lo que NO cambia: la verificación sigue teniendo la última palabra.
+        Tras ajustar se relee la configuración, y si aun así no coincide, se
+        veta igual."""
         self._params = params
         self._lector = lector
+        self._ajustador = ajustador
         self._cache: dict[str, str | None] = {}
 
     async def verificar(self, symbol: str) -> str | None:
@@ -125,8 +151,33 @@ class VerificadorCuenta:
             self._cache[symbol] = await self._verificar_sin_cache(symbol)
         return self._cache[symbol]
 
+    def _necesita_ajuste(self, config: ConfiguracionCuentaSymbol) -> bool:
+        """True si el margen o el apalancamiento no son los que la estrategia
+        asume. NO incluye el modo de posición: ese es de CUENTA, no de
+        símbolo, y este bot no lo toca -cambiarlo afectaría a toda la
+        operativa del usuario, incluida la manual."""
+        esperado = self._params.apalancamiento
+        return (
+            not config.margen_aislado
+            or not math.isclose(config.apalancamiento_long, esperado, rel_tol=1e-9)
+            or not math.isclose(config.apalancamiento_short, esperado, rel_tol=1e-9)
+        )
+
     async def _verificar_sin_cache(self, symbol: str) -> str | None:
         config = await self._lector(symbol)
+        if self._ajustador is not None and self._necesita_ajuste(config):
+            # Se intenta corregir ANTES de decidir. Un fallo del ajuste no
+            # se traga: si Bitget lo rechaza -p. ej. porque hay una posición
+            # abierta en ese símbolo-, la excepción sube y esta consulta no
+            # se cachea, así que el símbolo se reintentará. Lo que NO se
+            # hace es dar por bueno el ajuste: se relee.
+            log.warning(
+                "bot: %s no esta en margen aislado a %.6g; se AJUSTA la "
+                "configuracion de ese simbolo (unica escritura de este bot "
+                "sobre la cuenta) y se vuelve a verificar",
+                symbol, self._params.apalancamiento)
+            await self._ajustador(symbol, self._params.apalancamiento)
+            config = await self._lector(symbol)
         # El modo de posición se comprueba PRIMERO porque es el más grave de
         # los tres: sin modo unilateral no existe `reduceOnly`, y `reduceOnly`
         # es lo que impide que una orden de cierre pueda abrir una posición

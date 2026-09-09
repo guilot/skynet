@@ -78,10 +78,29 @@ revés.
    sin verificar mientras no se ejecute el banco de integración con claves de
    demo. Hasta entonces, el modo real es código probado contra un exchange
    imaginario.
-2. En Bitget, cada símbolo que se vaya a operar debe estar en **margen
-   aislado** y al apalancamiento que asume la estrategia. El bot lo comprueba
-   por símbolo antes de su primera entrada y **veta** el que no coincida: nunca
-   cambia la configuración de la cuenta por su cuenta.
+2. **El modo de posición de la cuenta debe ser unilateral (one-way).** Es lo
+   único de la configuración que el bot NO ajusta por su cuenta: es un ajuste
+   de cuenta, no de símbolo, y cambiarlo afectaría también a tu operativa
+   manual. Si no lo está, el bot veta todos los símbolos y lo dice en el log.
+
+   No es una preferencia: en modo cobertura Bitget rechaza las órdenes
+   `reduceOnly` con `code=40774`, y todos los cierres y stops de este bot son
+   reduce-only. Sin modo unilateral el bot podría abrir y luego no poder
+   cerrar.
+
+   El **margen aislado y el apalancamiento** sí los ajusta el bot, por
+   símbolo y justo antes de su primera entrada en él, porque en Bitget son
+   por par y no se heredan -tenerlos todos preconfigurados a mano no es
+   viable con un escáner que entra donde salta la señal-. El ajuste está
+   acotado: solo el símbolo en el que va a entrar, solo a los valores de la
+   estrategia, y solo sobre símbolos sin posición abierta (el bot únicamente
+   entra donde no tiene nada, así que no puede alterar el margen de algo que
+   lleves tú a mano). Después **relee y, si aun así no coincide, veta**. Se
+   ve en el log como "se AJUSTA la configuracion de ese simbolo".
+
+   En `SCANNER_BOT_REAL=lectura` el ajuste está **desconectado**: ese escalón
+   ensaya sin escribir nada en la cuenta.
+
 3. El freno de emergencia se acciona creando el fichero indicado por
    `bot.fichero_parada` en `config.toml` (por defecto `data/parar_bot`, relativo
    al `WorkingDirectory` del servicio). Con él presente no se abren entradas

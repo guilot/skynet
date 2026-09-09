@@ -763,8 +763,16 @@ async def main(argv: list[str] | None = None) -> None:
                 # Perezoso y por símbolo: en Bitget el apalancamiento no es
                 # de la cuenta, así que aquí solo se construye; se consulta
                 # antes de la primera entrada de cada par (Task 11).
+                # El ajustador solo se conecta en `real`: en `real_lectura`
+                # el bot no manda ordenes, asi que tampoco debe ESCRIBIR en
+                # la configuracion de la cuenta -ese escalon existe para
+                # ensayar sin tocar nada. Sin ajustador, el verificador se
+                # comporta como nacio: verifica y veta.
                 verificador = VerificadorCuenta(
-                    params, piezas.privado.get_configuracion_symbol)
+                    params, piezas.privado.get_configuracion_symbol,
+                    ajustador=(piezas.privado.ajustar_configuracion_symbol
+                               if modo == REAL else None),
+                )
             # Los frenos se cablean en TODOS los modos -pero no los dos
             # frenos en todos (corrección de la ronda de revisión, que separó
             # lo que yo había juntado):
