@@ -127,6 +127,23 @@ class VerificadorCuenta:
 
     async def _verificar_sin_cache(self, symbol: str) -> str | None:
         config = await self._lector(symbol)
+        # El modo de posición se comprueba PRIMERO porque es el más grave de
+        # los tres: sin modo unilateral no existe `reduceOnly`, y `reduceOnly`
+        # es lo que impide que una orden de cierre pueda abrir una posición
+        # contraria. En `hedge_mode` Bitget rechaza todo cierre de este bot
+        # con `code=40774` (observado contra la simulación en la Task 12), así
+        # que el bot podría ABRIR y luego no poder cerrar -exactamente la
+        # situación que esta fase entera existe para hacer imposible.
+        if not config.modo_una_via:
+            log.error(
+                "bot: %s no esta en modo de posicion unilateral (one-way); "
+                "se veta el simbolo -- sin el, las ordenes reduce-only que "
+                "este bot usa para CERRAR son rechazadas por Bitget, asi que "
+                "podria abrirse una posicion que luego no se puede cerrar. "
+                "Cambialo a mano en Bitget (es un ajuste de cuenta, no por "
+                "simbolo); el bot NUNCA lo cambia por su cuenta", symbol,
+            )
+            return MOTIVO_VETO
         if not config.margen_aislado:
             log.warning(
                 "bot: %s no esta en margen aislado; se veta el simbolo "

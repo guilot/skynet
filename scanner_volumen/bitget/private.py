@@ -52,18 +52,27 @@ class ConfiguracionCuentaSymbol:
     `scanner_volumen.bot.verificacion_cuenta`, que es quien decide qué hacer
     con esta información -este cliente solo la reporta, fielmente).
 
-    SUPUESTO SIN VERIFICAR (pendiente de confirmar contra la cuenta de
-    simulación en la Task 12): el endpoint candidato es
-    `GET /api/v2/mix/account/account` (singular, con `symbol` + `marginCoin`
-    + `productType`). Se asume que devuelve `marginMode` con valores
-    "isolated" / "crossed", y que el apalancamiento aislado viaja en dos
-    campos separados, `isolatedLongLever` e `isolatedShortLever` -Bitget
-    permite apalancamiento distinto por lado en margen aislado-. Ninguno de
-    estos tres nombres de campo se ha probado contra la API real.
+    CONFIRMADO contra la cuenta de simulación (Task 12, ejecutado): el
+    endpoint es `GET /api/v2/mix/account/account` (singular, con `symbol` +
+    `marginCoin` + `productType`), y devuelve `marginMode` con valores
+    "isolated"/"crossed", `isolatedLongLever` e `isolatedShortLever` (como
+    enteros, no cadenas) y `posMode` con valores "one_way_mode"/"hedge_mode".
+
+    **`modo_una_via` no es un detalle de configuración: es la condición sin
+    la cual la garantía central de esta fase no existe.** Todo cierre y todo
+    stop que manda este bot son `reduceOnly`, que es lo que impide que una
+    orden de cierre pueda ABRIR una posición contraria por error. Y
+    `reduceOnly` solo existe en modo de posición unilateral: en `hedge_mode`
+    Bitget rechaza la orden con `code=40774 "The order type for unilateral
+    position must also be the unilateral position type."` (observado, no
+    supuesto). O sea que en `hedge_mode` el bot no podría cerrar nada, y la
+    alternativa que Bitget ofrece ahí -`tradeSide: "close"`- NO tiene la
+    propiedad de reduce-only que la seguridad de esta fase asume.
     """
     margen_aislado: bool
     apalancamiento_long: float
     apalancamiento_short: float
+    modo_una_via: bool
 
 
 @dataclass(frozen=True)
@@ -93,6 +102,43 @@ def _formato_decimal(valor: float) -> str:
     return formateado if formateado else "0"
 
 
+# El modo de margen que la estrategia asume y que `VerificacionCuenta` exige
+# por símbolo antes de la primera entrada: si el símbolo no está en aislado,
+# el bot VETA en vez de operarlo (y nunca cambia la configuración de la
+# cuenta). Mandarlo en la orden es obligatorio -Bitget rechaza `place-order`
+# sin él con `code=400172 "The margin mode cannot be empty"` (observado
+# contra la cuenta de simulación)- y el valor coherente es exactamente el
+# que se verifica: pedir "crossed" aquí abriría en un modo que la estrategia
+# no ha dimensionado.
+MODO_MARGEN = "isolated"
+
+
+def _moneda_de_margen(venue: str) -> str:
+    """La moneda de margen que corresponde a un `productType`.
+
+    NO es siempre `"USDT"`, y darlo por hecho fue un defecto real que solo
+    apareció al ejecutar el banco de pruebas contra la cuenta de simulación:
+    con `productType = "SUSDT-FUTURES"` la moneda es `SUSDT`, y mandar
+    `USDT` hace que Bitget rechace la petición con
+    `code=40778 "SBTCSUSDT does not support USDT currency as margin"`
+    (observado, no supuesto). Antes de esto la moneda estaba escrita a mano
+    en seis sitios de este fichero, lo que ataba el cliente a un único
+    entorno sin que nada lo dijera.
+
+    La regla es el propio `productType` sin su sufijo: `USDT-FUTURES` ->
+    `USDT`, `SUSDT-FUTURES` -> `SUSDT`, `USDC-FUTURES` -> `USDC`.
+    """
+    sin_sufijo = venue.removesuffix("-FUTURES")
+    if not sin_sufijo or sin_sufijo == venue:
+        raise ValueError(
+            f"productType inesperado: {venue!r} (se esperaba algo como "
+            f"'USDT-FUTURES' o 'SUSDT-FUTURES'). No se adivina la moneda de "
+            f"margen: mandar la equivocada hace que Bitget rechace todas las "
+            f"peticiones de esta cuenta."
+        )
+    return sin_sufijo
+
+
 class BitgetPrivate:
     """Cliente autenticado para Bitget con firma de peticiones.
 
@@ -116,6 +162,7 @@ class BitgetPrivate:
         self._api_secret = api_secret
         self._passphrase = passphrase
         self._product_params = {"productType": venue}
+        self._margin_coin = _moneda_de_margen(venue)
 
     def __repr__(self) -> str:
         """Representación que no expone las credenciales."""
@@ -208,8 +255,25 @@ class BitgetPrivate:
             url,
             **kwargs,
         )
-        resp.raise_for_status()
-        payload = resp.json()
+        # El cuerpo se lee ANTES de mirar el estado HTTP, a propósito. Bitget
+        # manda su diagnóstico útil DENTRO del JSON incluso cuando responde
+        # 4xx: el defecto que motiva esto se vio ejecutando el banco contra la
+        # simulación, donde un `raise_for_status()` previo convertía
+        # `{"code":"40778","msg":"SBTCSUSDT does not support USDT currency as
+        # margin"}` -que nombra el problema exacto- en un `HTTPStatusError:
+        # 400 Bad Request` sin ninguna pista. Perder ese mensaje es perder lo
+        # único que distingue "mandé mal un parámetro" de "la firma está rota",
+        # y esa confusión ya costó una ronda entera de depuración.
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict):
+            resp.raise_for_status()
+            raise RuntimeError(
+                f"Bitget devolvió una respuesta no interpretable en {path} "
+                f"(HTTP {resp.status_code})"
+            )
 
         if payload.get("code") != "00000":
             # NO incluir credenciales en el mensaje de error
@@ -253,12 +317,14 @@ class BitgetPrivate:
         # Seleccionar explícitamente la cuenta en USDT
         data = None
         for item in data_list:
-            if item.get("marginCoin") == "USDT":
+            if item.get("marginCoin") == self._margin_coin:
                 data = item
                 break
 
         if data is None:
-            raise RuntimeError("No se encontró saldo en USDT en Bitget")
+            raise RuntimeError(
+                f"No se encontró saldo en {self._margin_coin} en Bitget"
+            )
 
         if "accountEquity" not in data or "unrealizedPL" not in data:
             # NO se rellena con 0: un campo crítico ausente es una API que
@@ -310,13 +376,21 @@ class BitgetPrivate:
         """
         payload = await self._pedir(
             "GET", "/api/v2/mix/account/account",
-            params={"symbol": symbol, "marginCoin": "USDT"},
+            params={"symbol": symbol, "marginCoin": self._margin_coin},
         )
         data = payload.get("data", {})
         return ConfiguracionCuentaSymbol(
             margen_aislado=(data.get("marginMode") == "isolated"),
             apalancamiento_long=float(data.get("isolatedLongLever", 0)),
             apalancamiento_short=float(data.get("isolatedShortLever", 0)),
+            # Falla cerrado a propósito: cualquier valor que no sea
+            # exactamente "one_way_mode" -incluido un campo ausente o un
+            # nombre que Bitget cambie- se lee como "no es unilateral" y el
+            # símbolo acaba vetado. Equivocarse hacia el veto cuesta no
+            # operar; equivocarse hacia el otro lado significa mandar
+            # cierres que el exchange rechaza y creer que hay una red que no
+            # está.
+            modo_una_via=(data.get("posMode") == "one_way_mode"),
         )
 
     @staticmethod
@@ -350,8 +424,10 @@ class BitgetPrivate:
         ("buy"/"sell"); este cliente no conoce `Direction`.
         """
         cuerpo = {
+            **self._product_params,
             "symbol": symbol,
-            "marginCoin": "USDT",
+            "marginCoin": self._margin_coin,
+            "marginMode": MODO_MARGEN,
             "size": _formato_decimal(cantidad),
             "side": lado,
             "orderType": "market",
@@ -377,8 +453,9 @@ class BitgetPrivate:
         contra la cuenta de simulación (Task 12).
         """
         cuerpo = {
+            **self._product_params,
             "symbol": symbol,
-            "marginCoin": "USDT",
+            "marginCoin": self._margin_coin,
             "planType": "loss_plan",
             "triggerPrice": _formato_decimal(precio_disparo),
             "triggerType": "mark_price",
@@ -404,8 +481,9 @@ class BitgetPrivate:
         en la respuesta, se conserva el `stop_id` recibido.
         """
         cuerpo = {
+            **self._product_params,
             "symbol": symbol,
-            "marginCoin": "USDT",
+            "marginCoin": self._margin_coin,
             "orderId": stop_id,
             "triggerPrice": _formato_decimal(precio_disparo),
         }
@@ -423,8 +501,9 @@ class BitgetPrivate:
         Bitget responde, fielmente y sin interpretarlo.
         """
         cuerpo = {
+            **self._product_params,
             "symbol": symbol,
-            "marginCoin": "USDT",
+            "marginCoin": self._margin_coin,
             "orderId": stop_id,
             "planType": "loss_plan",
         }

@@ -9,9 +9,10 @@ from scanner_volumen.bot.verificacion_cuenta import MOTIVO_VETO, VerificadorCuen
 from scanner_volumen.strategy.model import StrategyParams
 
 
-def _config(aislado=True, long_=20.0, short=20.0):
+def _config(aislado=True, long_=20.0, short=20.0, una_via=True):
     return ConfiguracionCuentaSymbol(
         margen_aislado=aislado, apalancamiento_long=long_, apalancamiento_short=short,
+        modo_una_via=una_via,
     )
 
 
@@ -122,3 +123,49 @@ async def test_pequenas_diferencias_de_punto_flotante_no_vetan():
     })
     verificador = VerificadorCuenta(StrategyParams(apalancamiento=20.0), lector)
     assert await verificador.verificar("AAAUSDT") is None
+
+
+# --- modo de posición unilateral (hallazgo del banco de pruebas, Task 12) ---
+
+
+async def test_un_simbolo_en_hedge_mode_se_veta():
+    """El veto más importante de los tres, y el que faltaba.
+
+    Toda la seguridad de esta fase descansa en que los cierres y los stops
+    van `reduceOnly`: es lo que impide que una orden de cierre abra una
+    posición contraria. Y `reduceOnly` NO existe en modo cobertura: Bitget
+    rechaza esas órdenes con `code=40774 "The order type for unilateral
+    position must also be the unilateral position type."` (observado contra
+    la cuenta de simulación, no supuesto).
+
+    Sin este veto el bot podría ABRIR en una cuenta en `hedge_mode` y luego
+    no poder cerrar -ni por stop, ni a mercado-, que es exactamente la
+    situación que esta fase entera existe para hacer imposible."""
+    lector = LectorFalso({"AAAUSDT": _config(una_via=False)})
+    v = VerificadorCuenta(StrategyParams(), lector)
+
+    assert await v.verificar("AAAUSDT") == MOTIVO_VETO
+
+
+async def test_el_modo_de_posicion_se_comprueba_antes_que_el_resto():
+    """Con las tres cosas mal a la vez, el veto sigue siendo uno solo, pero
+    el orden importa para el log: el modo de posición es el que deja al bot
+    sin poder cerrar, así que es el que hay que nombrar primero."""
+    lector = LectorFalso({"AAAUSDT": _config(una_via=False, aislado=False,
+                                             long_=1.0, short=1.0)})
+    v = VerificadorCuenta(StrategyParams(), lector)
+
+    assert await v.verificar("AAAUSDT") == MOTIVO_VETO
+
+
+async def test_un_simbolo_bien_configurado_en_una_via_no_se_veta():
+    """El caso bueno sigue pasando: unilateral + aislado + apalancamiento
+    esperado no produce veto -si no, el veto nuevo dejaría al bot sin operar
+    nada."""
+    p = StrategyParams()
+    lector = LectorFalso({"AAAUSDT": _config(una_via=True, aislado=True,
+                                             long_=p.apalancamiento,
+                                             short=p.apalancamiento)})
+    v = VerificadorCuenta(p, lector)
+
+    assert await v.verificar("AAAUSDT") is None

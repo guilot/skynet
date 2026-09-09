@@ -990,7 +990,7 @@ def _config_cuenta(margen_aislado=True, apalancamiento=None):
                   else apalancamiento)
     return ConfiguracionCuentaSymbol(
         margen_aislado=margen_aislado, apalancamiento_long=lever,
-        apalancamiento_short=lever,
+        apalancamiento_short=lever, modo_una_via=True,
     )
 
 

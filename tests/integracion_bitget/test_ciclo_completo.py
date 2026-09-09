@@ -79,7 +79,7 @@ import uuid
 import httpx
 import pytest
 
-from scanner_volumen.bitget.rest import BitgetRest
+from scanner_volumen.bitget.rest import BASE_URL as BASE_URL_PUBLICO, BitgetRest
 from scanner_volumen.models import Direction
 
 from .diagnostico import bajo_sospecha
@@ -105,7 +105,11 @@ async def _precio_mercado_actual() -> float:
     fill real, nunca de esta referencia-, así que un desvío aquí no
     invalida el test; solo evitaría pedir una cantidad absurda si el precio
     real estuviera muy lejos de cualquier valor fijo en el código."""
-    async with httpx.AsyncClient(timeout=10.0) as cliente_http:
+    # `base_url` es obligatorio: `BitgetRest` construye rutas RELATIVAS
+    # (ver `rest.py`, `self._client.get(f"{prefix}/{path}")`) y sin base el
+    # cliente no sabe a donde apuntar -httpx lanza `UnsupportedProtocol`.
+    # `main()` lo pasa igual al construir el suyo; este banco lo omitia.
+    async with httpx.AsyncClient(base_url=BASE_URL_PUBLICO, timeout=10.0) as cliente_http:
         rest = BitgetRest(PRODUCT_TYPE_DEMO, RATE_LIMIT_PUBLICO, cliente_http)
         tickers = await rest.get_tickers()
     for ticker in tickers:

@@ -512,6 +512,7 @@ class PrivadoFalso:
             margen_aislado=True,
             apalancamiento_long=float(StrategyParams().apalancamiento),
             apalancamiento_short=float(StrategyParams().apalancamiento),
+            modo_una_via=True,
         )
 
 
