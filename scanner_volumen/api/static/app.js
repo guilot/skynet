@@ -130,6 +130,97 @@ conectar();
 // viaja en el payload del `/ws` de arriba. Un fetch con su propio
 // setInterval -en vez de forzarlo dentro del WebSocket del estado- deja las
 // dos fuentes de datos separadas, igual que ya lo están en el backend.
+// --- historico de trades del bot ---
+
+// Los rangos que guarda `bot_posiciones.max_rank` son los del estado del
+// escaner (NORMAL=0 ... EXTREME=4). Se traducen aqui porque saber HASTA
+// DONDE llego una posicion es la mitad de la historia de un trade: dos
+// operaciones con el mismo PnL no significan lo mismo si una toco EXTREME
+// y la otra murio en WATCH.
+const NOMBRE_RANGO = ["NORMAL", "WATCH", "HOT", "SIGNAL", "EXTREME"];
+
+// Los precios del universo van de 0.00001 a 100000, asi que un numero fijo
+// de decimales queda mal en los dos extremos: "140.200000" sobra por la
+// derecha y "0.001000" pierde la informacion por ella. Se ajusta a la
+// magnitud, que es como lo muestra cualquier exchange.
+function precio(v) {
+  if (v === null || v === undefined) return "—";
+  const a = Math.abs(v);
+  if (a >= 1000) return num(v, 2);
+  if (a >= 1) return num(v, 4);
+  if (a >= 0.01) return num(v, 5);
+  return num(v, 8);
+}
+
+// Duracion en la unidad que se lee de un vistazo, no en segundos crudos.
+function duracion(desdeMs, hastaMs) {
+  if (!desdeMs || !hastaMs) return "—";
+  const min = Math.round((hastaMs - desdeMs) / 60000);
+  if (min < 60) return `${min}m`;
+  const h = Math.floor(min / 60);
+  return `${h}h ${String(min % 60).padStart(2, "0")}m`;
+}
+
+function horaCorta(ms) {
+  if (!ms) return "—";
+  // Hora LOCAL del navegador, que es la que el operador tiene en su reloj.
+  // El resto del panel usa el reloj del exchange para decidir cosas; esto
+  // es solo presentacion de un instante ya ocurrido.
+  const d = new Date(ms);
+  return `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")} `
+       + `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+function pintarHistorico(cerradas) {
+  const cuerpo = document.querySelector("#bot-cerradas tbody");
+  const vacio = document.getElementById("bot-sin-trades");
+  const tabla = document.getElementById("bot-cerradas");
+  const resumen = document.getElementById("bot-resumen");
+
+  if (!cerradas || cerradas.length === 0) {
+    cuerpo.innerHTML = "";
+    tabla.hidden = true;
+    vacio.hidden = false;
+    resumen.textContent = "";
+    return;
+  }
+  tabla.hidden = false;
+  vacio.hidden = true;
+
+  // El resumen acompaña SIEMPRE al win rate con el total y el PnL: un win
+  // rate alto con PnL negativo es perfectamente posible en esta estrategia
+  // -las salidas escalonadas dejan cerrar muchos trades en verde recortando
+  // los que se iban lejos-, asi que mostrarlo solo seria enganoso.
+  const ganadores = cerradas.filter((t) => t.pnl > 0).length;
+  const total = cerradas.reduce((a, t) => a + t.pnl, 0);
+  const signo = total >= 0 ? "+" : "";
+  resumen.textContent =
+    `${cerradas.length} trades · ${ganadores} en verde `
+    + `(${(100 * ganadores / cerradas.length).toFixed(0)}%) · `
+    + `PnL ${signo}${num(total)} USDT`;
+  resumen.className = total >= 0 ? "ganancia" : "perdida";
+
+  cuerpo.innerHTML = cerradas
+    .map((t) => {
+      const clase = t.pnl > 0 ? "ganancia" : (t.pnl < 0 ? "perdida" : "");
+      const s = t.pnl >= 0 ? "+" : "";
+      // Sobre el MARGEN, que es lo que de verdad se arriesgo en ese trade,
+      // no sobre el nocional apalancado ni sobre el equity total.
+      const pct = t.margin ? (100 * t.pnl / t.margin) : null;
+      return `<tr class="${t.degradada ? "degradada" : ""}">
+        <td>${t.symbol}</td>
+        <td>${t.direction}</td>
+        <td>${precio(t.entry_price)}</td>
+        <td class="apagado">${horaCorta(t.close_ts)}</td>
+        <td class="apagado">${duracion(t.entry_ts, t.close_ts)}</td>
+        <td class="apagado">${NOMBRE_RANGO[t.max_rank] ?? "—"}</td>
+        <td class="${clase}">${s}${num(t.pnl)}</td>
+        <td class="${clase}">${pct === null ? "—" : s + num(pct, 1) + "%"}</td>
+      </tr>`;
+    })
+    .join("");
+}
+
 function pintarBot(datos) {
   const seccion = document.getElementById("bot");
   if (!datos.activo) { seccion.hidden = true; return; }
@@ -160,10 +251,12 @@ function pintarBot(datos) {
     .map((p) => `<tr>
         <td>${p.symbol}</td>
         <td>${p.direction}</td>
-        <td>${num(p.entry_price, 6)}</td>
+        <td>${precio(p.entry_price)}</td>
         <td>${num(p.margin)}</td>
       </tr>`)
     .join("");
+
+  pintarHistorico(datos.cerradas);
 }
 
 async function refrescarBot() {

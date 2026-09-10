@@ -193,9 +193,15 @@ def test_api_bot_publica_equity_y_abiertas(tmp_path):
     assert len(datos["abiertas"]) == 1
     assert datos["abiertas"][0]["symbol"] == "AAAUSDT"
     assert datos["abiertas"][0]["precio"] is None
+    # El historico que consume el panel: ademas de lo que ya habia, lleva
+    # direccion, precio y momento de entrada -de ahi sale la duracion- y el
+    # flag `degradada`, porque una posicion cerrada tras un fallo del broker
+    # no es un trade normal y el panel no debe presentarla como tal.
     assert datos["cerradas"] == [
-        {"symbol": "BBBUSDT", "close_ts": 60_000, "pnl": pytest.approx(25.0),
-         "max_rank": 3},
+        {"symbol": "BBBUSDT", "direction": "LONG", "entry_ts": 0,
+         "entry_price": pytest.approx(50.0), "close_ts": 60_000,
+         "pnl": pytest.approx(25.0), "fees": pytest.approx(0.3),
+         "margin": pytest.approx(10.0), "max_rank": 3, "degradada": False},
     ]
 
 

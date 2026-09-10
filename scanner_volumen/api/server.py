@@ -86,9 +86,19 @@ def create_app(
         # devuelve las más recientes primero, así que se expone tal cual
         # -sin `reversed`- para que el panel muestre el último cierre
         # arriba.
+        # Historico de trades para el panel. Se enriquece respecto a lo que
+        # habia (symbol/close_ts/pnl/max_rank) con lo que hace falta para
+        # LEERLO como un historial y no como una lista de numeros: la
+        # direccion, el precio de entrada y el instante de entrada -del que
+        # sale la duracion-. `degradada` viaja porque una posicion cerrada
+        # tras un fallo no es un trade normal y el panel no debe presentarla
+        # como tal.
         cerradas = [
-            {"symbol": f["symbol"], "close_ts": f["close_ts"], "pnl": f["pnl"],
-             "max_rank": f["max_rank"]}
+            {"symbol": f["symbol"], "direction": f["direction"],
+             "entry_ts": f["entry_ts"], "entry_price": f["entry_price"],
+             "close_ts": f["close_ts"], "pnl": f["pnl"], "fees": f["fees"],
+             "margin": f["margin"], "max_rank": f["max_rank"],
+             "degradada": bool(f["degradada"])}
             for f in bot_repo.cerradas(modo, limite=20)
         ]
         return {

@@ -54,3 +54,18 @@ tr.obsoleta td:nth-child(2)::after { content: " ⏱"; color: #d29922; }
   background: rgba(248, 81, 73, .15); font-weight: bold; }
 #bot.dinero-real { padding: .5rem; border: 1px solid var(--rojo);
   border-radius: 8px; background: rgba(248, 81, 73, .06); }
+
+/* Historico de trades del bot. El PnL se colorea con los mismos verde/rojo
+   que ya usa el resto del panel, en vez de introducir una paleta nueva.
+   `duracion` y `max` van en tono apagado: son contexto, no el dato que se
+   viene a mirar. */
+#bot h3 { font-size: .8rem; letter-spacing: .1em; margin: 1rem 0 .4rem;
+  color: #8b949e; display: flex; gap: .6rem; align-items: baseline; }
+#bot-resumen { font-size: .75rem; letter-spacing: 0; }
+#bot-cerradas td.ganancia { color: var(--verde); }
+#bot-cerradas td.perdida { color: var(--rojo); }
+#bot-cerradas td.apagado { color: #8b949e; }
+/* Una posicion cerrada tras un fallo del broker no es un trade normal: se
+   marca para que nadie la lea como parte del rendimiento de la estrategia. */
+#bot-cerradas tr.degradada td:first-child::after { content: " ⚠"; color: #d29922; }
+#bot-sin-trades { color: #8b949e; margin: .2rem 0 0; }
