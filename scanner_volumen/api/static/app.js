@@ -173,6 +173,24 @@ function horaCorta(ms) {
 
 // Etiquetas de los motivos de salida. Los valores crudos (`SCALE_HOT`) son
 // los de `ExitReason` y no se traducen en la base -son datos-, solo aqui.
+// Que trades tiene el usuario desplegados, y el desglose ya descargado de
+// cada uno. Vive fuera de `pintarHistorico` porque esa funcion se ejecuta en
+// CADA sondeo (5s) y no puede ser ella quien recuerde esto.
+//
+// El fallo que esto arregla: el panel repintaba el `tbody` entero cada 5
+// segundos, asi que un desglose abierto se cerraba solo a los pocos
+// segundos de abrirlo. Se cierra cuando el usuario lo dice, no cuando toca
+// sondear.
+const desplegados = new Map();   // id -> detalle ya descargado (o null si aun carga)
+let firmaHistorico = null;
+
+// Firma de la lista de cerrados. Si no cambia, no hay nada que repintar: el
+// historico solo se mueve cuando se cierra un trade nuevo. Evita ademas el
+// parpadeo de reconstruir 20 filas cada 5 segundos para dejarlas igual.
+function firmaDe(cerradas) {
+  return cerradas.map((t) => `${t.id}:${t.pnl}:${t.fases}`).join("|");
+}
+
 const MOTIVO = {
   SCALE_HOT: "parcial en HOT",
   SCALE_SIGNAL: "parcial en SIGNAL",
@@ -183,26 +201,41 @@ const MOTIVO = {
 };
 
 async function alternarDetalle(fila) {
-  const siguiente = fila.nextElementSibling;
-  if (siguiente && siguiente.classList.contains("detalle")) {
-    siguiente.remove();
+  const id = fila.dataset.id;
+  if (desplegados.has(id)) {          // ya abierto -> el usuario lo cierra
+    desplegados.delete(id);
+    const sig = fila.nextElementSibling;
+    if (sig && sig.classList.contains("detalle")) sig.remove();
     fila.classList.remove("abierto");
     return;
   }
+  desplegados.set(id, null);
+  await dibujarDetalle(fila);
+}
+
+// Separado de `alternarDetalle` porque tambien se usa al repintar, para
+// restaurar lo que estaba abierto sin volver a pedirlo a la red.
+async function dibujarDetalle(fila) {
+  const id = fila.dataset.id;
   fila.classList.add("abierto");
   const tr = document.createElement("tr");
   tr.className = "detalle";
   tr.innerHTML = `<td colspan="10" class="apagado">cargando…</td>`;
   fila.after(tr);
 
-  let d;
-  try {
-    const r = await fetch(`/api/bot/trade/${fila.dataset.id}`);
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    d = await r.json();
-  } catch (e) {
-    tr.innerHTML = `<td colspan="10" class="perdida">no se pudo cargar el desglose: ${e.message}</td>`;
-    return;
+  let d = desplegados.get(id);
+  if (!d) {
+    try {
+      const r = await fetch(`/api/bot/trade/${id}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      d = await r.json();
+    } catch (e) {
+      tr.innerHTML = `<td colspan="10" class="perdida">no se pudo cargar el desglose: ${e.message}</td>`;
+      return;
+    }
+    // Un trade cerrado no cambia nunca, asi que su desglose se cachea y el
+    // repintado no vuelve a pedirlo.
+    if (desplegados.has(id)) desplegados.set(id, d);
   }
 
   const filas = d.fases
@@ -258,10 +291,20 @@ function pintarHistorico(cerradas) {
     tabla.hidden = true;
     vacio.hidden = false;
     resumen.textContent = "";
+    firmaHistorico = "";
+    desplegados.clear();
     return;
   }
   tabla.hidden = false;
   vacio.hidden = true;
+
+  // Si la lista no ha cambiado no se toca el DOM. El historico solo se mueve
+  // cuando se cierra un trade, asi que en la inmensa mayoria de los sondeos
+  // esto sale por aqui -y un desglose abierto ni se entera de que hubo
+  // sondeo.
+  const firma = firmaDe(cerradas);
+  if (firma === firmaHistorico) return;
+  firmaHistorico = firma;
 
   // El resumen acompaña SIEMPRE al win rate con el total y el PnL: un win
   // rate alto con PnL negativo es perfectamente posible en esta estrategia
@@ -304,6 +347,15 @@ function pintarHistorico(cerradas) {
   cuerpo.querySelectorAll("tr.trade").forEach((fila) => {
     fila.addEventListener("click", () => alternarDetalle(fila));
   });
+
+  // Cuando SI hubo que repintar (se cerro un trade nuevo), se restaura lo
+  // que el usuario tenia abierto. Sin red: el desglose de un trade cerrado
+  // no cambia nunca y ya esta cacheado.
+  if (desplegados.size > 0) {
+    cuerpo.querySelectorAll("tr.trade").forEach((fila) => {
+      if (desplegados.has(fila.dataset.id)) dibujarDetalle(fila);
+    });
+  }
 }
 
 function pintarBot(datos) {
