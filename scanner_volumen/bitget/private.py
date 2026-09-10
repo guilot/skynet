@@ -10,6 +10,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import time
 from dataclasses import dataclass
 
@@ -18,6 +19,8 @@ import httpx
 from scanner_volumen.bitget.rate_limit import TokenBucket
 
 BASE_URL = "https://api.bitget.com"
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -223,6 +226,9 @@ class BitgetPrivate:
                 query_string = "?" + query_string
             extra = query_string
         else:
+            # `productType` se inyecta AQUI, en un solo sitio, para todos
+            # los cuerpos POST -por eso ningun metodo lo repite: hacerlo
+            # seria redundante y haria creer que falta donde no falta.
             todos_cuerpo = {**self._product_params, **(body or {})}
             if todos_cuerpo:
                 cuerpo_str = json.dumps(todos_cuerpo, separators=(",", ":"))
@@ -493,7 +499,6 @@ class BitgetPrivate:
         ("buy"/"sell"); este cliente no conoce `Direction`.
         """
         cuerpo = {
-            **self._product_params,
             "symbol": symbol,
             "marginCoin": self._margin_coin,
             "marginMode": MODO_MARGEN,
@@ -513,16 +518,13 @@ class BitgetPrivate:
         del plan order (`orderId`) que Bitget asigna, que es el `stop_id` que
         maneja el resto del bot.
 
-        SUPUESTO SIN VERIFICAR: los campos exactos de `place-tpsl-order`
-        (`planType`, `triggerType`, `holdSide`) se toman de la documentación
-        general de la API V2 de Bitget, no de una llamada real -el esquema
-        de firma sí se verificó (Task 2), pero el cuerpo de este endpoint
-        concreto no-. Se marca `planType="loss_plan"` porque este bot solo
-        coloca stops de pérdida, nunca de beneficio. Pendiente de confirmar
+        CONFIRMADO contra la simulación con una posición real: `planType=
+        "loss_plan"` y `triggerType="mark_price"` se aceptan, y `holdSide`
+        usa vocabulario de ORDEN ("buy"/"sell", donde "buy" es la posición
+        LARGA), no de posición -mandar "long" da `code=43011`. Ver
         contra la cuenta de simulación (Task 12).
         """
         cuerpo = {
-            **self._product_params,
             "symbol": symbol,
             "marginCoin": self._margin_coin,
             "planType": PLAN_TYPE_STOP,
@@ -552,7 +554,6 @@ class BitgetPrivate:
         cambiara; si no viene, se conserva el `stop_id` recibido.
         """
         cuerpo = {
-            **self._product_params,
             "symbol": symbol,
             "marginCoin": self._margin_coin,
             "orderId": stop_id,
@@ -560,10 +561,16 @@ class BitgetPrivate:
             # `size` y `planType` son OBLIGATORIOS aunque solo se cambie el
             # precio: sin `size`, Bitget responde `code=400172 "Order
             # quantity cannot be empty"` (observado contra la simulación).
-            # Que haya que remandarlos tiene una ventaja: el stop del
-            # exchange queda siempre dimensionado a lo que de verdad sigue
-            # abierto, en vez de conservar la cantidad original tras una
-            # salida parcial.
+            # La cantidad que manda el runner es la que de verdad sigue
+            # abierta EN EL INSTANTE de la llamada. Ojo: eso NO significa
+            # que el stop del exchange quede siempre al día, y la primera
+            # versión de este comentario lo afirmaba -`_sincronizar_stop`
+            # solo dispara cuando cambia el precio del stop, y ese precio
+            # cambia una única vez por posición (el paso a break-even es
+            # irreversible), así que tras una segunda parcial el stop
+            # conserva la cantidad de la primera. Con `reduceOnly` el
+            # sobredimensionado es inocuo -cierra lo que haya-, pero
+            # conviene no creerse una invariante que no existe.
             "size": _formato_decimal(cantidad),
             "planType": PLAN_TYPE_STOP,
         }
@@ -581,7 +588,6 @@ class BitgetPrivate:
         Bitget responde, fielmente y sin interpretarlo.
         """
         cuerpo = {
-            **self._product_params,
             "symbol": symbol,
             "marginCoin": self._margin_coin,
             "orderId": stop_id,
@@ -639,11 +645,26 @@ class BitgetPrivate:
             precio = float(orden.get("priceAvg") or 0)
             if cantidad <= 0 or precio <= 0:
                 return None
+            # FALLA CERRADO si falta `fee`, igual que `get_saldo` con sus
+            # campos críticos. La primera versión ponía 0 en silencio, que
+            # es exactamente lo que el comentario de `get_saldo` prohíbe doce
+            # líneas más arriba: este valor va DIRECTO al libro contable vía
+            # `_cerrar_por_sondeo`, así que una comisión perdida no es un
+            # dato que falte, es un PnL inflado que nadie va a notar.
+            # Devolver `None` deja la posición para revisión manual, que es
+            # el camino degradado que ya existe.
+            if orden.get("fee") is None:
+                log.warning(
+                    "bot: la orden %s del historial no trae 'fee'; no se "
+                    "construye el fill (un 0 silencioso inflaria el PnL). "
+                    "Si esto se repite, el nombre del campo cambio en la API",
+                    orden.get("orderId"))
+                return None
             # `fee` viene NEGATIVO (lo que cobró el exchange); el resto del
             # bot trata la comisión como un coste positivo.
             return FillOrden(
                 precio=precio, cantidad=cantidad,
-                comision=abs(float(orden.get("fee") or 0)),
+                comision=abs(float(orden["fee"])),
                 ts=int(orden.get("cTime") or 0),
             )
         return None
@@ -657,11 +678,11 @@ class BitgetPrivate:
         cantidad para construir la `OrdenEjecutada`, así que se agregan aquí
         en vez de dejar que `BitgetBroker` conozca la forma de la respuesta.
 
-        SUPUESTO SIN VERIFICAR: la forma de la respuesta (`data.fillList`,
-        con `price`, `baseVolume` y `feeDetail[].totalFee` por fill) se toma
-        de la documentación general de la API V2 de Bitget para
-        `/api/v2/mix/order/fills`, no de una llamada real. Pendiente de
-        confirmar contra la cuenta de simulación (Task 12).
+        CONFIRMADO contra la simulación: la respuesta es `data.fillList`,
+        con `price`, `baseVolume` y `feeDetail[].totalFee` por fill. Ojo a
+        que la forma NO es la misma que la de `/order/orders-history` (que
+        usa `entrustedList` con `priceAvg` y un `fee` plano): son dos
+        superficies distintas y `get_orden_por_client_oid` traduce la otra.
         """
         payload = await self._pedir(
             "GET", "/api/v2/mix/order/fills",

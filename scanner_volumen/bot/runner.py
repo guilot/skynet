@@ -1093,10 +1093,14 @@ class BotRunner:
         try:
             nuevo_id = await self._broker.mover_stop(
                 symbol=pos.symbol, stop_id=pos.stop_id, precio_disparo=nuevo_precio,
-                # Lo que de VERDAD sigue abierto, no el tamaño original:
-                # tras una salida parcial el stop del exchange debe cubrir
-                # solo el resto. Bitget obliga a remandar la cantidad al
-                # modificar, así que aquí se aprovecha para mantenerlo al día.
+                # Lo que de VERDAD sigue abierto en este instante, no el
+                # tamaño original. No es una sincronización continua: este
+                # método solo actúa cuando cambia el PRECIO del stop, y ese
+                # precio cambia una sola vez por posición (el paso a
+                # break-even es irreversible), así que tras una segunda
+                # parcial el stop del exchange conserva la cantidad de la
+                # primera. Inocuo con `reduceOnly`, pero que nadie lo lea
+                # como una garantía de que siempre está al día.
                 cantidad=pos.size * pos.reglas.restante,
             )
         except Exception:

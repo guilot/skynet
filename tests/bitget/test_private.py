@@ -593,3 +593,44 @@ async def test_no_se_ajusta_la_configuracion_de_un_simbolo_con_posicion_abierta(
         await priv.ajustar_configuracion_symbol("BTCUSDT", 20.0)
 
     assert [p for p in cliente.peticiones if p["method"] == "POST"] == []
+
+
+async def test_una_orden_del_historial_sin_comision_no_se_da_por_buena():
+    """Este valor va DIRECTO al libro contable via `_cerrar_por_sondeo`, asi
+    que rellenar la comision con 0 en silencio no es un dato que falte: es un
+    PnL inflado que nadie notaria. `get_saldo` prohibe justo eso doce lineas
+    mas arriba, con un comentario explicito, y aqui se hacia lo contrario."""
+    priv, _ = _privado({"code": "00000", "data": {"entrustedList": [
+        {"clientOid": "x", "status": "filled", "priceAvg": "100",
+         "baseVolume": "1.0", "cTime": "1"},   # sin `fee`
+    ]}})
+    assert await priv.get_orden_por_client_oid("BTCUSDT", "x", 0) is None
+
+
+async def test_una_orden_del_historial_completa_si_se_traduce():
+    """El caso bueno, con la forma REAL observada al dispararse un stop: la
+    orden que Bitget crea lleva como `clientOid` el `orderId` del plan order,
+    y su `fee` viene negativo."""
+    priv, _ = _privado({"code": "00000", "data": {"entrustedList": [
+        {"clientOid": "1481670349406855171", "status": "filled",
+         "priceAvg": "78177.8", "baseVolume": "0.0335",
+         "fee": "-1.57137378", "cTime": "1788984060182",
+         "orderSource": "loss_market"},
+    ]}})
+    fill = await priv.get_orden_por_client_oid(
+        "SBTCSUSDT", "1481670349406855171", 0)
+    assert fill is not None
+    assert fill.precio == pytest.approx(78177.8)
+    assert fill.cantidad == pytest.approx(0.0335)
+    assert fill.comision == pytest.approx(1.57137378)  # positiva
+    assert fill.ts == 1788984060182
+
+
+async def test_una_orden_del_historial_no_ejecutada_no_cuenta_como_cierre():
+    """Una orden cancelada o a medias no es un cierre: devolver su precio
+    escribiria en el libro el de una operacion que no ocurrio."""
+    priv, _ = _privado({"code": "00000", "data": {"entrustedList": [
+        {"clientOid": "x", "status": "canceled", "priceAvg": "100",
+         "baseVolume": "1.0", "fee": "-0.1"},
+    ]}})
+    assert await priv.get_orden_por_client_oid("BTCUSDT", "x", 0) is None
