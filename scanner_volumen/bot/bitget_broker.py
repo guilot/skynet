@@ -161,32 +161,24 @@ class BitgetBroker:
             ) from exc
 
     async def cancelar_stop(self, *, symbol: str, stop_id: str) -> None:
-        """Cancela un stop. Idempotente a propósito: si Bitget rechaza la
-        cancelación porque el plan order ya no existe -normalmente porque ya
-        se ejecutó, que es justo el caso que interesa no tratar como error-,
-        se ignora en vez de propagar.
+        """Cancela un stop. No traga errores.
 
-        SUPUESTO SIN VERIFICAR (documentado también en el informe de la
-        tarea): se trata CUALQUIER `RuntimeError` de
-        `BitgetPrivate.cancelar_stop` como "el stop ya no existe", sin
-        distinguir por código de error de Bitget. Es la lectura conservadora
-        posible del lado de "no revienta el cierre normal de una posición
-        cuyo stop saltó solo"; el riesgo es que oculte un error genuino
-        (por ejemplo, de autenticación) detrás de un `code` que no es
-        realmente "ya no existe" -de ahí el `log.warning`: si algún día
-        resulta ser lo segundo, aquí queda la traza para encontrarlo-.
-        Discriminar por el código de error real de Bitget es exactamente lo
-        que resolvería esto, y queda pendiente de la tarea que verifica
-        contra la cuenta de simulación.
+        CONFIRMADO contra la cuenta de simulación: cancelar un plan order
+        que nunca existió devuelve `code=00000 success`, no un error. Es
+        decir, **la idempotencia la da el propio Bitget**, no este método.
+
+        Por eso ya no hay `except RuntimeError` aquí. Lo había, tratando
+        CUALQUIER error como "el stop ya no existe"; siendo el endpoint
+        idempotente, ese `except` no protegía de nada real y solo servía
+        para disfrazar de rutina un fallo de autenticación o de parámetros.
+        Y tras leer el cuerpo de la respuesta en `_pedir`, su alcance había
+        crecido: los errores de negocio con HTTP 4xx, que antes subían como
+        `HTTPStatusError`, pasaron a ser `RuntimeError`.
+
+        Propagar es seguro: `BotRunner._cancelar_stop` ya envuelve esta
+        llamada en su propio `try/except`, registra el fallo y NO impide dar
+        la posición por cerrada -está cerrada de verdad, con el dinero ya
+        liquidado-. La diferencia es que ahora ese fallo se ve como lo que
+        es, en vez de como una suposición.
         """
-        try:
-            await self._privado.cancelar_stop(symbol=symbol, stop_id=stop_id)
-        except RuntimeError as exc:
-            log.warning(
-                "bot: cancelar_stop de %s (stop_id=%s): Bitget rechazo la "
-                "cancelacion; se ASUME (no se ha confirmado) que el stop ya no "
-                "existe -ejecutado o cancelado antes- y no se propaga. Si el "
-                "motivo real fuese otro (autenticacion, parametros...) quedaria "
-                "sin mas rastro que este aviso. Error: %s",
-                symbol, stop_id, exc,
-            )
+        await self._privado.cancelar_stop(symbol=symbol, stop_id=stop_id)

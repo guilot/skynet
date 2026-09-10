@@ -107,10 +107,11 @@ def _formato_decimal(valor: float) -> str:
     return formateado if formateado else "0"
 
 
-# El modo de margen que la estrategia asume y que `VerificacionCuenta` exige
-# por símbolo antes de la primera entrada: si el símbolo no está en aislado,
-# el bot VETA en vez de operarlo (y nunca cambia la configuración de la
-# cuenta). Mandarlo en la orden es obligatorio -Bitget rechaza `place-order`
+# El modo de margen que la estrategia asume. `VerificadorCuenta` lo exige por
+# símbolo antes de la primera entrada: si no coincide, lo AJUSTA (ver
+# `ajustar_configuracion_symbol`, la única escritura de este cliente que no es
+# una orden) y, si tras releer sigue sin coincidir, veta.
+# Mandarlo en la orden es obligatorio -Bitget rechaza `place-order`
 # sin él con `code=400172 "The margin mode cannot be empty"` (observado
 # contra la cuenta de simulación)- y el valor coherente es exactamente el
 # que se verifica: pedir "crossed" aquí abriría en un modo que la estrategia
@@ -448,11 +449,29 @@ class BitgetPrivate:
         así que exigir que estén todos preconfigurados a mano significaba,
         en la práctica, no operar ninguno.
 
-        No comprueba el resultado: de eso se encarga quien llama, releyendo
-        la configuración después. Si Bitget rechaza el cambio -por ejemplo
-        porque hay una posición abierta en ese símbolo- la excepción sube,
-        y el veto de `VerificadorCuenta` sigue siendo la última palabra.
+        **Se NIEGA si hay una posición abierta en ese símbolo**, sea del bot
+        o de un humano. Esa comprobación estaba solo escrita en los
+        comentarios -"solo sobre símbolos sin posición abierta"- y una
+        revisión demostró que nada la imponía: el bot únicamente entra donde
+        no tiene nada suyo, pero una posición que el usuario abra a mano
+        DESPUÉS del arranque no está ni en `abiertas` ni entre los símbolos
+        vetados, y se le habría reescrito el margen y el apalancamiento
+        -cambiando su precio de liquidación-. Ahora la garantía la impone el
+        código, no un comentario, y cuesta una lectura en un camino raro.
+
+        No comprueba el RESULTADO del cambio: de eso se encarga quien llama,
+        releyendo la configuración después. Si Bitget rechaza el cambio, la
+        excepción sube y el veto de `VerificadorCuenta` sigue siendo la
+        última palabra.
         """
+        abiertas = await self.get_posiciones()
+        if any(p.symbol == symbol for p in abiertas):
+            raise RuntimeError(
+                f"no se ajusta la configuracion de {symbol!r}: hay una "
+                f"posicion abierta en ese simbolo, y cambiar el margen o el "
+                f"apalancamiento le moveria el precio de liquidacion. Puede "
+                f"ser una posicion abierta a mano: este bot no la toca."
+            )
         base = {**self._product_params, "symbol": symbol,
                 "marginCoin": self._margin_coin}
         await self._pedir(

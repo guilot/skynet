@@ -3,38 +3,64 @@ import hashlib
 import hmac
 import json
 
+import httpx
 import pytest
 
 from scanner_volumen.bitget.private import BitgetPrivate
 
 
 class RespuestaFalsa:
-    def __init__(self, payload):
+    """Respuesta HTTP falsa.
+
+    `status_code` es configurable a proposito: la version anterior devolvia
+    SIEMPRE 200 con un `raise_for_status` que nunca lanzaba, y eso hacia
+    invisible todo el manejo de errores HTTP -una revision comprobo que
+    revertir el orden de `raise_for_status`/`json` dejaba la suite en verde."""
+
+    def __init__(self, payload, status_code=200):
         self._payload = payload
-        self.status_code = 200
+        self.status_code = status_code
 
     def json(self):
+        if self._payload is _SIN_JSON:
+            raise ValueError("no es JSON")
         return self._payload
 
     def raise_for_status(self):
-        return None
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"HTTP {self.status_code}", request=None, response=None)
+
+
+_SIN_JSON = object()
 
 
 class ClienteFalso:
-    """Registra las peticiones para poder inspeccionar cabeceras y cuerpo."""
+    """Registra las peticiones para poder inspeccionar cabeceras y cuerpo.
 
-    def __init__(self, payload):
+    `payloads` admite una lista para respuestas distintas en llamadas
+    sucesivas (p. ej. leer posiciones y luego escribir configuracion)."""
+
+    def __init__(self, payload, status_code=200):
         self.payload = payload
+        self._status = status_code
         self.peticiones = []
 
     async def request(self, method, url, **kwargs):
         self.peticiones.append({"method": method, "url": url, **kwargs})
-        return RespuestaFalsa(self.payload)
+        payload = self.payload
+        if isinstance(payload, list):
+            payload = payload[min(len(self.peticiones) - 1, len(payload) - 1)]
+        return RespuestaFalsa(payload, self._status)
 
 
-def _privado(payload):
-    cliente = ClienteFalso(payload)
-    return BitgetPrivate("USDT-FUTURES", 10.0, cliente,
+def _privado(payload, venue="USDT-FUTURES", status_code=200):
+    """`venue` es un parametro para poder ejercitar la moneda de margen
+    DERIVADA: con "USDT-FUTURES" coincide con la constante que habia escrita
+    a mano, asi que un test que solo use ese venue no distingue el codigo
+    corregido del roto -es exactamente lo que paso."""
+    cliente = ClienteFalso(payload, status_code)
+    return BitgetPrivate(venue, 10.0, cliente,
                          api_key="clave", api_secret="secreto",
                          passphrase="frase"), cliente
 
@@ -440,3 +466,130 @@ async def test_get_fill_sin_fills_lanza():
     priv, _ = _privado({"code": "00000", "data": {"fillList": []}})
     with pytest.raises(RuntimeError, match="No se encontraron fills"):
         await priv.get_fill("BTCUSDT", "order-inexistente")
+
+
+# --- los defectos que el banco de pruebas encontro, y que nada protegia ---
+#
+# Una revision midio que 11 de 24 mutaciones sobre este bloque pasaban en
+# VERDE, incluidos los seis defectos que el bloque existe para arreglar. La
+# causa era el andamiaje: todos los tests construian con "USDT-FUTURES" (donde
+# la moneda derivada coincide con la constante vieja) y la respuesta falsa
+# nunca lanzaba en `raise_for_status`.
+
+
+async def test_la_moneda_de_margen_se_deriva_del_producttype():
+    """`marginCoin` NO es siempre "USDT": con `SUSDT-FUTURES` es `SUSDT`, y
+    mandar la equivocada hace que Bitget rechace con code=40778 (observado).
+    Estaba escrita a mano en seis sitios."""
+    priv, cliente = _privado({"code": "00000", "data": {"orderId": "1"}},
+                             venue="SUSDT-FUTURES")
+    await priv.colocar_orden(symbol="SBTCSUSDT", lado="buy", cantidad=1.0,
+                             reduce_only=False, client_oid="x")
+    cuerpo = json.loads(cliente.peticiones[0]["content"])
+    assert cuerpo["marginCoin"] == "SUSDT"
+
+
+async def test_el_saldo_selecciona_la_cuenta_de_la_moneda_derivada():
+    """El mismo defecto por el lado de la lectura: con `SUSDT-FUTURES` la
+    cuenta que hay que elegir es la de `SUSDT`, no la de `USDT`."""
+    priv, _ = _privado(
+        {"code": "00000", "data": [
+            {"marginCoin": "USDT", "accountEquity": "999", "unrealizedPL": "0"},
+            {"marginCoin": "SUSDT", "accountEquity": "3000", "unrealizedPL": "0"},
+        ]},
+        venue="SUSDT-FUTURES")
+    saldo = await priv.get_saldo()
+    assert saldo.equity == pytest.approx(3000.0)
+
+
+async def test_place_order_manda_el_modo_de_margen():
+    """Sin `marginMode`, Bitget rechaza con code=400172 "The margin mode
+    cannot be empty": en modo real TODAS las ordenes habrian sido
+    rechazadas."""
+    priv, cliente = _privado({"code": "00000", "data": {"orderId": "1"}})
+    await priv.colocar_orden(symbol="BTCUSDT", lado="buy", cantidad=1.0,
+                             reduce_only=False, client_oid="x")
+    cuerpo = json.loads(cliente.peticiones[0]["content"])
+    assert cuerpo["marginMode"] == "isolated"
+
+
+async def test_modify_tpsl_manda_cantidad_y_plantype():
+    """Sin `size`, code=400172 "Order quantity cannot be empty" aunque solo
+    se cambie el precio."""
+    priv, cliente = _privado({"code": "00000", "data": {"orderId": "s1"}})
+    await priv.mover_stop(symbol="BTCUSDT", stop_id="s1", precio_disparo=99.0,
+                          cantidad=2.5)
+    cuerpo = json.loads(cliente.peticiones[0]["content"])
+    assert cuerpo["size"] == "2.5"
+    assert cuerpo["planType"] == "loss_plan"
+
+
+async def test_el_modo_de_posicion_se_lee_y_falla_cerrado():
+    """`modo_una_via` decide si existe `reduceOnly`, sobre el que descansa
+    toda la seguridad de la fase. Cualquier valor que no sea exactamente
+    "one_way_mode" -incluido el campo ausente- se lee como NO unilateral."""
+    for pos_mode, esperado in (("one_way_mode", True), ("hedge_mode", False),
+                               (None, False), ("", False)):
+        datos = {"marginMode": "isolated", "isolatedLongLever": 20,
+                 "isolatedShortLever": 20}
+        if pos_mode is not None:
+            datos["posMode"] = pos_mode
+        priv, _ = _privado({"code": "00000", "data": datos})
+        cfg = await priv.get_configuracion_symbol("BTCUSDT")
+        assert cfg.modo_una_via is esperado, f"posMode={pos_mode!r}"
+
+
+async def test_un_error_http_conserva_el_diagnostico_de_bitget():
+    """El defecto: `raise_for_status()` corria ANTES de leer el JSON, asi que
+    un 400 llegaba como `HTTPStatusError: 400 Bad Request` y se perdia el
+    `code`/`msg` con el que Bitget explica el problema -lo unico que
+    distingue "mande mal un parametro" de "la firma esta rota"."""
+    priv, _ = _privado(
+        {"code": "40778", "msg": "SBTCSUSDT does not support USDT currency as margin"},
+        status_code=400)
+    with pytest.raises(RuntimeError) as exc:
+        await priv.get_saldo()
+    assert "40778" in str(exc.value)
+    assert "does not support USDT currency" in str(exc.value)
+
+
+async def test_una_respuesta_que_no_es_json_sigue_propagando_el_error_http():
+    """La contrapartida: leer el cuerpo primero no puede tragarse un fallo
+    HTTP cuando NO hay JSON que interpretar (un 502 de un proxy, p. ej.)."""
+    priv, _ = _privado(_SIN_JSON, status_code=502)
+    with pytest.raises(httpx.HTTPStatusError):
+        await priv.get_saldo()
+
+
+async def test_ajustar_la_configuracion_manda_aislado_y_el_apalancamiento():
+    """La UNICA escritura de este cliente que no es una orden, y no tenia ni
+    un test."""
+    priv, cliente = _privado([
+        {"code": "00000", "data": []},                      # get_posiciones
+        {"code": "00000", "data": {}},                      # set-margin-mode
+        {"code": "00000", "data": {}},                      # set-leverage
+    ])
+    await priv.ajustar_configuracion_symbol("BTCUSDT", 20.0)
+
+    escrituras = [p for p in cliente.peticiones if p["method"] == "POST"]
+    cuerpos = [json.loads(p["content"]) for p in escrituras]
+    assert any("set-margin-mode" in p["url"] for p in escrituras)
+    assert cuerpos[0]["marginMode"] == "isolated"
+    assert any("set-leverage" in p["url"] for p in escrituras)
+    assert cuerpos[1]["leverage"] == "20"
+
+
+async def test_no_se_ajusta_la_configuracion_de_un_simbolo_con_posicion_abierta():
+    """La garantia estaba solo en los comentarios y nada la imponia: una
+    posicion que el usuario abra a mano DESPUES del arranque no esta ni en
+    `abiertas` ni entre los vetados, y se le habria reescrito el margen y el
+    apalancamiento -moviendole el precio de liquidacion."""
+    priv, cliente = _privado(
+        {"code": "00000", "data": [
+            {"symbol": "BTCUSDT", "holdSide": "long", "total": "1.0",
+             "openPriceAvg": "100"},
+        ]})
+    with pytest.raises(RuntimeError, match="posicion abierta"):
+        await priv.ajustar_configuracion_symbol("BTCUSDT", 20.0)
+
+    assert [p for p in cliente.peticiones if p["method"] == "POST"] == []

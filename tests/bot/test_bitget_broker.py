@@ -211,35 +211,42 @@ async def test_cancelar_stop_normal_delega_en_el_cliente():
     assert fake.stops_cancelados == [{"symbol": "BTCUSDT", "stop_id": "exchange-order-1"}]
 
 
-async def test_cancelar_stop_ya_ejecutado_no_lanza():
-    """El stop ya saltó en el exchange -Bitget rechaza la cancelación porque
-    el plan order ya no existe-; cancelar_stop debe tragarse ese error."""
+async def test_cancelar_stop_propaga_el_error_en_vez_de_asumir_que_ya_no_existe():
+    """El `except RuntimeError` que habia aqui no protegia de nada.
+
+    CONFIRMADO contra la cuenta de simulacion: cancelar un plan order que
+    nunca existio devuelve `code=00000 success`, no un error. O sea que la
+    idempotencia la da el propio Bitget, y aquel `except` -que trataba
+    CUALQUIER error como "el stop ya no existe"- solo servia para disfrazar
+    de rutina un fallo de autenticacion o de parametros. Ademas su alcance
+    habia crecido sin querer: al leer el cuerpo de la respuesta en `_pedir`,
+    los errores de negocio con HTTP 4xx pasaron de `HTTPStatusError` a
+    `RuntimeError`, que es justo lo que aqui se capturaba.
+
+    SIN VERIFICAR: que cancelar un stop YA EJECUTADO tambien devuelva
+    success. Solo se probo con uno inexistente. Si resultara devolver error,
+    el sintoma seria una traza en el log en cada salida por stop -ruidosa,
+    no peligrosa- y entonces habria que estrechar la excepcion a ESE codigo
+    concreto, que es lo que no se podia hacer mientras no se conociera."""
     fake = FakeBitgetPrivate(cancelar_lanza=True)
     broker, _ = _broker(fake)
-    await broker.cancelar_stop(symbol="BTCUSDT", stop_id="ya-no-existe")
-    # No debe lanzar. Se registra igualmente el intento en el doble.
+
+    with pytest.raises(RuntimeError):
+        await broker.cancelar_stop(symbol="BTCUSDT", stop_id="ya-no-existe")
+
     assert fake.stops_cancelados == [{"symbol": "BTCUSDT", "stop_id": "ya-no-existe"}]
 
 
-async def test_cancelar_stop_que_falla_no_propaga_pero_deja_rastro_en_el_log(caplog):
-    """El hallazgo de la ronda 1: tragarse el error sin registrar nada deja
-    indistinguible "el stop ya se ejecutó" de un fallo real (auth, parámetros
-    mal formados...) durante la cancelación. Debe quedar como mínimo un
-    warning con el símbolo, el stop_id y el error original -sin credenciales,
-    que ya excluye `_pedir` y este código no debe añadir nada por su cuenta."""
-    fake = FakeBitgetPrivate(cancelar_lanza=True)
-    broker, _ = _broker(fake)
-    with caplog.at_level("WARNING"):
-        await broker.cancelar_stop(symbol="BTCUSDT", stop_id="ya-no-existe")
+async def test_el_runner_aisla_el_fallo_de_cancelar_para_que_propagar_sea_seguro():
+    """El contrato que hace seguro propagar: quien decide que un fallo al
+    cancelar no bloquea el cierre es el RUNNER, no el broker. La posicion ya
+    esta cerrada de verdad -el dinero liquidado-, asi que dejarla
+    `abierta = 1` por esto la atascaria para siempre ocupando un hueco de
+    concurrencia. Si alguien quita ese aislamiento, propagar desde aqui deja
+    de ser seguro y este test lo dice."""
+    import inspect
 
-    assert len(caplog.records) == 1
-    registro = caplog.records[0]
-    assert registro.levelname == "WARNING"
-    mensaje = registro.getMessage()
-    assert "BTCUSDT" in mensaje
-    assert "ya-no-existe" in mensaje
-    assert "ASUME" in mensaje  # dejar explícito que es una suposición, no una certeza
-    # No debe filtrar credenciales (aunque este test no las usa, se guarda
-    # la garantía por si el mensaje de error de _pedir cambiara algún día).
-    for secreto in ("clave", "secreto", "frase", "passphrase", "api_key"):
-        assert secreto not in mensaje
+    from scanner_volumen.bot.runner import BotRunner
+
+    fuente = inspect.getsource(BotRunner._cancelar_stop)
+    assert "try:" in fuente and "except Exception" in fuente
