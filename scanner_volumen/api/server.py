@@ -110,7 +110,13 @@ def create_app(
                 "id": f["id"], "symbol": f["symbol"], "direction": f["direction"],
                 "entry_ts": f["entry_ts"], "entry_price": f["entry_price"],
                 "close_ts": f["close_ts"], "exit_price": salida,
-                "pnl": f["pnl"], "fees": f["fee_entrada"] + f["fees"],
+                # `fees` YA es el coste total del trade: `fees_acumuladas` se
+                # inicializa con la comision de ENTRADA (`runner.py`, `_abrir`)
+                # y `_acumular_pnl` le va sumando las de cada salida. Sumarle
+                # `fee_entrada` aqui la contaba dos veces -era un defecto de
+                # este panel, no del bot, y lo detecto el usuario al ver que
+                # el total no cuadraba con las fases.
+                "pnl": f["pnl"], "fees": f["fees"],
                 "margin": f["margin"], "max_rank": f["max_rank"],
                 "fases": len(fills), "degradada": bool(f["degradada"]),
             })
@@ -167,7 +173,9 @@ def create_app(
             "entry_ts": fila["entry_ts"], "close_ts": fila["close_ts"],
             "size": fila["size"], "margin": fila["margin"],
             "fee_entrada": fila["fee_entrada"],
-            "fees_total": fila["fee_entrada"] + fila["fees"],
+            # Ver la nota de `fees` mas arriba: la columna ya incluye la
+            # entrada, asi que el total es esa columna tal cual.
+            "fees_total": fila["fees"],
             "pnl": fila["pnl"], "max_rank": fila["max_rank"],
             "degradada": bool(fila["degradada"]),
             "fases": fases,
