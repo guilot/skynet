@@ -171,6 +171,82 @@ function horaCorta(ms) {
        + `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
+// Etiquetas de los motivos de salida. Los valores crudos (`SCALE_HOT`) son
+// los de `ExitReason` y no se traducen en la base -son datos-, solo aqui.
+const MOTIVO = {
+  SCALE_HOT: "parcial en HOT",
+  SCALE_SIGNAL: "parcial en SIGNAL",
+  EXTREME: "cierre tras EXTREME",
+  STOP: "stop",
+  STALE_BE: "estancada (break-even)",
+  END_OF_DATA: "fin de datos",
+};
+
+async function alternarDetalle(fila) {
+  const siguiente = fila.nextElementSibling;
+  if (siguiente && siguiente.classList.contains("detalle")) {
+    siguiente.remove();
+    fila.classList.remove("abierto");
+    return;
+  }
+  fila.classList.add("abierto");
+  const tr = document.createElement("tr");
+  tr.className = "detalle";
+  tr.innerHTML = `<td colspan="10" class="apagado">cargando…</td>`;
+  fila.after(tr);
+
+  let d;
+  try {
+    const r = await fetch(`/api/bot/trade/${fila.dataset.id}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    d = await r.json();
+  } catch (e) {
+    tr.innerHTML = `<td colspan="10" class="perdida">no se pudo cargar el desglose: ${e.message}</td>`;
+    return;
+  }
+
+  const filas = d.fases
+    .map((f) => {
+      const c = f.pnl_neto > 0 ? "ganancia" : (f.pnl_neto < 0 ? "perdida" : "");
+      const sg = f.pnl_neto >= 0 ? "+" : "";
+      // El desvio compara lo que la REGLA pedia con lo que el mercado dio.
+      // Puede no existir: una salida a mercado por temporizador no promete
+      // ningun nivel, y ahi un "0 bps" seria una medicion inventada.
+      const desv = f.desvio_bps === null || f.desvio_bps === undefined
+        ? "—" : `${f.desvio_bps >= 0 ? "+" : ""}${num(f.desvio_bps, 0)} bps`;
+      return `<tr>
+        <td>${MOTIVO[f.reason] ?? f.reason}</td>
+        <td>${num(100 * f.fraction, 0)}%</td>
+        <td>${precio(f.precio)}</td>
+        <td class="apagado">${desv}</td>
+        <td class="apagado">${num(f.comision)}</td>
+        <td class="${c}">${sg}${num(f.pnl_neto)}</td>
+      </tr>`;
+    })
+    .join("");
+
+  // El funding NO se muestra porque el bot no lo registra, y poner un 0
+  // seria afirmar que no se pago nada. En paper es literalmente cierto -no
+  // hay exchange que lo cobre-; en real aparece solo agregado, como la
+  // diferencia entre el saldo real y el equity calculado que ya ensena el
+  // informe. Ademas estos trades duran minutos y el funding se cobra en
+  // ventanas de 8h, asi que casi nunca llegan a cruzar una.
+  tr.innerHTML = `<td colspan="10">
+      <table class="fases">
+        <thead><tr><th>FASE</th><th>PARTE</th><th>PRECIO</th>
+                   <th>DESVIO</th><th>FEE</th><th>PNL</th></tr></thead>
+        <tbody>${filas}</tbody>
+      </table>
+      <p class="nota-fases">
+        Entrada ${precio(d.entry_price)} · tamano ${num(d.size, 4)} ·
+        margen ${num(d.margin)} · fee de entrada ${num(d.fee_entrada)} ·
+        <strong>fees totales ${num(d.fees_total)}</strong> ·
+        PnL ${d.pnl >= 0 ? "+" : ""}${num(d.pnl)} USDT.
+        El funding no se registra por trade (ver nota).
+      </p>
+    </td>`;
+}
+
 function pintarHistorico(cerradas) {
   const cuerpo = document.querySelector("#bot-cerradas tbody");
   const vacio = document.getElementById("bot-sin-trades");
@@ -207,18 +283,27 @@ function pintarHistorico(cerradas) {
       // Sobre el MARGEN, que es lo que de verdad se arriesgo en ese trade,
       // no sobre el nocional apalancado ni sobre el equity total.
       const pct = t.margin ? (100 * t.pnl / t.margin) : null;
-      return `<tr class="${t.degradada ? "degradada" : ""}">
+      return `<tr class="trade ${t.degradada ? "degradada" : ""}" data-id="${t.id}">
         <td>${t.symbol}</td>
         <td>${t.direction}</td>
         <td>${precio(t.entry_price)}</td>
+        <td>${precio(t.exit_price)}</td>
         <td class="apagado">${horaCorta(t.close_ts)}</td>
         <td class="apagado">${duracion(t.entry_ts, t.close_ts)}</td>
         <td class="apagado">${NOMBRE_RANGO[t.max_rank] ?? "—"}</td>
+        <td class="apagado">${num(t.fees)}</td>
         <td class="${clase}">${s}${num(t.pnl)}</td>
         <td class="${clase}">${pct === null ? "—" : s + num(pct, 1) + "%"}</td>
       </tr>`;
     })
     .join("");
+
+  // Delegacion sobre las filas ya pintadas: se re-crean en cada sondeo, asi
+  // que enganchar aqui es mas simple que mantener un listener en el tbody
+  // con estado de que fila estaba abierta.
+  cuerpo.querySelectorAll("tr.trade").forEach((fila) => {
+    fila.addEventListener("click", () => alternarDetalle(fila));
+  });
 }
 
 function pintarBot(datos) {

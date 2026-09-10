@@ -69,3 +69,16 @@ tr.obsoleta td:nth-child(2)::after { content: " ⏱"; color: #d29922; }
    marca para que nadie la lea como parte del rendimiento de la estrategia. */
 #bot-cerradas tr.degradada td:first-child::after { content: " ⚠"; color: #d29922; }
 #bot-sin-trades { color: #8b949e; margin: .2rem 0 0; }
+
+/* Fila desplegable del desglose por fases. */
+#bot-cerradas tbody tr.trade { cursor: pointer; }
+#bot-cerradas tbody tr.trade:hover { background: #161b22; }
+#bot-cerradas tbody tr.trade td:first-child::before {
+  content: "▸ "; color: #8b949e; }
+#bot-cerradas tbody tr.trade.abierto td:first-child::before { content: "▾ "; }
+#bot-cerradas tbody tr.detalle > td { padding: 0 0 .6rem 1.2rem;
+  border-bottom: 1px solid var(--borde); }
+table.fases { width: auto; margin: 0; font-size: .8rem; }
+table.fases th, table.fases td { padding: .2rem .5rem; border-bottom: none; }
+table.fases thead th { color: #8b949e; font-weight: normal; }
+.nota-fases { color: #8b949e; font-size: .75rem; margin: .3rem 0 0; }

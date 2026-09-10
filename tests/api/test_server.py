@@ -10,6 +10,7 @@ from scanner_volumen.models import Direction, State
 from scanner_volumen.scoring.score import ScoreBreakdown
 from scanner_volumen.storage.db import open_db
 from scanner_volumen.storage.repos import SignalRepo
+from scanner_volumen.strategy.model import ExitReason
 
 
 def metrica_y_breakdown(symbol, score, ts=1000):
@@ -197,12 +198,24 @@ def test_api_bot_publica_equity_y_abiertas(tmp_path):
     # direccion, precio y momento de entrada -de ahi sale la duracion- y el
     # flag `degradada`, porque una posicion cerrada tras un fallo del broker
     # no es un trade normal y el panel no debe presentarla como tal.
-    assert datos["cerradas"] == [
-        {"symbol": "BBBUSDT", "direction": "LONG", "entry_ts": 0,
-         "entry_price": pytest.approx(50.0), "close_ts": 60_000,
-         "pnl": pytest.approx(25.0), "fees": pytest.approx(0.3),
-         "margin": pytest.approx(10.0), "max_rank": 3, "degradada": False},
-    ]
+    fila = datos["cerradas"][0]
+    assert fila["symbol"] == "BBBUSDT"
+    assert fila["direction"] == "LONG"
+    assert fila["entry_price"] == pytest.approx(50.0)
+    assert fila["close_ts"] == 60_000
+    assert fila["pnl"] == pytest.approx(25.0)
+    assert fila["margin"] == pytest.approx(10.0)
+    assert fila["max_rank"] == 3
+    assert fila["degradada"] is False
+    # `fees` es el coste TOTAL del trade (entrada + salidas), no solo el de
+    # las salidas: es lo que el operador quiere comparar contra el PnL. Aqui
+    # la fila tiene fee_entrada=0.12 y fees=0.30, asi que el total es 0.42
+    # -si esta asercion dijera 0.30, estaria midiendo la mitad del coste.
+    assert fila["fees"] == pytest.approx(0.42)
+    # Sin fills registrados no hay precio de salida que promediar, y se dice
+    # con un `None` en vez de inventar el de entrada.
+    assert fila["exit_price"] is None
+    assert fila["fases"] == 0
 
 
 def test_api_bot_publica_el_saldo_real_persistido_en_modo_real(tmp_path):
@@ -249,3 +262,79 @@ def test_api_bot_recorta_cerradas_a_veinte_mas_recientes(tmp_path):
     assert len(datos["cerradas"]) == 20
     assert datos["cerradas"][0]["symbol"] == "S24USDT"  # la más reciente, primero
     assert datos["cerradas"][-1]["symbol"] == "S5USDT"
+
+
+# --- desglose de un trade por fases ---
+
+
+def _trade_escalonado(bot_repo):
+    """Un LONG que escala a HOT y luego sale por stop, con deslizamiento en
+    la primera parcial: el mercado dio 109.0 donde la regla pedia 110.0."""
+    pid = bot_repo.abrir(
+        modo="paper", symbol="AAAUSDT", direction=Direction.LONG, entry_ts=0,
+        entry_price=100.0, entry_price_senal=100.0, margin=20.0,
+        notional=400.0, size=4.0, fee_entrada=0.20,
+    )
+    bot_repo.registrar_fill(pid, ts=60_000, reason=ExitReason.SCALE_HOT,
+                            fraction=0.33, precio_referencia=110.0, precio=109.0,
+                            comision=0.14, precio_regla=110.0)
+    bot_repo.registrar_fill(pid, ts=120_000, reason=ExitReason.STOP,
+                            fraction=0.67, precio_referencia=100.0, precio=100.0,
+                            comision=0.27, precio_regla=100.0)
+    return pid
+
+
+def test_api_bot_trade_desglosa_las_fases_con_su_pnl(tmp_path):
+    """Cuanto se cobro en cada fase, a que precio y con cuanto PnL.
+
+    El PnL por fase se reconstruye (no esta guardado), asi que lo que este
+    test protege de verdad es que la suma de las fases mas la comision de
+    entrada reproduzca EXACTAMENTE el pnl que el bot guardo: si algun dia
+    divergen, el desglose estaria contando una historia distinta de la del
+    libro contable."""
+    conn = open_db(tmp_path / "scanner.db")
+    bot_repo = BotRepo(conn)
+    bot_repo.set_equity_inicial("paper", 1000.0)
+    pid = _trade_escalonado(bot_repo)
+    # (109-100)*4*0.33 - 0.14 = 11.88 - 0.14 = 11.74
+    # (100-100)*4*0.67 - 0.27 =  0.00 - 0.27 = -0.27
+    # total - fee_entrada 0.20 = 11.27
+    bot_repo.cerrar(pid, close_ts=120_000, pnl=11.27, fees=0.41, max_rank=2)
+
+    app = create_app(ScannerState(), SignalRepo(conn), bot_repo=bot_repo, modo="paper")
+    with TestClient(app) as cliente:
+        d = cliente.get(f"/api/bot/trade/{pid}").json()
+
+    assert [f["reason"] for f in d["fases"]] == ["SCALE_HOT", "STOP"]
+    assert d["fases"][0]["fraction"] == pytest.approx(0.33)
+    assert d["fases"][0]["precio"] == pytest.approx(109.0)
+    assert d["fases"][0]["pnl_neto"] == pytest.approx(11.74)
+    assert d["fases"][1]["pnl_neto"] == pytest.approx(-0.27)
+    # el deslizamiento: la regla pedia 110, el mercado dio 109 -> -91 bps
+    assert d["fases"][0]["desvio_bps"] == pytest.approx(-90.909, rel=1e-3)
+    # y el coste TOTAL, entrada incluida
+    assert d["fees_total"] == pytest.approx(0.61)
+
+    reconstruido = sum(f["pnl_neto"] for f in d["fases"]) - d["fee_entrada"]
+    assert reconstruido == pytest.approx(d["pnl"], abs=0.01), (
+        "el desglose por fases no cuadra con el pnl guardado en la posicion"
+    )
+
+
+def test_api_bot_trade_de_otro_modo_no_se_expone(tmp_path):
+    """Los libros de `paper` y `real` son distintos y no deben mezclarse en
+    la misma vista: pedir por id un trade de otro modo es un 404, no una
+    fila de otro libro."""
+    conn = open_db(tmp_path / "scanner.db")
+    bot_repo = BotRepo(conn)
+    pid = bot_repo.abrir(
+        modo="real", symbol="AAAUSDT", direction=Direction.LONG, entry_ts=0,
+        entry_price=100.0, entry_price_senal=100.0, margin=20.0,
+        notional=400.0, size=4.0, fee_entrada=0.2,
+    )
+    bot_repo.cerrar(pid, close_ts=60_000, pnl=1.0, fees=0.1, max_rank=2)
+
+    app = create_app(ScannerState(), SignalRepo(conn), bot_repo=bot_repo, modo="paper")
+    with TestClient(app) as cliente:
+        assert cliente.get(f"/api/bot/trade/{pid}").status_code == 404
+        assert cliente.get("/api/bot/trade/9999").status_code == 404
