@@ -390,3 +390,26 @@ def test_las_fees_expuestas_no_cuentan_la_entrada_dos_veces(tmp_path):
     assert detalle["fees_total"] == pytest.approx(suma_pantalla), (
         "el total de fees no cuadra con la suma de entrada mas fases"
     )
+
+
+def test_los_estaticos_obligan_a_revalidar(tmp_path):
+    """El panel se sirve desde el mismo proceso que el scanner y sus ficheros
+    cambian en cada despliegue: sin `no-cache`, el navegador se queda con el
+    `app.js` viejo mientras recibe el `index.html` nuevo.
+
+    Eso paso de verdad: el panel salio con las columnas nuevas y sin una sola
+    fila, porque el JS cacheado ni siquiera tenia la funcion que las pinta, y
+    la unica salida era que el operador supiera hacer Ctrl+Shift+R.
+
+    `no-cache` no impide cachear: obliga a preguntar antes de usar lo
+    cacheado, y con el `etag` que ya se manda esa pregunta cuesta un 304."""
+    conn = open_db(tmp_path / "scanner.db")
+    app = create_app(ScannerState(), SignalRepo(conn), bot_repo=None, modo="paper")
+    with TestClient(app) as cliente:
+        for ruta in ("/", "/static/app.js", "/static/index.html"):
+            r = cliente.get(ruta)
+            assert r.status_code == 200, ruta
+            assert "no-cache" in r.headers.get("cache-control", ""), (
+                f"{ruta} no obliga a revalidar: un despliegue dejaria al "
+                f"navegador con la version vieja"
+            )

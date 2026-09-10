@@ -195,9 +195,35 @@ def create_app(
 
     @app.get("/")
     def index() -> FileResponse:
-        return FileResponse(ESTATICOS / "index.html")
+        # `no-cache` NO significa "no guardes": significa "guarda, pero
+        # pregunta antes de usarlo". Con el `etag` que ya manda Starlette, la
+        # comprobacion cuesta un 304 vacio.
+        #
+        # Sin esto, un despliegue dejaba al navegador con el `app.js` viejo
+        # mientras servia el `index.html` nuevo -y el panel salia con las
+        # columnas nuevas y sin una sola fila, porque el JS cacheado ni
+        # siquiera tenia la funcion que las pinta. Paso de verdad, y la unica
+        # salida era que el operador supiera hacer Ctrl+Shift+R.
+        return FileResponse(
+            ESTATICOS / "index.html",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    class EstaticosRevalidados(StaticFiles):
+        """`StaticFiles` que obliga a revalidar en cada carga.
+
+        El panel es una app de una sola pagina servida desde el mismo
+        proceso que el scanner: no hay CDN ni versionado de assets, y estos
+        ficheros cambian en cada despliegue. Revalidar siempre es lo barato
+        y lo correcto aqui; cachear a ciegas es lo que rompio el panel tras
+        un despliegue."""
+
+        def file_response(self, *args, **kwargs):
+            respuesta = super().file_response(*args, **kwargs)
+            respuesta.headers["Cache-Control"] = "no-cache"
+            return respuesta
 
     with contextlib.suppress(RuntimeError):
-        app.mount("/static", StaticFiles(directory=ESTATICOS), name="static")
+        app.mount("/static", EstaticosRevalidados(directory=ESTATICOS), name="static")
 
     return app
