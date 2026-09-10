@@ -23,6 +23,18 @@ def _abrir(repo, symbol="A", ts=0, precio=100.0, margin=20.0):
     )
 
 
+def _reservar(repo, modo="paper", symbol="A", ts=0, precio=100.0, margin=20.0,
+              client_oid="oid-test"):
+    """Igual que `_abrir`, pero como lo hace `BotRunner._abrir` ANTES de
+    mandar la orden: `confirmada=False` y con `client_oid`."""
+    return repo.abrir(
+        modo=modo, symbol=symbol, direction=Direction.LONG, entry_ts=ts,
+        entry_price=precio, entry_price_senal=precio, margin=margin,
+        notional=margin * 20, size=margin * 20 / precio, fee_entrada=0.0,
+        client_oid=client_oid, confirmada=False,
+    )
+
+
 def test_abrir_devuelve_id_y_aparece_como_abierta(repo):
     pid = _abrir(repo)
     assert pid > 0
@@ -113,6 +125,34 @@ def test_el_equity_inicial_no_se_mezcla_entre_modos(repo):
     assert repo.equity_inicial("real", defecto=0.0) == pytest.approx(50.0)
 
 
+def test_saldo_real_sin_dato_devuelve_none(repo):
+    # a diferencia de equity_inicial, saldo_real no tiene un "defecto" que
+    # tenga sentido inventar: None es la señal de "el proceso en vivo
+    # todavia no ha persistido ninguno" que el informe necesita distinguir
+    # de un saldo real de 0.
+    assert repo.saldo_real("real") is None
+
+
+def test_saldo_real_persiste(repo):
+    repo.set_saldo_real("real", 850.0)
+    assert repo.saldo_real("real") == pytest.approx(850.0)
+
+
+def test_saldo_real_se_puede_actualizar(repo):
+    # cada tick en real sobreescribe el anterior: el informe solo quiere el
+    # ULTIMO saldo conocido, no un historial.
+    repo.set_saldo_real("real", 850.0)
+    repo.set_saldo_real("real", 830.0)
+    assert repo.saldo_real("real") == pytest.approx(830.0)
+
+
+def test_saldo_real_no_se_mezcla_entre_modos(repo):
+    # "paper" nunca deberia tener un saldo_real persistido, pero si algo lo
+    # hiciera, no debe contaminar la lectura de "real".
+    repo.set_saldo_real("real", 850.0)
+    assert repo.saldo_real("paper") is None
+
+
 def test_los_modos_no_se_mezclan(repo):
     repo.set_equity_inicial("paper", 1000.0)
     pid = repo.abrir(modo="real", symbol="B", direction=Direction.LONG, entry_ts=0,
@@ -151,6 +191,70 @@ def test_marcar_degradada_persiste_el_flag(repo):
     assert repo.abiertas("paper")[0]["degradada"] == 0
     repo.marcar_degradada(pid)
     assert repo.abiertas("paper")[0]["degradada"] == 1
+
+
+def test_por_client_oid_encuentra_la_fila_reservada(repo):
+    pid = _reservar(repo, client_oid="oid-1")
+    fila = repo.por_client_oid("paper", "oid-1")
+    assert fila is not None
+    assert fila["id"] == pid
+    assert fila["symbol"] == "A"
+    assert fila["confirmada"] == 0
+
+
+def test_por_client_oid_devuelve_none_si_no_existe(repo):
+    assert repo.por_client_oid("paper", "oid-inexistente") is None
+
+
+def test_por_client_oid_no_mezcla_modos(repo):
+    _reservar(repo, modo="real", symbol="B", client_oid="oid-2")
+    assert repo.por_client_oid("paper", "oid-2") is None
+    assert repo.por_client_oid("real", "oid-2") is not None
+
+
+def test_confirmar_apertura_actualiza_precio_tamano_comision_y_marca_confirmada(repo):
+    pid = _reservar(repo, precio=100.0, client_oid="oid-3")
+    assert repo.abiertas("paper")[0]["confirmada"] == 0
+
+    # el broker devolvio un precio y una cantidad distintos de los
+    # provisionales con los que se reservo la fila
+    repo.confirmar_apertura(pid, entry_price=101.5, size=3.94, fee_entrada=0.24)
+
+    fila = repo.abiertas("paper")[0]
+    assert fila["entry_price"] == pytest.approx(101.5)
+    assert fila["size"] == pytest.approx(3.94)
+    assert fila["fee_entrada"] == pytest.approx(0.24)
+    assert fila["confirmada"] == 1
+
+
+def test_reservadas_sin_confirmar_deja_de_devolver_la_fila_al_confirmarla(repo):
+    # esta transicion (aparece -> desaparece) es exactamente la que usara la
+    # reconciliacion de arranque (Task 8) para distinguir una orden huerfana
+    # -mandada pero nunca confirmada- de una posicion normal.
+    pid = _reservar(repo, client_oid="oid-4")
+
+    reservadas = repo.reservadas_sin_confirmar("paper")
+    assert len(reservadas) == 1
+    assert reservadas[0]["id"] == pid
+    assert reservadas[0]["client_oid"] == "oid-4"
+
+    repo.confirmar_apertura(pid, entry_price=100.5, size=4.0, fee_entrada=0.1)
+
+    assert repo.reservadas_sin_confirmar("paper") == []
+
+
+def test_reservadas_sin_confirmar_no_mezcla_modos(repo):
+    _reservar(repo, modo="real", symbol="B", client_oid="oid-5")
+    assert repo.reservadas_sin_confirmar("paper") == []
+    assert len(repo.reservadas_sin_confirmar("real")) == 1
+
+
+def test_reservadas_sin_confirmar_no_incluye_posiciones_ya_confirmadas(repo):
+    # `abrir()` sin `confirmada=False` (el camino que usan el resto de
+    # llamadores) debe quedar fuera desde el principio, no solo tras un
+    # `confirmar_apertura` explicito.
+    _abrir(repo)
+    assert repo.reservadas_sin_confirmar("paper") == []
 
 
 def test_incrementar_contador_acumula_por_modo_y_clave(repo):

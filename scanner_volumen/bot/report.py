@@ -7,8 +7,11 @@ consigues del que la regla pedía.
 """
 from __future__ import annotations
 
+from scanner_volumen.bot.frenos import MOTIVO_SALDO_NO_FIABLE as FRENO_SALDO_NO_FIABLE
 from scanner_volumen.bot.model import ETIQUETAS_DESCARTE
+from scanner_volumen.bot.modo import REAL, REAL_LECTURA
 from scanner_volumen.bot.repo import BotRepo
+from scanner_volumen.bot.verificacion_cuenta import MOTIVO_VETO as VETO_CONFIG_CUENTA
 from scanner_volumen.models import Direction
 from scanner_volumen.strategy.model import (
     ExitReason, Fill, ResumenOperativa, TradeResumen,
@@ -80,6 +83,7 @@ def construir_resumen(
 
 def format_bloque_ejecucion(
     repo: BotRepo, modo: str, descartes: dict[str, int], cierres_tardios: int,
+    saldo_real: float | None = None,
 ) -> str:
     cerradas = repo.cerradas(modo)
     abiertas = repo.abiertas(modo)
@@ -149,17 +153,117 @@ def format_bloque_ejecucion(
     lineas.append(
         f"Cierres tardios por reinicio: {max(cierres_tardios, tardios_guardados)}"
     )
+
+    # Bloque de modo real (Task 11): en `paper` no hay saldo real que
+    # comparar ni exchange que reconcilie nada, así que el bloque NO
+    # aparece -ni una línea distinta- para no romper el formato que los
+    # tests de `paper` fijan como referencia. Se comprueba PERTENENCIA a
+    # los modos reales de `bot/modo.py` (hallazgo de revisión), no
+    # `modo != "paper"`: con esa desigualdad, un modo mal escrito o
+    # desconocido (`--modo pape`, un typo) imprimía el bloque entero con
+    # todo a cero en vez de tratarse como el `paper` que probablemente se
+    # quería decir.
+    if modo in (REAL, REAL_LECTURA):
+        lineas.extend(_lineas_modo_real(repo, modo, saldo_real))
     return "\n".join(lineas)
+
+
+def _lineas_modo_real(
+    repo: BotRepo, modo: str, saldo_real: float | None,
+) -> list[str]:
+    """El bloque que solo se imprime cuando hay dinero real en juego (spec
+    §9 y §10): el saldo real, el equity que calcula el bot y la diferencia
+    entre ambos -la métrica que justifica toda la fase, porque mide todo lo
+    que la estrategia no ve (funding, comisiones no modeladas, redondeos)-,
+    más los cierres que decidió el exchange por su cuenta, las posiciones
+    ajenas detectadas y los símbolos vetados, y cuántas veces se activó cada
+    freno manual."""
+    equity_bot = repo.equity(modo)
+    contadores = repo.contadores(modo)
+    lineas = ["", "Modo real:"]
+    if saldo_real is None:
+        # El proceso en vivo todavía no ha completado un tick en real (o
+        # este informe corre contra una base anterior a que empezara a
+        # persistirlo): mejor decirlo que fingir una diferencia de 0.00 que
+        # no se ha medido.
+        lineas.append(f"  Saldo real: sin dato todavia (equity calculado: {equity_bot:.2f})")
+    else:
+        diferencia = saldo_real - equity_bot
+        lineas.append(f"  Saldo real: {saldo_real:.2f}")
+        lineas.append(f"  Equity calculado: {equity_bot:.2f}")
+        lineas.append(
+            f"  Diferencia (funding, comisiones no modeladas, redondeos): "
+            f"{diferencia:+.2f}"
+        )
+    # Dos caminos distintos detectan un cierre que decidió el exchange por su
+    # cuenta -el stop saltó, o hubo liquidación- y ninguno marca al otro: el
+    # sondeo en vivo (`BotRunner._cerrar_por_sondeo`, runner.py) lo ve
+    # mientras el bot sigue corriendo; la reconciliación de arranque
+    # (`_reconciliar_cerrada_en_exchange`) lo encuentra al arrancar, cuando
+    # pasó con el bot caído. Se muestran POR SEPARADO en vez de sumados en un
+    # único número: para quien opera no es lo mismo "pasó y lo vi al
+    # momento" que "pasó y me enteré al reiniciar" -la segunda es la señal
+    # de que hubo una ventana sin gobierno, que la primera no tiene.
+    lineas.append(
+        f"  Cierres ejecutados por el exchange (sondeo en vivo): "
+        f"{contadores.get('cierres detectados por sondeo', 0)}"
+    )
+    lineas.append(
+        f"  Cierres ejecutados por el exchange (detectados al arrancar): "
+        f"{contadores.get('posiciones cerradas en el exchange', 0)}"
+    )
+    lineas.append(f"  Posiciones ajenas detectadas: {contadores.get('posiciones ajenas', 0)}")
+    # Dos etiquetas DISTINTAS a propósito (hallazgo de revisión): una
+    # posición ajena y un apalancamiento mal configurado piden acciones
+    # opuestas del operador (investigar de quién es la posición, frente a
+    # corregir la configuración de ESE símbolo en Bitget y reiniciar el
+    # bot) -sumarlas en un único "Simbolos vetados: N" le escondería cuál
+    # de las dos hace falta. Ver `bot/verificacion_cuenta.py`.
+    lineas.append(
+        f"  Simbolos vetados (posicion ajena): {contadores.get('simbolo vetado', 0)}"
+    )
+    lineas.append(
+        f"  Simbolos vetados (config de cuenta): "
+        f"{contadores.get(VETO_CONFIG_CUENTA, 0)}"
+    )
+    lineas.append(
+        f"  Freno perdida diaria activado: {contadores.get('perdida diaria', 0)} veces"
+    )
+    lineas.append(
+        f"  Freno parada de emergencia activado: "
+        f"{contadores.get('parada de emergencia', 0)} veces"
+    )
+    # El tercer freno (Task 13): el proveedor de saldo no tenía una lectura
+    # real y reciente que dar. Solo puede ocurrir en los modos reales, y por
+    # eso vive aquí y no en `ETIQUETAS_DESCARTE` -que imprimiría una línea de
+    # ceros también en `paper`. Ver `bot/frenos.py`.
+    lineas.append(
+        f"  Freno saldo no fiable activado: "
+        f"{contadores.get(FRENO_SALDO_NO_FIABLE, 0)} veces"
+    )
+    # Posiciones que el exchange cerró por su cuenta y que el bot NO pudo
+    # cerrar en su libro porque no consiguió el fill real de ese cierre
+    # (nunca se inventa un precio, ver `BotRunner._cerrar_por_sondeo`).
+    # Quedan marcadas `degradada` y siguen ocupando su hueco de
+    # concurrencia: es la línea que le dice al operador que hay filas
+    # varadas esperando una intervención manual, y sin ella el único rastro
+    # era un `log.error` perdido en journalctl.
+    varadas = contadores.get("sondeo sin fill real", 0)
+    lineas.append(
+        f"  Cierres SIN fill real (posiciones varadas, requieren revision "
+        f"manual): {varadas}"
+    )
+    return lineas
 
 
 def format_informe_bot(
     repo: BotRepo, modo: str, equity_inicial: float,
     descartes: dict[str, int] | None = None, cierres_tardios: int = 0,
     total_transiciones: int = 0, max_concurrentes: int = 0,
-    arrancado_ms: int | None = None,
+    arrancado_ms: int | None = None, saldo_real: float | None = None,
 ) -> str:
     etiquetas = descartes or dict.fromkeys(ETIQUETAS_DESCARTE, 0)
     resumen = construir_resumen(repo, modo, equity_inicial, etiquetas,
                                 total_transiciones, max_concurrentes, arrancado_ms)
     return (format_resumen(resumen) + "\n\n"
-            + format_bloque_ejecucion(repo, modo, etiquetas, cierres_tardios))
+            + format_bloque_ejecucion(repo, modo, etiquetas, cierres_tardios, saldo_real))

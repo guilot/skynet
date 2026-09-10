@@ -185,12 +185,29 @@ class BotConfig:
     alejarse del precio de la señal antes de descartar la entrada. Nace en 0.0
     (desactivado): primero se mide cuánto cuesta llegar tarde, y solo después
     se elige un umbral con datos detrás.
+
+    `perdida_diaria_max` y `fichero_parada` son los dos frenos manuales de la
+    Fase 3 (`bot/frenos.py`): cortan ENTRADAS nuevas -nunca la gestión de las
+    posiciones abiertas- cuando la pérdida del día supera esa fracción del
+    saldo de referencia, o cuando existe el fichero de parada de emergencia.
+
+    `sondeo_segundos` y `saldo_refresco_segundos` son las dos cadencias que
+    solo existen en los modos reales (Task 13, `__main__.py`): cada cuánto se
+    pregunta al exchange qué posiciones siguen vivas -para enterarse de un
+    stop que saltó mientras el bot miraba a otro lado- y cada cuánto se
+    refresca el saldo real que dimensiona el margen y mide el freno de
+    pérdida diaria. En `paper` no se arranca ninguno de esos dos bucles, así
+    que estos dos valores no cambian nada de lo que corre hoy en producción.
     """
 
     enabled: bool
     modo: str
     equity_inicial: float
     desvio_max_entrada: float
+    perdida_diaria_max: float = 0.10
+    fichero_parada: str = "data/parar_bot"
+    sondeo_segundos: float = 30.0
+    saldo_refresco_segundos: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -240,18 +257,12 @@ _MODOS_BOT = ("paper", "real")
 def _validar_bot(raw_bot: dict) -> None:
     """Valida el switch del bot al cargar, en un único punto de fallo.
 
-    "real" se reconoce como modo válido pero se rechaza en ejecución: el
-    interruptor de la Fase 3 queda cableado donde va a ir, y no puede
-    encenderse por accidente antes de que exista la ejecución real."""
+    "real" se reconoce como modo válido. El interruptor de la Fase 3 vive
+    ahora en `resolver_modo`, que exige además la variable de entorno."""
     modo = raw_bot["modo"]
     if modo not in _MODOS_BOT:
         raise ValueError(
             f"bot.modo no es válido: {modo!r} (válidos: {list(_MODOS_BOT)})"
-        )
-    if modo == "real":
-        raise ValueError(
-            "bot.modo = 'real' requiere la ejecución contra Bitget, que es la "
-            "Fase 3 y todavía no está implementada. Usa 'paper'."
         )
     if raw_bot["equity_inicial"] <= 0:
         raise ValueError(
@@ -262,6 +273,22 @@ def _validar_bot(raw_bot: dict) -> None:
             "bot.desvio_max_entrada no puede ser negativo, llegó "
             f"{raw_bot['desvio_max_entrada']!r}"
         )
+    perdida = raw_bot["perdida_diaria_max"]
+    if not (0 <= perdida <= 1):
+        raise ValueError(
+            f"bot.perdida_diaria_max debe estar entre 0 y 1, llegó {perdida!r}"
+        )
+    # Las dos cadencias de los modos reales: una cadencia <= 0 no es un ajuste
+    # agresivo sino un bucle que gira sin dormir, y con red de por medio eso
+    # significa martillear el exchange hasta que corte por límite de
+    # peticiones -justo el estado en el que el sondeo dejaría de detectar los
+    # cierres que existe para detectar. Se rechaza al cargar, como el resto de
+    # umbrales, en vez de fallar en caliente sin decir qué campo del TOML lo
+    # causó.
+    for campo in ("sondeo_segundos", "saldo_refresco_segundos"):
+        valor = raw_bot[campo]
+        if valor <= 0:
+            raise ValueError(f"bot.{campo} debe ser positivo, llegó {valor!r}")
 
 
 def _validar_backtest(raw_backtest: dict) -> None:

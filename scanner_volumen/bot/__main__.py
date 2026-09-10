@@ -44,6 +44,11 @@ def main(argv: list[str] | None = None) -> None:
             total_transiciones=contadores.get("transiciones", 0),
             max_concurrentes=contadores.get("max_concurrentes", 0),
             arrancado_ms=repo.arrancado_ms(),
+            # `None` en `paper` (nunca se persiste) y en `real` hasta que el
+            # proceso en vivo complete su primer tick -ver `BotRepo.
+            # set_saldo_real`-; `format_bloque_ejecucion` lo maneja sin
+            # reventar en ambos casos.
+            saldo_real=repo.saldo_real(args.modo),
         ))
     finally:
         conn.close()

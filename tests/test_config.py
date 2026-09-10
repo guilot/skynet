@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from scanner_volumen.bot.modo import resolver_modo
 from scanner_volumen.config import CURVAS_ESPERADAS, load_config
 
 # Anclado a la ubicación del propio fichero, no al cwd: sin esto la suite
@@ -200,14 +201,18 @@ def test_config_bot_se_carga_entera():
     assert cfg.bot.desvio_max_entrada == 0.0  # 0 = desactivado
 
 
-def test_modo_real_no_arranca(tmp_path):
-    # el switch de la Fase 3 está cableado pero no puede encenderse todavía
+def test_modo_real_se_acepta_en_la_config_pero_no_basta(tmp_path):
+    """`load_config` ya no rechaza `real`: el rechazo vive ahora en
+    `resolver_modo`, que exige además la variable de entorno. Este test fija
+    que la config SOLA nunca es suficiente para llegar a dinero real."""
     origen = CONFIG_PATH.read_text(encoding="utf-8")
     destino = tmp_path / "config.toml"
     destino.write_text(origen.replace('modo = "paper"', 'modo = "real"'),
                        encoding="utf-8")
-    with pytest.raises(ValueError, match="Fase 3"):
-        load_config(destino)
+    cfg = load_config(destino)          # ya no lanza
+    assert cfg.bot.modo == "real"
+    with pytest.raises(ValueError, match="SCANNER_BOT_REAL"):
+        resolver_modo(cfg.bot, {})      # pero sola no basta
 
 
 def test_modo_desconocido_falla(tmp_path):

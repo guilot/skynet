@@ -152,3 +152,27 @@ async def test_sin_transicion_de_entrada_no_revienta(conn):
     )
     # no la adopta, pero tampoco tumba el arranque
     assert bot2.abiertas == {}
+
+
+async def test_una_posicion_degradada_sigue_degradada_tras_reiniciar(conn):
+    """El flag `degradada` esta PERSISTIDO precisamente para sobrevivir al
+    reinicio -si no, una posicion aislada tras un fallo del broker volvia
+    del reinicio como sana y desaparecia del recuento del informe.
+
+    `_reconstruir_una` construia la `PosicionAbierta` sin leerlo, asi que la
+    persistencia funcionaba en la base pero no llegaba a memoria. Se detecto
+    mutando: poner `degradada=False` ahi dejaba la suite entera en verde."""
+    bot1, repo = _nuevo_runner(conn)
+    await bot1.on_tick([tr()], lambda s: 100.0, ahora=0)
+    pos = bot1.abiertas["A"]
+    pos.degradada = True
+    repo.marcar_degradada(pos.id)
+
+    bot2, _ = _nuevo_runner(conn)
+    await bot2.reconstruir(
+        transiciones_de=lambda s, desde: [tr()],
+        velas_de=lambda s, desde: velas(0, [100.0]),
+        precio_de=lambda s: 100.0, ahora=MIN,
+    )
+
+    assert bot2.abiertas["A"].degradada is True
