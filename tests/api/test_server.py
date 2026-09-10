@@ -413,3 +413,26 @@ def test_los_estaticos_obligan_a_revalidar(tmp_path):
                 f"{ruta} no obliga a revalidar: un despliegue dejaria al "
                 f"navegador con la version vieja"
             )
+
+
+def test_los_assets_van_versionados_por_contenido(tmp_path):
+    """`Cache-Control: no-cache` no basta y se aprendio en produccion: esa
+    cabecera solo gobierna las respuestas FUTURAS, asi que un navegador que
+    ya tenia el `app.js` viejo guardado con las reglas de antes lo seguia
+    usando. El panel salio con las columnas nuevas y sin una sola fila.
+
+    Cambiar la URL lo arregla de raiz: `app.js?v=<huella>` es un recurso
+    DISTINTO, y no se puede servir de una cache que no lo tiene."""
+    conn = open_db(tmp_path / "scanner.db")
+    app = create_app(ScannerState(), SignalRepo(conn), bot_repo=None, modo="paper")
+    with TestClient(app) as cliente:
+        html = cliente.get("/").text
+
+    assert "/static/app.js?v=" in html, "el JS no va versionado"
+    assert "/static/style.css?v=" in html, "el CSS no va versionado"
+    # y la version es la MISMA para los dos: es una huella del panel entero,
+    # no una por fichero, para que no puedan quedar desparejados.
+    import re
+    versiones = set(re.findall(r"/static/\w+\.\w+\?v=(\w+)", html))
+    assert len(versiones) == 1, f"versiones desparejadas: {versiones}"
+    assert len(versiones.pop()) == 12

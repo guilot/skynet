@@ -304,7 +304,6 @@ function pintarHistorico(cerradas) {
   // sondeo.
   const firma = firmaDe(cerradas);
   if (firma === firmaHistorico) return;
-  firmaHistorico = firma;
 
   // El resumen acompaña SIEMPRE al win rate con el total y el PnL: un win
   // rate alto con PnL negativo es perfectamente posible en esta estrategia
@@ -357,6 +356,14 @@ function pintarHistorico(cerradas) {
       if (desplegados.has(fila.dataset.id)) dibujarDetalle(fila);
     });
   }
+
+  // La firma se marca AL FINAL, solo si se ha pintado de verdad. Marcarla
+  // antes -como hacia la primera version- convertia cualquier excepcion
+  // posterior en un fallo PERMANENTE: la tabla se quedaba vacia y los
+  // sondeos siguientes salian por el atajo de "no ha cambiado nada" sin
+  // volver a intentarlo nunca. Y como `refrescarBot` se traga la excepcion
+  // con un `console.warn`, el sintoma era una tabla vacia sin ninguna pista.
+  firmaHistorico = firma;
 }
 
 function pintarBot(datos) {

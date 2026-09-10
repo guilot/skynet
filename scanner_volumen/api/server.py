@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from scanner_volumen.app.state import ScannerState
@@ -193,21 +194,42 @@ def create_app(
         except Exception as exc:  # noqa: BLE001 - una pestaña caída no tumba el servidor
             log.debug("WebSocket del dashboard cerrado: %s", exc)
 
+    def _version_estaticos() -> str:
+        """Huella del contenido de `app.js` + `style.css`.
+
+        Se calcula una vez al construir la app: estos ficheros no cambian
+        con el proceso vivo, cambian con el despliegue -que reinicia el
+        proceso."""
+        h = hashlib.sha256()
+        for nombre in ("app.js", "style.css"):
+            ruta = ESTATICOS / nombre
+            if ruta.exists():
+                h.update(ruta.read_bytes())
+        return h.hexdigest()[:12]
+
+    VERSION_ESTATICOS = _version_estaticos()
+
     @app.get("/")
-    def index() -> FileResponse:
-        # `no-cache` NO significa "no guardes": significa "guarda, pero
-        # pregunta antes de usarlo". Con el `etag` que ya manda Starlette, la
-        # comprobacion cuesta un 304 vacio.
-        #
-        # Sin esto, un despliegue dejaba al navegador con el `app.js` viejo
-        # mientras servia el `index.html` nuevo -y el panel salia con las
-        # columnas nuevas y sin una sola fila, porque el JS cacheado ni
-        # siquiera tenia la funcion que las pinta. Paso de verdad, y la unica
-        # salida era que el operador supiera hacer Ctrl+Shift+R.
-        return FileResponse(
-            ESTATICOS / "index.html",
-            headers={"Cache-Control": "no-cache"},
-        )
+    def index() -> HTMLResponse:
+        """Sirve el panel con la version incrustada en la URL de los assets.
+
+        `Cache-Control: no-cache` no basta por si solo, y esto se aprendio
+        en produccion: esa cabecera solo gobierna las respuestas FUTURAS,
+        asi que un navegador que ya tenia el `app.js` viejo guardado con las
+        reglas de antes seguia usandolo. El panel salio con las columnas
+        nuevas y sin una sola fila -el JS cacheado ni siquiera tenia la
+        funcion que las pinta- y la unica salida era saber hacer
+        Ctrl+Shift+R.
+
+        Cambiar la URL lo arregla de raiz: `app.js?v=<huella>` es un recurso
+        DISTINTO para el navegador, asi que no puede servirlo de una cache
+        que no lo tiene. Y como la huella es del contenido, un despliegue
+        que no toque el panel no invalida nada.
+        """
+        html = (ESTATICOS / "index.html").read_text(encoding="utf-8")
+        html = html.replace("/static/app.js", f"/static/app.js?v={VERSION_ESTATICOS}")
+        html = html.replace("/static/style.css", f"/static/style.css?v={VERSION_ESTATICOS}")
+        return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
     class EstaticosRevalidados(StaticFiles):
         """`StaticFiles` que obliga a revalidar en cada carga.
