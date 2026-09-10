@@ -395,18 +395,20 @@ async def test_una_reserva_no_correlacionable_veta_el_simbolo(conn):
     assert repo.contadores("paper").get("simbolo vetado") == 1
 
 
-async def test_una_reserva_huerfana_que_SI_se_ejecuto_se_adopta_por_el_historial(conn):
-    """La mejora sobre el veto, posible tras verificar la API de verdad.
+async def test_una_reserva_huerfana_que_SI_se_ejecuto_se_adopta_pero_queda_degradada(conn):
+    """Adoptar sus DATOS es correcto; darla por gobernada NO lo era.
 
-    El endpoint de POSICIONES no devuelve `client_oid`, pero el de ORDENES
-    si (comprobado contra la cuenta de simulacion). Asi que la pregunta que
-    de verdad importa -"¿llego a ejecutarse mi orden?"- tiene respuesta.
+    El endpoint de posiciones no devuelve `client_oid`, pero el de ordenes
+    si, asi que se puede saber si la orden llego a ejecutarse. Si se
+    ejecuto, adoptar precio/tamano/comision REALES evita que el libro
+    contable quede mintiendo con los valores provisionales.
 
-    Si se ejecuto, hay una posicion REAL apalancada y sin stop, porque el
-    stop se coloca DESPUES de confirmar la apertura. Vetar el simbolo evita
-    abrir otra encima, pero deja esa posicion sin gobierno; adoptarla con
-    sus datos reales es estrictamente mejor, porque a partir de ahi el bot
-    le pone su stop y la gestiona como cualquier otra."""
+    Pero esa posicion NO tiene stop en el exchange -el stop se coloca
+    DESPUES de confirmar la apertura, y el proceso murio antes- y nada se lo
+    va a poner: `_colocar_stop_inicial` solo se invoca desde `_abrir`. La
+    primera version de este test afirmaba lo contrario y dejaba pasar una
+    posicion a 20x sin red, sin marcar y con un log diciendo que estaba
+    gobernada. Ahora se marca degradada y SE MANTIENE EL VETO."""
     repo = BotRepo(conn)
     posicion_id = repo.abrir(
         modo="paper", symbol="A", direction=Direction.LONG, entry_ts=0,
@@ -416,8 +418,7 @@ async def test_una_reserva_huerfana_que_SI_se_ejecuto_se_adopta_por_el_historial
     )
 
     async def _historial(symbol, client_oid=None):
-        # solo responde al identificador de ESA reserva: la correlacion en
-        # produccion es por `clientOid`, no por simbolo.
+        # la correlacion en produccion es por `clientOid`, no por simbolo
         if client_oid == "bot-huerfano":
             return OrdenEjecutada(ts=0, precio=101.5, cantidad=3.9, comision=0.21)
         return None
@@ -435,12 +436,50 @@ async def test_una_reserva_huerfana_que_SI_se_ejecuto_se_adopta_por_el_historial
 
     fila = next(f for f in repo.abiertas("paper") if f["id"] == posicion_id)
     assert fila["confirmada"] == 1
-    # se adopta con los datos REALES del exchange, no con los provisionales
+    # datos REALES del exchange, no los provisionales
     assert fila["entry_price"] == pytest.approx(101.5)
     assert fila["size"] == pytest.approx(3.9)
     assert fila["fee_entrada"] == pytest.approx(0.21)
-    # y ya NO se veta: la posicion pasa a estar gobernada
-    assert "A" not in bot.simbolos_vetados
+    # ...pero visible como lo que es: sin stop y sin gobierno
+    assert fila["degradada"] == 1
+    assert "A" in bot.simbolos_vetados
+
+
+async def test_la_reserva_adoptada_no_deja_abrir_otra_encima(conn):
+    """La regresion concreta que introdujo la primera version.
+
+    Si la adopcion quita el veto y `_reconstruir_una` se rinde despues
+    -aqui, porque no hay transicion de entrada en la base, que es un
+    escenario realista-, el simbolo queda libre y el bot abre una SEGUNDA
+    posicion sobre la misma real. Es el fallo que la Task 13 habia cerrado
+    con el veto, reintroducido por una 'mejora'."""
+    repo = BotRepo(conn)
+    repo.abrir(
+        modo="paper", symbol="A", direction=Direction.LONG, entry_ts=0,
+        entry_price=100.0, entry_price_senal=100.0, margin=20.0,
+        notional=400.0, size=4.0, fee_entrada=0.0,
+        client_oid="bot-huerfano", confirmada=False,
+    )
+
+    async def _historial(symbol, client_oid=None):
+        if client_oid == "bot-huerfano":
+            return OrdenEjecutada(ts=0, precio=101.5, cantidad=3.9, comision=0.21)
+        return None
+
+    bot, _ = _nuevo_runner(conn)
+    await bot.reconciliar_con_exchange(
+        [PosicionExchange(symbol="A", direction=Direction.LONG, size=3.9,
+                          entry_price=101.5, entry_ts=0, client_oid=None)],
+        transiciones_de=_sin_historial, velas_de=_sin_velas, precio_de=_sin_precio,
+        fill_de_cierre=_historial, ahora=MIN,
+    )
+    # llega una senal de entrada para ese mismo simbolo
+    await bot.on_tick([tr(ts=2 * MIN)], lambda s: 100.0, ahora=2 * MIN)
+
+    filas = [f for f in repo.abiertas("paper") if f["symbol"] == "A"]
+    assert len(filas) == 1, (
+        f"se abrio una segunda posicion encima de la real: {len(filas)} filas"
+    )
 
 
 async def test_si_el_historial_tampoco_la_encuentra_se_sigue_vetando(conn):

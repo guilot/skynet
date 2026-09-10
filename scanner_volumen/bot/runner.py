@@ -514,6 +514,9 @@ class BotRunner:
             # es exactamente el mismo mecanismo que usa un tick normal, no uno
             # especial para el reinicio.
             stop_id=fila["stop_id"], stop_price_colocado=reglas.stop_price,
+            # el flag persistido tiene que sobrevivir al reinicio: sin esto,
+            # una posicion marcada degradada volvia del reinicio como sana.
+            degradada=bool(fila["degradada"]),
         )
 
         registrados = {f["reason"]: f for f in self._repo.fills_de(fila["id"])}
@@ -754,17 +757,42 @@ class BotRunner:
             # gobierno: adoptada, el bot le pondrá su stop y la gestionará.
             orden = await buscar_orden(fila["symbol"], client_oid)
             if orden is not None:
+                # Se adoptan sus DATOS REALES -precio, tamaño y comisión del
+                # exchange en vez de los provisionales-, que es lo que
+                # impide que el libro contable quede mintiendo.
                 self._repo.confirmar_apertura(
                     fila["id"], entry_price=orden.precio,
                     size=orden.cantidad, fee_entrada=orden.comision,
                 )
+                # Pero NO queda gobernada, y esto es lo que una revisión
+                # demostró que la primera versión de este código afirmaba en
+                # falso: esa posición NO TIENE STOP en el exchange -el stop
+                # se coloca después de confirmar la apertura, y este proceso
+                # murió antes-, y nada se lo va a poner. `_colocar_stop_
+                # inicial` solo se invoca desde `_abrir`, y `_sincronizar_
+                # stop` se va de vacío cuando `stop_id is None`. Colocarlo
+                # aquí es materia de otra ronda: su camino de fallo cierra a
+                # mercado, y meter un cierre de emergencia dentro de la
+                # reconciliación de arranque es una decisión que merece su
+                # propia revisión, no un añadido de paso.
+                #
+                # Así que se marca degradada y SE MANTIENE EL VETO. Quitarlo
+                # -lo que hacía la primera versión- reintroducía el fallo que
+                # la Task 13 cerró: si `_reconstruir_una` se rinde después
+                # (p. ej. porque falta la transición de entrada en la base),
+                # el símbolo queda libre y el bot abre una SEGUNDA posición
+                # encima de la real.
+                self._repo.marcar_degradada(fila["id"])
+                self.simbolos_vetados.add(fila["symbol"])
                 self._repo.incrementar_contador(
                     self._cfg.modo, "reserva adoptada por historial")
-                log.warning(
-                    "bot: reconciliacion: %s (client_oid=%r) no se pudo "
-                    "correlacionar contra las posiciones, pero SI aparece "
-                    "ejecutada en el historial de ordenes; se adopta con sus "
-                    "datos reales (precio %.6g, tamano %.6g)",
+                log.error(
+                    "bot: reconciliacion: %s (client_oid=%r) aparece "
+                    "EJECUTADA en el historial de ordenes; se adopta con sus "
+                    "datos reales (precio %.6g, tamano %.6g) pero queda "
+                    "DEGRADADA y el simbolo VETADO: esa posicion esta "
+                    "apalancada y SIN STOP en el exchange, y este bot no se "
+                    "lo va a poner -- ponle un stop a mano o cierrala",
                     fila["symbol"], client_oid, orden.precio, orden.cantidad)
                 return
             self._repo.incrementar_contador(

@@ -127,9 +127,15 @@ revés.
    la registra. El endpoint de posiciones no devuelve el identificador de
    cliente, así que por esa vía el bot no la reconoce como suya -pero el
    historial de órdenes SÍ lo devuelve, así que la busca ahí por su
-   identificador y, si aparece ejecutada, **la adopta con sus datos reales**
-   y pasa a gestionarla como cualquier otra (le colocará su stop). Se ve en
-   el log como `reserva adoptada por historial`.
+   identificador y, si aparece ejecutada, **adopta sus datos reales**
+   (precio, tamaño y comisión del exchange en vez de los provisionales), para
+   que el libro contable no quede mintiendo.
+
+   **Pero esa posición no queda gobernada, y hay que atenderla:** no tiene
+   stop en el exchange -el stop se coloca después de confirmar la apertura, y
+   el proceso murió antes- y el bot **no se lo va a poner**. Queda marcada
+   `degradada`, el símbolo vetado, y el log lo dice con un error. Ponle un
+   stop a mano o ciérrala.
 
    Si tampoco aparece en el historial, no se puede afirmar que se ejecutara:
    la fila se deja intacta y el símbolo queda **vetado** el resto de la
