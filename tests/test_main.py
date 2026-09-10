@@ -14,25 +14,42 @@ levantar `httpx.AsyncClient`, `uvicorn` ni una `main()` entera. No toca red
 ni reloj de pared real salvo `ahora_ms()`, cuyo único contrato es "milisegundos
 desde epoch", que se comprueba sin comparar contra ningún reloj del exchange.
 """
+import asyncio
 from pathlib import Path
 
 import pytest
 
 from scanner_volumen.__main__ import (
-    MANTENIMIENTO_REINTENTO_MS, ahora_ms, marcar_ws_conectado, parse_args,
-    paso_evaluador, paso_mantenimiento, paso_outcomes, paso_tickers,
+    MANTENIMIENTO_REINTENTO_MS, ProveedorSaldo, ahora_ms,
+    construir_piezas_del_bot, hacer_fill_de_cierre, main,
+    marcar_ws_conectado, parse_args,
+    paso_evaluador, paso_mantenimiento, paso_outcomes, paso_saldo,
+    paso_sondeo, paso_tickers, posiciones_del_bot,
 )
 from scanner_volumen.app.orchestrator import Orchestrator
 from scanner_volumen.app.state import ScannerState
+from scanner_volumen.bitget.private import (
+    BitgetPrivate, ConfiguracionCuentaSymbol, SaldoCuenta,
+)
+from scanner_volumen.bitget.private import PosicionExchange as PosicionExchangeBitget
 from scanner_volumen.bitget.ws import WsEvent
-from scanner_volumen.config import load_config
+from scanner_volumen.bot.bitget_broker import BitgetBroker
+from scanner_volumen.bot.broker import PaperBroker
+from scanner_volumen.bot.frenos import MOTIVO_PARADA_EMERGENCIA, Frenos
+from scanner_volumen.bot.model import OrdenEjecutada
+from scanner_volumen.bot.modo import PAPER, REAL, REAL_LECTURA
+from scanner_volumen.bot.portfolio import LivePortfolio
+from scanner_volumen.bot.repo import BotRepo
+from scanner_volumen.bot.runner import BotRunner
+from scanner_volumen.config import BotConfig, load_config
 from scanner_volumen.engine.profile import build_profile
-from scanner_volumen.models import Candle, Contract, Direction, Ticker
+from scanner_volumen.models import Candle, Contract, Direction, State, Ticker
 from scanner_volumen.scoring.score import ScoreBreakdown
 from scanner_volumen.storage.db import open_db
 from scanner_volumen.storage.repos import (
     CandleRepo, MaintenanceRepo, ProfileRepo, SignalRepo, StateTransitionRepo,
 )
+from scanner_volumen.strategy.model import StrategyParams, TransitionRow
 from scanner_volumen.universe.selector import UniverseSelector
 
 MINUTO = 60_000
@@ -459,3 +476,858 @@ async def test_paso_tickers_no_propaga_un_fallo_de_rest(orq):
 
     assert nuevo_ultimo == 0  # no avanzó: el refresco falló
     assert orq.state.connected is False
+
+
+# --- cableado del bot en los tres modos (Task 13) ---
+#
+# Estos tests protegen el punto donde una confusión pone dinero real en juego.
+# El más importante es el del escalón intermedio (`real_lectura`): si alguien
+# lo rompe, el bot empezaría a mandar órdenes reales creyendo que no.
+
+
+class PrivadoFalso:
+    """Doble de `BitgetPrivate` que no toca red. Cuenta las llamadas porque
+    varios tests necesitan demostrar que el camino SÍ se recorrió, no solo
+    que el resultado salió bien."""
+
+    def __init__(self, saldos=(1000.0,), posiciones=()):
+        self._saldos = list(saldos)
+        self._posiciones = list(posiciones)
+        self.consultas_de_saldo = 0
+        self.consultas_de_posiciones = 0
+        self.ajustes = []
+
+    async def get_saldo(self):
+        self.consultas_de_saldo += 1
+        valor = self._saldos[min(self.consultas_de_saldo - 1, len(self._saldos) - 1)]
+        if isinstance(valor, Exception):
+            raise valor
+        return SaldoCuenta(realizado=valor, disponible=valor, equity=valor,
+                           pnl_no_realizado=0.0)
+
+    async def get_posiciones(self):
+        self.consultas_de_posiciones += 1
+        return list(self._posiciones)
+
+    async def get_configuracion_symbol(self, symbol):
+        return ConfiguracionCuentaSymbol(
+            margen_aislado=True,
+            apalancamiento_long=float(StrategyParams().apalancamiento),
+            apalancamiento_short=float(StrategyParams().apalancamiento),
+            modo_una_via=True,
+        )
+
+    async def ajustar_configuracion_symbol(self, symbol, apalancamiento):
+        # la unica escritura de este cliente que no es una orden; se apunta
+        # para que los tests puedan comprobar QUIEN la recibe y en que modo.
+        self.ajustes.append((symbol, apalancamiento))
+
+
+def _entorno_con_claves():
+    return {
+        "SCANNER_BITGET_KEY": "clave-de-prueba",
+        "SCANNER_BITGET_SECRET": "secreto-de-prueba",
+        "SCANNER_BITGET_PASSPHRASE": "passphrase-de-prueba",
+    }
+
+
+async def test_la_factoria_en_paper_no_construye_cliente_autenticado():
+    """Y ni siquiera mira el entorno: se le pasan claves válidas y las
+    ignora. El camino de paper no debe cargar credenciales que no necesita."""
+    cfg = load_config(CONFIG_PATH)
+    piezas = construir_piezas_del_bot(
+        PAPER, StrategyParams(), cfg, http=None, entorno=_entorno_con_claves())
+
+    assert piezas.privado is None
+    assert isinstance(piezas.broker, PaperBroker)
+
+
+async def test_la_factoria_en_real_lectura_lee_de_verdad_pero_ejecuta_en_paper():
+    """EL TEST DEL ESCALÓN INTERMEDIO. `real_lectura` existe para conectarse
+    a Bitget de verdad -saldo, posiciones, configuración de cuenta- sin poder
+    mandar ni una orden. Si esta línea se rompe, el bot operaría con dinero
+    real creyendo que está de prueba."""
+    cfg = load_config(CONFIG_PATH)
+    piezas = construir_piezas_del_bot(
+        REAL_LECTURA, StrategyParams(), cfg, http=None,
+        entorno=_entorno_con_claves())
+
+    assert isinstance(piezas.privado, BitgetPrivate)  # sí lee
+    assert isinstance(piezas.broker, PaperBroker)     # pero no ejecuta
+    assert not isinstance(piezas.broker, BitgetBroker)
+
+
+async def test_la_factoria_en_real_usa_el_broker_de_bitget():
+    cfg = load_config(CONFIG_PATH)
+    piezas = construir_piezas_del_bot(
+        REAL, StrategyParams(), cfg, http=None, entorno=_entorno_con_claves())
+
+    assert isinstance(piezas.privado, BitgetPrivate)
+    assert isinstance(piezas.broker, BitgetBroker)
+
+
+@pytest.mark.parametrize("variable", [
+    "SCANNER_BITGET_KEY", "SCANNER_BITGET_SECRET", "SCANNER_BITGET_PASSPHRASE",
+])
+def test_la_factoria_en_real_sin_credenciales_falla_nombrando_la_variable(variable):
+    """El mensaje nombra la VARIABLE que falta, nunca su contenido: una clave
+    no puede aparecer en un log ni en un mensaje de excepción."""
+    cfg = load_config(CONFIG_PATH)
+    entorno = _entorno_con_claves()
+    del entorno[variable]
+
+    with pytest.raises(ValueError, match=variable):
+        construir_piezas_del_bot(REAL, StrategyParams(), cfg, None, entorno)
+
+
+def test_la_factoria_no_filtra_las_credenciales_en_el_mensaje_de_error():
+    cfg = load_config(CONFIG_PATH)
+    entorno = _entorno_con_claves()
+    entorno["SCANNER_BITGET_SECRET"] = ""  # presente pero vacía
+
+    with pytest.raises(ValueError) as excinfo:
+        construir_piezas_del_bot(REAL, StrategyParams(), cfg, None, entorno)
+
+    mensaje = str(excinfo.value)
+    for valor in _entorno_con_claves().values():
+        assert valor not in mensaje
+
+
+async def test_la_factoria_rechaza_un_modo_desconocido():
+    """La guarda redundante de `construir_piezas_del_bot`: un modo nuevo que
+    nadie enseñó a esta función debe hacerla fallar, nunca caer por defecto
+    en el broker que mueve dinero."""
+    cfg = load_config(CONFIG_PATH)
+    with pytest.raises(ValueError, match="modo efectivo desconocido"):
+        construir_piezas_del_bot("casi_real", StrategyParams(), cfg, None,
+                                 _entorno_con_claves())
+
+
+def _config_real(tmp_path):
+    """Copia de `config.toml` con `modo = "real"` y una base de datos propia.
+
+    La base de datos se redirige a `tmp_path` para poder AFIRMAR que el
+    proceso murió antes de abrirla: es lo que demuestra que la doble llave se
+    comprueba antes de tocar nada, no a mitad del arranque."""
+    texto = CONFIG_PATH.read_text(encoding="utf-8")
+    assert 'modo = "paper"' in texto
+    texto = texto.replace('modo = "paper"', 'modo = "real"')
+    db = tmp_path / "no-deberia-existir.db"
+    texto = texto.replace('db_path = "data/scanner.db"', f'db_path = "{db}"')
+    destino = tmp_path / "config.toml"
+    destino.write_text(texto, encoding="utf-8")
+    return destino, db
+
+
+async def test_main_no_arranca_con_modo_real_y_sin_la_variable(tmp_path, monkeypatch):
+    """La doble llave de la Fase 3: `modo = "real"` en el fichero no basta.
+    El `ValueError` de `resolver_modo` NO se captura -impedir el arranque es
+    justamente su trabajo."""
+    ruta, db = _config_real(tmp_path)
+    monkeypatch.delenv("SCANNER_BOT_REAL", raising=False)
+
+    with pytest.raises(ValueError, match="SCANNER_BOT_REAL"):
+        await main(["--config", str(ruta)])
+
+    # y murió ANTES de abrir la base de datos ni ninguna conexión de red
+    assert not db.exists()
+
+
+async def test_main_no_arranca_con_modo_real_y_una_variable_inventada(
+    tmp_path, monkeypatch,
+):
+    ruta, db = _config_real(tmp_path)
+    monkeypatch.setenv("SCANNER_BOT_REAL", "si")
+
+    with pytest.raises(ValueError, match="SCANNER_BOT_REAL"):
+        await main(["--config", str(ruta)])
+
+    assert not db.exists()
+
+
+# --- el proveedor de saldo (Step 2) ---
+
+
+async def test_el_proveedor_lanza_mientras_no_haya_observado_un_saldo():
+    """La decisión de diseño del Step 2: el proveedor NO PUEDE devolver un
+    valor que no sea un saldo real observado. Sin esta propiedad, un `0.0`
+    inicial se persistiría como referencia del freno de pérdida diaria y lo
+    desactivaría el resto del día UTC, sobreviviendo a un reinicio."""
+    proveedor = ProveedorSaldo(PrivadoFalso(), edad_maxima_s=60.0)
+
+    with pytest.raises(ValueError, match="ningún saldo real"):
+        proveedor()
+
+
+async def test_el_proveedor_devuelve_el_ultimo_saldo_observado():
+    privado = PrivadoFalso(saldos=(1234.5, 1200.0))
+    proveedor = ProveedorSaldo(privado, edad_maxima_s=60.0)
+
+    assert await proveedor.refrescar() == pytest.approx(1234.5)
+    assert proveedor() == pytest.approx(1234.5)  # sin volver a preguntar
+    assert privado.consultas_de_saldo == 1
+
+    await proveedor.refrescar()
+    assert proveedor() == pytest.approx(1200.0)
+
+
+@pytest.mark.parametrize("espurio", [0.0, -5.0, float("nan"), float("inf")])
+async def test_un_saldo_espurio_no_entra_en_el_cache(espurio):
+    """Un valor inválido se rechaza en la ÚNICA puerta de entrada del caché,
+    y no sustituye al último bueno: el freno sigue midiendo sobre una cifra
+    real en vez de sobre la basura recién llegada."""
+    privado = PrivadoFalso(saldos=(1000.0, espurio))
+    proveedor = ProveedorSaldo(privado, edad_maxima_s=60.0)
+    await proveedor.refrescar()
+
+    with pytest.raises(ValueError):
+        await proveedor.refrescar()
+
+    assert proveedor() == pytest.approx(1000.0)
+
+
+async def test_el_primer_saldo_espurio_deja_al_proveedor_sin_valor():
+    """El caso que más importa: si la PRIMERA lectura del día es basura, el
+    proveedor sigue sin tener nada que devolver -jamás un cero de fábrica."""
+    proveedor = ProveedorSaldo(PrivadoFalso(saldos=(0.0,)), edad_maxima_s=60.0)
+
+    with pytest.raises(ValueError):
+        await proveedor.refrescar()
+    with pytest.raises(ValueError, match="ningún saldo real"):
+        proveedor()
+
+
+async def test_un_saldo_demasiado_viejo_deja_de_darse_por_bueno():
+    """Un saldo observado hace mucho es real pero ya no es una medida: si la
+    red lleva caída lo bastante, el freno de pérdida diaria estaría
+    comparando contra una foto congelada mientras la cuenta se hunde."""
+    reloj = {"t": 0.0}
+    proveedor = ProveedorSaldo(PrivadoFalso(), edad_maxima_s=60.0,
+                               reloj=lambda: reloj["t"])
+    await proveedor.refrescar()
+
+    reloj["t"] = 60.0
+    assert proveedor() == pytest.approx(1000.0)  # justo en el límite, vale
+
+    reloj["t"] = 60.1
+    with pytest.raises(ValueError, match="tolerados"):
+        proveedor()
+
+    # y se recupera en cuanto vuelve a haber una lectura fresca
+    await proveedor.refrescar()
+    assert proveedor() == pytest.approx(1000.0)
+
+
+async def test_el_mismo_proveedor_alimenta_a_la_cartera_y_a_los_frenos(tmp_path):
+    """El invariante de la Task 11: la referencia del freno y la medida del
+    margen tienen que salir de la MISMA fuente. Se comprueba cambiando el
+    saldo una sola vez y viendo que las dos puntas se mueven juntas."""
+    conn = open_db(tmp_path / "bot.db")
+    repo = BotRepo(conn)
+    repo.set_equity_inicial("real", 1000.0)
+    cfg_bot = BotConfig(enabled=True, modo="real", equity_inicial=1000.0,
+                        desvio_max_entrada=0.0, perdida_diaria_max=0.05,
+                        fichero_parada=str(tmp_path / "no-existe"))
+    privado = PrivadoFalso(saldos=(1000.0, 900.0))
+    proveedor = ProveedorSaldo(privado, edad_maxima_s=3600.0)
+    await proveedor.refrescar()
+
+    params = StrategyParams()
+    cartera = LivePortfolio(params, cfg_bot, repo, proveedor)
+    frenos = Frenos(cfg_bot, repo, "real", proveedor)
+
+    assert cartera.equity() == pytest.approx(1000.0)
+    frenos.registrar_saldo_del_dia(0, proveedor())
+    assert frenos.puede_abrir(0) is None
+
+    await proveedor.refrescar()  # la cuenta cae un 10%, con el tope en el 5%
+    assert cartera.equity() == pytest.approx(900.0)
+    assert frenos.puede_abrir(0) == "perdida diaria"
+    conn.close()
+
+
+async def test_paso_saldo_refresca_y_persiste_el_mismo_numero(tmp_path):
+    """El contrato con la Task 13 escrito en `BotRepo.set_saldo_real`: lo que
+    el informe enseña tiene que ser exactamente la cifra que dimensiona el
+    margen, no una segunda lectura por otro camino."""
+    conn = open_db(tmp_path / "bot.db")
+    repo = BotRepo(conn)
+    privado = PrivadoFalso(saldos=(1234.5,))
+    proveedor = ProveedorSaldo(privado, edad_maxima_s=60.0)
+
+    await paso_saldo(proveedor, repo, "real")
+
+    assert repo.saldo_real("real") == pytest.approx(1234.5)
+    assert proveedor() == pytest.approx(1234.5)
+    conn.close()
+
+
+async def test_paso_saldo_no_propaga_un_fallo_ni_persiste_nada(tmp_path):
+    conn = open_db(tmp_path / "bot.db")
+    repo = BotRepo(conn)
+    privado = PrivadoFalso(saldos=(RuntimeError("Bitget no responde"),))
+    proveedor = ProveedorSaldo(privado, edad_maxima_s=60.0)
+
+    await paso_saldo(proveedor, repo, "real")  # no lanza
+
+    assert repo.saldo_real("real") is None
+    conn.close()
+
+
+# --- traducción de posiciones del exchange ---
+
+
+def test_las_posiciones_del_exchange_se_traducen_al_vocabulario_del_bot():
+    traducidas = posiciones_del_bot([
+        PosicionExchangeBitget(symbol="AAAUSDT", lado="long", tamano=4.0,
+                               precio_entrada=100.0),
+        PosicionExchangeBitget(symbol="BBBUSDT", lado="short", tamano=2.0,
+                               precio_entrada=50.0),
+    ])
+
+    assert [p.symbol for p in traducidas] == ["AAAUSDT", "BBBUSDT"]
+    assert [p.direction for p in traducidas] == [Direction.LONG, Direction.SHORT]
+    assert traducidas[0].size == pytest.approx(4.0)
+    assert traducidas[0].entry_price == pytest.approx(100.0)
+    # el endpoint de posiciones no los trae: se dejan vacíos, no inventados
+    assert traducidas[0].client_oid is None
+
+
+def test_las_posiciones_de_tamano_no_positivo_se_descartan():
+    """Una fila de tamaño 0 traducida sería una posición FANTASMA, con dos
+    efectos contrarios y ambos malos: el sondeo creería que sigue abierta y
+    no detectaría nunca su cierre, y la reconciliación de arranque la
+    vetaría como ajena.
+
+    El filtro es seguro se comporte como se comporte Bitget -si nunca
+    devolviera filas así, no descarta nada-, pero sin este test nada impide
+    quitarlo: se comprobó que eliminarlo dejaba la suite entera en verde."""
+    traducidas = posiciones_del_bot([
+        PosicionExchangeBitget(symbol="AAAUSDT", lado="long", tamano=0.0,
+                               precio_entrada=100.0),
+        PosicionExchangeBitget(symbol="BBBUSDT", lado="long", tamano=-1.0,
+                               precio_entrada=100.0),
+        PosicionExchangeBitget(symbol="CCCUSDT", lado="long", tamano=4.0,
+                               precio_entrada=100.0),
+    ])
+
+    assert [p.symbol for p in traducidas] == ["CCCUSDT"]
+
+
+def test_un_lado_desconocido_en_una_fila_de_tamano_cero_no_llega_a_lanzar():
+    """El descarte va ANTES de interpretar el lado, a propósito: una fila
+    vacía con el lado en blanco no debe tumbar la lectura entera del
+    exchange -que es lo que haría el `ValueError` del lado desconocido."""
+    assert posiciones_del_bot([
+        PosicionExchangeBitget(symbol="AAAUSDT", lado="", tamano=0.0,
+                               precio_entrada=0.0),
+    ]) == []
+
+
+def test_una_posicion_con_lado_desconocido_no_se_interpreta():
+    """Interpretar mal el lado de una posición apalancada es peor que no
+    interpretarlo: quien llama lo trata como "no se pudo leer el exchange"."""
+    with pytest.raises(ValueError, match="lado desconocido"):
+        posiciones_del_bot([
+            PosicionExchangeBitget(symbol="AAAUSDT", lado="", tamano=4.0,
+                                   precio_entrada=100.0),
+        ])
+
+
+# --- el solape sondeo/tick (Step 5): el fill duplicado ---
+#
+# Requisito de diseño trasladado desde la Task 9. El sondeo corre como tarea
+# independiente del bucle evaluador: si pilla a `BotRunner._ejecutar`
+# suspendido en un `await` del broker -después de mandar la orden de cierre y
+# antes de registrarla- ve la posición desaparecida del exchange y la cierra
+# en la base mientras el cierre normal sigue en vuelo. Resultado: DOS fills
+# para un solo cierre.
+
+
+class BrokerQueSeQueda(PaperBroker):
+    """`PaperBroker` que se suspende dentro de `cerrar` hasta que el test lo
+    suelta. Reproduce exactamente la ventana peligrosa: el bot ya decidió
+    cerrar y está esperando al exchange."""
+
+    def __init__(self, params):
+        super().__init__(params)
+        self.dentro_de_cerrar = asyncio.Event()
+        self.puerta = asyncio.Event()
+
+    async def cerrar(self, **kwargs):
+        self.dentro_de_cerrar.set()
+        await self.puerta.wait()
+        return await super().cerrar(**kwargs)
+
+
+async def _fill_de_cierre_falso(symbol, client_oid=None):
+    return OrdenEjecutada(ts=MINUTO, precio=97.0, cantidad=4.0, comision=0.0)
+
+
+def _bot_con_broker_lento(tmp_path, symbol):
+    """Un `BotRunner` en modo `real` con una posición ya abierta en `symbol` y
+    un broker que se queda colgado en el siguiente cierre."""
+    conn = open_db(tmp_path / "bot.db")
+    repo = BotRepo(conn)
+    repo.set_equity_inicial("real", 1000.0)
+    cfg_bot = BotConfig(enabled=True, modo="real", equity_inicial=1000.0,
+                        desvio_max_entrada=0.0)
+    params = StrategyParams(comision_taker=0.0)
+    broker = BrokerQueSeQueda(params)
+    runner = BotRunner(params, cfg_bot, repo, broker,
+                       LivePortfolio(params, cfg_bot, repo),
+                       fill_de_cierre=_fill_de_cierre_falso)
+    return conn, repo, runner, broker
+
+
+def _transicion_de_entrada(symbol, precio=100.0):
+    return TransitionRow(ts=0, symbol=symbol, prev_state=State.NORMAL,
+                         new_state=State.HOT, price=precio,
+                         direction=Direction.LONG, score=75.0)
+
+
+async def test_sin_cerrojo_el_sondeo_duplica_el_cierre(tmp_path):
+    """El peligro es REAL, no teórico: este test lo reproduce sin el cerrojo.
+    Es lo que hace que el test siguiente signifique algo -sin este, "no se
+    duplicó" podría deberse a que los dos caminos nunca se cruzaron."""
+    symbol = "AAAUSDT"
+    conn, repo, runner, broker = _bot_con_broker_lento(tmp_path, symbol)
+    await runner.on_tick([_transicion_de_entrada(symbol)],
+                         lambda s: 100.0, ahora=0)
+    posicion_id = runner.abiertas[symbol].id
+
+    # el tick cruza el stop (100 * 0.975) y se queda dentro del broker
+    tarea_tick = asyncio.create_task(
+        runner.on_tick([], lambda s: 90.0, ahora=MINUTO))
+    await broker.dentro_de_cerrar.wait()
+
+    # el sondeo entra justo en esa ventana: para el exchange ya no hay nada
+    await runner.sondear_exchange([], ahora=MINUTO)
+
+    broker.puerta.set()
+    await tarea_tick
+
+    assert len(repo.fills_de(posicion_id)) == 2  # el cierre se contó dos veces
+    conn.close()
+
+
+async def test_el_cerrojo_impide_que_el_sondeo_duplique_el_cierre(orq, tmp_path):
+    """Mismo solape, con el cableado de verdad: `paso_evaluador` y
+    `paso_sondeo` compartiendo el `asyncio.Lock` que arma `main()`. Los dos
+    caminos corren -se comprueba que el sondeo llegó a preguntar al
+    exchange-, pero nunca a la vez, y el cierre se registra UNA sola vez."""
+    symbol = "AAAUSDT"
+    conn, repo, runner, broker = _bot_con_broker_lento(tmp_path, symbol)
+    await runner.on_tick([_transicion_de_entrada(symbol)],
+                         lambda s: 100.0, ahora=0)
+    posicion_id = runner.abiertas[symbol].id
+
+    # el precio que verá `paso_evaluador` a través de `_precio_de(orq)`
+    base = 14 * DIA
+    orq.set_ticker(Ticker(symbol, 90.0, 1.0, 5e6, 100.0, 0.0001, ts=base))
+    privado = PrivadoFalso(posiciones=())  # el exchange no reporta nada
+    cerrojo = asyncio.Lock()
+
+    tarea_tick = asyncio.create_task(
+        paso_evaluador(orq, orq.bootstrapper, base, runner, cerrojo))
+    await broker.dentro_de_cerrar.wait()  # el tick tiene el cerrojo tomado
+
+    tarea_sondeo = asyncio.create_task(
+        paso_sondeo(runner, privado, cerrojo, base))
+    await asyncio.sleep(0)  # el sondeo se queda esperando el cerrojo
+
+    broker.puerta.set()
+    await asyncio.gather(tarea_tick, tarea_sondeo)
+
+    assert privado.consultas_de_posiciones == 1  # el sondeo SÍ corrió
+    assert len(repo.fills_de(posicion_id)) == 1  # y no duplicó el cierre
+    assert repo.contadores("real").get("cierres detectados por sondeo") is None
+    conn.close()
+
+
+async def test_paso_sondeo_no_propaga_un_fallo_del_exchange(tmp_path):
+    symbol = "AAAUSDT"
+    conn, repo, runner, _ = _bot_con_broker_lento(tmp_path, symbol)
+
+    class PrivadoRoto:
+        async def get_posiciones(self):
+            raise RuntimeError("Bitget no responde")
+
+    await paso_sondeo(runner, PrivadoRoto(), asyncio.Lock(), MINUTO)  # no lanza
+    conn.close()
+
+
+async def test_paso_sondeo_pide_las_posiciones_con_el_cerrojo_tomado(tmp_path):
+    """La foto del exchange y su interpretación tienen que ser atómicas
+    respecto al tick: si se pidieran las posiciones ANTES de tomar el
+    cerrojo, una posición abierta mientras se espera al tick se leería como
+    "desaparecida del exchange" y se cerraría en la base recién abierta."""
+    symbol = "AAAUSDT"
+    conn, repo, runner, _ = _bot_con_broker_lento(tmp_path, symbol)
+    cerrojo = asyncio.Lock()
+    visto = {}
+
+    class PrivadoQueMira:
+        async def get_posiciones(self):
+            visto["cerrojo_tomado"] = cerrojo.locked()
+            return []
+
+    await paso_sondeo(runner, PrivadoQueMira(), cerrojo, MINUTO)
+
+    assert visto["cerrojo_tomado"] is True
+    conn.close()
+
+
+# --- la secuencia de arranque de los modos reales (ronda de revisión) ---
+#
+# HALLAZGO QUE MOTIVA ESTE BLOQUE: el revisor aplicó NUEVE mutaciones al
+# cableado de `main()` -entre ellas `frenos=None` y `verificador=None`, que
+# desconectan por completo dos criterios de aceptación de la fase- y la suite
+# entera siguió verde en las nueve. El código estaba bien escrito y no lo
+# defendía nada. Estos tests son esa red: arrancan `main()` de verdad con un
+# cliente falso y se paran justo en la frontera de los bucles, para poder
+# afirmar sobre lo que quedó cableado.
+
+
+class _MainCapturada:
+    """Lo que quedó construido cuando `main()` llegó a levantar los bucles."""
+
+    def __init__(self):
+        self.tareas: list[str] = []
+        self.portfolio_kwargs = None
+        self.frenos_args = None
+        self.frenos = None
+        self.runner_kwargs = None
+        self.runner = None
+        self.create_app_kwargs = None
+        self.repo = None
+
+
+def _config_para(tmp_path, modo, fichero_parada):
+    """Copia de `config.toml` con el modo, la base de datos y el fichero de
+    parada apuntando a `tmp_path`: nada de esto puede tocar producción."""
+    texto = CONFIG_PATH.read_text(encoding="utf-8")
+    texto = texto.replace('modo = "paper"', f'modo = "{modo}"')
+    texto = texto.replace('db_path = "data/scanner.db"',
+                          f'db_path = "{tmp_path / "scanner.db"}"')
+    texto = texto.replace('fichero_parada = "data/parar_bot"',
+                          f'fichero_parada = "{fichero_parada}"')
+    destino = tmp_path / "config.toml"
+    destino.write_text(texto, encoding="utf-8")
+    return destino
+
+
+async def _arrancar_main(monkeypatch, tmp_path, *, modo_config, valor_env,
+                         privado=None, fichero_parada=None):
+    """Corre `main()` hasta la frontera de los bucles y devuelve el cableado.
+
+    `asyncio.gather` se sustituye por un doble que anota qué corrutinas iban a
+    lanzarse y las cierra sin ejecutarlas: es exactamente el punto donde acaba
+    el cableado y empieza el proceso vivo, y frenar ahí evita que ningún bucle
+    llegue a tocar la red. El cliente privado es un doble, así que tampoco lo
+    hacen ni el saldo ni las posiciones."""
+    import scanner_volumen.__main__ as principal
+
+    capt = _MainCapturada()
+    fichero_parada = fichero_parada or (tmp_path / "parar_bot")
+    ruta = _config_para(tmp_path, modo_config, fichero_parada)
+
+    if valor_env is None:
+        monkeypatch.delenv("SCANNER_BOT_REAL", raising=False)
+    else:
+        monkeypatch.setenv("SCANNER_BOT_REAL", valor_env)
+    for nombre, valor in _entorno_con_claves().items():
+        monkeypatch.setenv(nombre, valor)
+
+    monkeypatch.setattr(principal, "get_code_revision", lambda cwd: "test")
+    if privado is not None:
+        monkeypatch.setattr(principal, "BitgetPrivate", lambda *a, **k: privado)
+
+    real_portfolio, real_frenos = principal.LivePortfolio, principal.Frenos
+    real_runner, real_repo = principal.BotRunner, principal.BotRepo
+    real_create_app = principal.create_app
+
+    def _portfolio(*a, **k):
+        capt.portfolio_kwargs = (a, k)
+        return real_portfolio(*a, **k)
+
+    def _frenos(*a, **k):
+        capt.frenos_args = (a, k)
+        capt.frenos = real_frenos(*a, **k)
+        return capt.frenos
+
+    def _runner(*a, **k):
+        capt.runner_kwargs = (a, k)
+        capt.runner = real_runner(*a, **k)
+        return capt.runner
+
+    def _repo_falso(*a, **k):
+        capt.repo = real_repo(*a, **k)
+        return capt.repo
+
+    def _create_app(*a, **k):
+        capt.create_app_kwargs = k
+        return real_create_app(*a, **k)
+
+    monkeypatch.setattr(principal, "LivePortfolio", _portfolio)
+    monkeypatch.setattr(principal, "Frenos", _frenos)
+    monkeypatch.setattr(principal, "BotRunner", _runner)
+    monkeypatch.setattr(principal, "BotRepo", _repo_falso)
+    monkeypatch.setattr(principal, "create_app", _create_app)
+
+    async def _gather_falso(*tareas, **kwargs):
+        for tarea in tareas:
+            capt.tareas.append(
+                getattr(getattr(tarea, "cr_code", None), "co_name", repr(tarea)))
+            tarea.close()  # ninguna llega a correr: aquí acaba el cableado
+        return []
+
+    monkeypatch.setattr(asyncio, "gather", _gather_falso)
+
+    await main(["--config", str(ruta)])
+    return capt
+
+
+def _hoy_utc():
+    from datetime import datetime, timezone
+    return datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+async def test_paper_arranca_las_mismas_tareas_de_siempre(monkeypatch, tmp_path):
+    """La red que protege lo que corre HOY en producción: ni bucle de saldo,
+    ni de sondeo, ni cliente autenticado, ni verificador de cuenta."""
+    capt = await _arrancar_main(monkeypatch, tmp_path,
+                                modo_config="paper", valor_env=None)
+
+    assert capt.tareas == ["run", "bucle_tickers", "bucle_evaluador",
+                           "bucle_outcomes", "bucle_mantenimiento", "serve"]
+    assert capt.runner_kwargs[1]["verificador"] is None
+    assert capt.runner_kwargs[1]["fill_de_cierre"] is None
+    assert capt.portfolio_kwargs[0][3] is None  # sin proveedor de saldo
+    assert capt.create_app_kwargs["modo"] == "paper"
+
+
+async def test_en_paper_la_parada_de_emergencia_esta_cableada(monkeypatch, tmp_path):
+    """I-3 de la revisión: `deploy/ENTORNO.md` documenta la parada de
+    emergencia como un control vivo, y hasta esta ronda era inerte en el
+    único modo que corre en producción. Solo actúa cuando un humano crea el
+    fichero, así que encenderla no cambia nada mientras no exista."""
+    parada = tmp_path / "parar_bot"
+    capt = await _arrancar_main(monkeypatch, tmp_path, modo_config="paper",
+                                valor_env=None, fichero_parada=parada)
+    frenos = capt.runner_kwargs[1]["frenos"]
+    assert frenos is not None
+
+    assert frenos.puede_abrir(0) is None  # sin fichero, inerte
+    parada.write_text("")
+    assert frenos.puede_abrir(0) == MOTIVO_PARADA_EMERGENCIA
+    parada.unlink()
+    assert frenos.puede_abrir(0) is None  # y se reanuda sin reiniciar
+
+
+async def test_en_paper_el_freno_de_perdida_diaria_no_se_evalua(monkeypatch, tmp_path):
+    """La otra mitad de I-3: la pérdida diaria SÍ actúa sola, y en `paper`
+    dejaría de abrir entradas que el backtest sí abre -rompiendo la
+    comparación para la que existe ese modo-. Ni se consulta el saldo ni se
+    persiste ninguna referencia del día."""
+    capt = await _arrancar_main(monkeypatch, tmp_path,
+                                modo_config="paper", valor_env=None)
+
+    assert capt.frenos.puede_abrir(0) is None
+    assert capt.repo.saldo_dia("paper", _hoy_utc()) is None
+
+
+@pytest.mark.parametrize("valor_env,modo", [("lectura", REAL_LECTURA),
+                                            ("ordenes", REAL)])
+async def test_el_arranque_real_persiste_el_saldo_y_la_referencia_del_dia(
+    monkeypatch, tmp_path, valor_env, modo,
+):
+    """Los dos pasos del arranque que ninguna mutación ponía en rojo:
+    `set_saldo_real` (sin él, el informe dice "sin dato todavia" para
+    siempre) y `registrar_saldo_del_dia` (la referencia del freno de pérdida
+    diaria, que debe quedar fijada ANTES de la primera consulta)."""
+    privado = PrivadoFalso(saldos=(1234.5,))
+    capt = await _arrancar_main(monkeypatch, tmp_path, modo_config="real",
+                                valor_env=valor_env, privado=privado)
+
+    assert capt.repo.saldo_real(modo) == pytest.approx(1234.5)
+    assert capt.repo.saldo_dia(modo, _hoy_utc()) == pytest.approx(1234.5)
+    assert privado.consultas_de_saldo == 1
+
+
+async def test_el_arranque_real_conecta_frenos_y_verificador(monkeypatch, tmp_path):
+    """`frenos=None` y `verificador=None` desconectan dos criterios de
+    aceptación de la fase (los frenos manuales y la verificación de cuenta) y
+    la suite seguía verde con ambas mutaciones."""
+    capt = await _arrancar_main(monkeypatch, tmp_path, modo_config="real",
+                                valor_env="ordenes", privado=PrivadoFalso())
+
+    assert capt.runner_kwargs[1]["frenos"] is not None
+    assert capt.runner_kwargs[1]["verificador"] is not None
+    assert capt.runner_kwargs[1]["fill_de_cierre"] is not None
+
+
+async def test_main_comparte_una_sola_instancia_de_proveedor_de_saldo(
+    monkeypatch, tmp_path,
+):
+    """I-2 de la revisión. El invariante de la Task 11 -la referencia del
+    freno y la medida del margen salen de la MISMA fuente- estaba probado
+    sobre un cableado construido a mano en el test, que demuestra que
+    compartir uno funciona pero nunca que `main()` lo comparta. Esto último
+    es lo que se comprueba aquí: la MISMA instancia, no una equivalente."""
+    capt = await _arrancar_main(monkeypatch, tmp_path, modo_config="real",
+                                valor_env="ordenes", privado=PrivadoFalso())
+
+    proveedor_cartera = capt.portfolio_kwargs[0][3]
+    proveedor_frenos = capt.frenos_args[0][3]
+    assert proveedor_cartera is not None
+    assert proveedor_frenos is proveedor_cartera
+
+
+@pytest.mark.parametrize("valor_env,modo", [("lectura", REAL_LECTURA),
+                                            ("ordenes", REAL)])
+async def test_el_modo_efectivo_llega_al_bot_y_al_panel(
+    monkeypatch, tmp_path, valor_env, modo,
+):
+    """`real` y `real_lectura` son dos libros contables distintos, y
+    `cfg.bot.modo` solo sabe decir "real". Si el modo efectivo no llega, el
+    panel avisaría de DINERO REAL en un modo que no puede mover un céntimo
+    (o, peor, dejaría de avisar en el que sí)."""
+    capt = await _arrancar_main(monkeypatch, tmp_path, modo_config="real",
+                                valor_env=valor_env, privado=PrivadoFalso())
+
+    assert capt.create_app_kwargs["modo"] == modo
+    assert capt.runner_kwargs[0][1].modo == modo   # la BotConfig del runner
+    assert capt.portfolio_kwargs[0][1].modo == modo
+    assert capt.frenos_args[0][2] == modo
+
+
+async def test_el_sondeo_y_la_reconciliacion_solo_ocurren_en_real(
+    monkeypatch, tmp_path,
+):
+    """En `real_lectura` el broker es el de paper: las posiciones de ese libro
+    son simuladas y no existen en Bitget. Ni se reconcilian contra el exchange
+    ni se sondean -"no está en el exchange" es su estado normal."""
+    privado_lectura = PrivadoFalso()
+    capt = await _arrancar_main(monkeypatch, tmp_path, modo_config="real",
+                                valor_env="lectura", privado=privado_lectura)
+    assert "bucle_sondeo" not in capt.tareas
+    assert "bucle_saldo" in capt.tareas          # el saldo sí se refresca
+    assert privado_lectura.consultas_de_posiciones == 0
+
+    otro = tmp_path / "real"
+    otro.mkdir()
+    privado_real = PrivadoFalso()
+    capt = await _arrancar_main(monkeypatch, otro,
+                                modo_config="real", valor_env="ordenes",
+                                privado=privado_real)
+    assert "bucle_sondeo" in capt.tareas
+    assert "bucle_saldo" in capt.tareas
+    assert privado_real.consultas_de_posiciones == 1  # reconcilió al arrancar
+
+
+async def test_main_no_arranca_si_no_consigue_el_primer_saldo(monkeypatch, tmp_path):
+    """La otra mitad del Step 2: que el proveedor lance sin saldo protege el
+    caché, pero nada protegía la exigencia del arranque -envolver el
+    `refrescar()` inicial en un `try/except: saldo = 0.0` dejaba la suite
+    verde y reintroducía justo el cero contra el que se diseñó el paso."""
+    privado = PrivadoFalso(saldos=(RuntimeError("Bitget no responde"),))
+
+    with pytest.raises(RuntimeError, match="Bitget no responde"):
+        await _arrancar_main(monkeypatch, tmp_path, modo_config="real",
+                             valor_env="ordenes", privado=privado)
+
+
+# --- el fill de un cierre que ejecuto el exchange (Task 12, banco real) ---
+
+
+class PrivadoConHistorial:
+    """Doble de `BitgetPrivate` para el proveedor de fills de cierre.
+
+    La forma de los datos NO es inventada: reproduce lo observado contra la
+    cuenta de simulacion al dispararse un stop de verdad -la orden que crea
+    Bitget lleva como `clientOid` el `orderId` del plan order, y su
+    `orderSource` es `loss_market`."""
+
+    def __init__(self, ordenes):
+        self._ordenes = ordenes
+        self.consultas = []
+
+    async def get_orden_por_client_oid(self, symbol, client_oid, desde_ms):
+        self.consultas.append((symbol, client_oid, desde_ms))
+        return self._ordenes.get(client_oid)
+
+
+async def test_el_fill_de_cierre_se_correlaciona_por_el_id_del_stop():
+    """La correlacion es por identificador, no por ventana de tiempo: el
+    `clientOid` de la orden que Bitget genera al saltar el stop es el
+    `orderId` de nuestro plan order, o sea el `stop_id` que el bot guarda."""
+    from scanner_volumen.bitget.private import FillOrden
+
+    privado = PrivadoConHistorial({
+        "stop-abc": FillOrden(precio=78177.8, cantidad=0.0335, comision=1.57),
+    })
+    proveedor = hacer_fill_de_cierre(privado)
+
+    orden = await proveedor("SBTCSUSDT", "stop-abc")
+
+    assert orden is not None
+    assert orden.precio == pytest.approx(78177.8)
+    assert orden.cantidad == pytest.approx(0.0335)
+    assert orden.comision == pytest.approx(1.57)
+    assert privado.consultas[0][:2] == ("SBTCSUSDT", "stop-abc")
+
+
+async def test_sin_id_con_el_que_correlacionar_no_se_inventa_nada():
+    """Una posicion sin `stop_id` -una degradada a la que nunca se le pudo
+    colocar el stop- no tiene con que correlacionar. Debe devolver `None` y
+    NO consultar el historial: devolver el ultimo cierre del simbolo seria
+    escribir en el libro el precio de una orden que puede no ser la nuestra,
+    y un precio equivocado no se distingue despues de uno correcto."""
+    privado = PrivadoConHistorial({})
+    proveedor = hacer_fill_de_cierre(privado)
+
+    assert await proveedor("SBTCSUSDT", None) is None
+    assert privado.consultas == []
+
+
+async def test_si_la_orden_no_aparece_en_el_historial_devuelve_none():
+    """El camino degradado sigue existiendo: la fila se deja intacta para
+    revision manual en vez de arriesgar un PnL fantasma."""
+    privado = PrivadoConHistorial({})
+    proveedor = hacer_fill_de_cierre(privado)
+
+    assert await proveedor("SBTCSUSDT", "stop-que-no-aparece") is None
+
+
+# --- el ajuste de la configuracion solo existe en `real` ---
+
+
+async def test_en_real_el_verificador_puede_ajustar_la_configuracion(
+    monkeypatch, tmp_path,
+):
+    """El bot corrige la configuracion del simbolo en el que va a entrar.
+
+    Hizo falta porque en Bitget el margen y el apalancamiento son POR
+    SIMBOLO y no se heredan (verificado contra la cuenta real: cambiar BTC
+    dejo ETH y XRP como estaban), y el escaner entra en el par que de senal
+    de entre cientos: sin esto el bot vetaba practicamente todo."""
+    capt = await _arrancar_main(monkeypatch, tmp_path, modo_config="real",
+                                valor_env="ordenes", privado=PrivadoFalso())
+
+    verificador = capt.runner_kwargs[1]["verificador"]
+    assert verificador._ajustador is not None
+
+
+async def test_en_real_lectura_el_verificador_NO_puede_ajustar_nada(
+    monkeypatch, tmp_path,
+):
+    """El escalon intermedio existe para ensayar SIN tocar nada, y eso
+    incluye la configuracion de la cuenta, no solo las ordenes. Si alguien
+    rompe esto, `real_lectura` empezaria a escribir en la cuenta creyendo
+    que solo lee."""
+    capt = await _arrancar_main(monkeypatch, tmp_path, modo_config="real",
+                                valor_env="lectura", privado=PrivadoFalso())
+
+    verificador = capt.runner_kwargs[1]["verificador"]
+    assert verificador._ajustador is None

@@ -44,4 +44,7 @@ systemctl --no-pager --lines=5 status "$SERVICE_NAME" || true
 
 echo
 echo "Hecho. Sigue los logs con:  journalctl -u $SERVICE_NAME -f"
+echo "Secretos (claves de Bitget, SCANNER_BOT_REAL): NO van aqui ni en el"
+echo "repositorio -> /etc/scanner_volumen.env con permisos 600."
+echo "Este script no lo crea ni lo toca; ver deploy/ENTORNO.md."
 echo "Dashboard (desde tu PC):    ssh -L 8000:127.0.0.1:8000 $RUN_USER@SERVIDOR"

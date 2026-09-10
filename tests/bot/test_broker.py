@@ -14,7 +14,8 @@ MIN = 60_000
 async def test_abrir_rellena_al_precio_de_mercado():
     broker = PaperBroker(StrategyParams(comision_taker=0.0))
     orden = await broker.abrir(symbol="A", direction=Direction.LONG,
-                               notional=400.0, precio_mercado=100.0, ts=MIN)
+                               notional=400.0, precio_mercado=100.0, ts=MIN,
+                               client_oid="oid-test")
     assert orden.precio == pytest.approx(100.0)
     assert orden.cantidad == pytest.approx(4.0)   # 400 / 100
     assert orden.ts == MIN
@@ -23,7 +24,8 @@ async def test_abrir_rellena_al_precio_de_mercado():
 async def test_abrir_cobra_comision_sobre_el_nocional():
     broker = PaperBroker(StrategyParams(comision_taker=0.0006))
     orden = await broker.abrir(symbol="A", direction=Direction.LONG,
-                               notional=400.0, precio_mercado=100.0, ts=0)
+                               notional=400.0, precio_mercado=100.0, ts=0,
+                               client_oid="oid-test")
     assert orden.comision == pytest.approx(0.24)  # 0.0006 * 400
 
 
@@ -48,10 +50,63 @@ async def test_rechaza_precio_no_positivo(metodo, precio):
     with pytest.raises(ValueError, match="precio_mercado debe ser estrictamente positivo"):
         if metodo == "abrir":
             await broker.abrir(symbol="A", direction=Direction.LONG,
-                               notional=400.0, precio_mercado=precio, ts=MIN)
+                               notional=400.0, precio_mercado=precio, ts=MIN,
+                               client_oid="oid-test")
         else:
             await broker.cerrar(symbol="A", direction=Direction.LONG,
                                 cantidad=2.0, precio_mercado=precio, ts=MIN)
+
+
+async def test_el_paper_broker_registra_el_stop_colocado():
+    broker = PaperBroker(StrategyParams())
+    sid = await broker.colocar_stop(symbol="A", direction=Direction.LONG,
+                                    cantidad=4.0, precio_disparo=97.5,
+                                    client_oid="oid-1")
+    assert sid
+    assert broker.stops_vivos()["A"].precio_disparo == pytest.approx(97.5)
+
+
+async def test_mover_el_stop_cambia_el_precio_y_conserva_uno_solo():
+    broker = PaperBroker(StrategyParams())
+    sid = await broker.colocar_stop(symbol="A", direction=Direction.LONG,
+                                    cantidad=4.0, precio_disparo=97.5,
+                                    client_oid="oid-1")
+    await broker.mover_stop(symbol="A", stop_id=sid, precio_disparo=100.0,
+                            cantidad=4.0)
+    assert len(broker.stops_vivos()) == 1
+    assert broker.stops_vivos()["A"].precio_disparo == pytest.approx(100.0)
+
+
+async def test_mover_un_stop_con_id_equivocado_revienta():
+    broker = PaperBroker(StrategyParams())
+    await broker.colocar_stop(symbol="A", direction=Direction.LONG,
+                              cantidad=4.0, precio_disparo=97.5,
+                              client_oid="oid-1")
+    with pytest.raises(ValueError, match="no hay stop vivo"):
+        await broker.mover_stop(symbol="A", stop_id="id-equivocado",
+                                precio_disparo=100.0, cantidad=4.0)
+
+
+async def test_mover_un_stop_sin_stop_previo_revienta():
+    broker = PaperBroker(StrategyParams())
+    with pytest.raises(ValueError, match="no hay stop vivo"):
+        await broker.mover_stop(symbol="A", stop_id="lo-que-sea",
+                                precio_disparo=100.0, cantidad=4.0)
+
+
+async def test_cancelar_el_stop_lo_elimina():
+    broker = PaperBroker(StrategyParams())
+    sid = await broker.colocar_stop(symbol="A", direction=Direction.LONG,
+                                    cantidad=4.0, precio_disparo=97.5,
+                                    client_oid="oid-1")
+    await broker.cancelar_stop(symbol="A", stop_id=sid)
+    assert broker.stops_vivos() == {}
+
+
+async def test_cancelar_un_stop_inexistente_no_revienta():
+    # en real puede haberse ejecutado ya; cancelarlo debe ser idempotente
+    broker = PaperBroker(StrategyParams())
+    await broker.cancelar_stop(symbol="A", stop_id="no-existe")
 
 
 def test_paper_broker_no_importa_clientes_de_red():
