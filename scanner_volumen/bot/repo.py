@@ -225,6 +225,19 @@ class BotRepo:
         )
         self._conn.commit()
 
+    def posicion(self, posicion_id: int) -> dict | None:
+        """Una posición por su id, o `None` si no existe.
+
+        La usa el panel para el desglose de un trade. Devuelve la fila
+        entera -incluido `modo`- porque quien llama tiene que poder
+        comprobar que la posición pertenece al modo que está mirando: los
+        libros de `paper` y `real` son distintos y no deben mezclarse en la
+        misma vista."""
+        fila = self._conn.execute(
+            "SELECT * FROM bot_posiciones WHERE id = ?", (posicion_id,),
+        ).fetchone()
+        return dict(fila) if fila is not None else None
+
     def fills_de(self, posicion_id: int) -> list[dict]:
         filas = self._conn.execute(
             "SELECT * FROM bot_fills WHERE posicion_id = ? ORDER BY ts, id",
