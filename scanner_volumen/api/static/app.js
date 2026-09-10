@@ -220,7 +220,7 @@ async function dibujarDetalle(fila) {
   fila.classList.add("abierto");
   const tr = document.createElement("tr");
   tr.className = "detalle";
-  tr.innerHTML = `<td colspan="10" class="apagado">cargando…</td>`;
+  tr.innerHTML = `<td colspan="11" class="apagado">cargando…</td>`;
   fila.after(tr);
 
   let d = desplegados.get(id);
@@ -230,7 +230,7 @@ async function dibujarDetalle(fila) {
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       d = await r.json();
     } catch (e) {
-      tr.innerHTML = `<td colspan="10" class="perdida">no se pudo cargar el desglose: ${e.message}</td>`;
+      tr.innerHTML = `<td colspan="11" class="perdida">no se pudo cargar el desglose: ${e.message}</td>`;
       return;
     }
     // Un trade cerrado no cambia nunca, asi que su desglose se cachea y el
@@ -264,7 +264,7 @@ async function dibujarDetalle(fila) {
   // diferencia entre el saldo real y el equity calculado que ya ensena el
   // informe. Ademas estos trades duran minutos y el funding se cobra en
   // ventanas de 8h, asi que casi nunca llegan a cruzar una.
-  tr.innerHTML = `<td colspan="10">
+  tr.innerHTML = `<td colspan="11">
       <table class="fases">
         <thead><tr><th>FASE</th><th>PARTE</th><th>PRECIO</th>
                    <th>DESVIO</th><th>FEE</th><th>PNL</th></tr></thead>
@@ -331,6 +331,7 @@ function pintarHistorico(cerradas) {
         <td>${t.direction}</td>
         <td>${precio(t.entry_price)}</td>
         <td>${precio(t.exit_price)}</td>
+        <td class="apagado">${horaCorta(t.entry_ts)}</td>
         <td class="apagado">${horaCorta(t.close_ts)}</td>
         <td class="apagado">${duracion(t.entry_ts, t.close_ts)}</td>
         <td class="apagado">${NOMBRE_RANGO[t.max_rank] ?? "—"}</td>
