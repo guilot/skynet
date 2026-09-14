@@ -25,14 +25,14 @@ import httpx
 
 BASE = "https://api.bitget.com"
 POR_PAGINA = 200          # limite de la API
-PAUSA = 0.05
+PAUSA = 0.15
 
-# Cuantos simbolos se descargan A LA VEZ. El cuello no es el limite de Bitget
-# sino la LATENCIA de cada peticion: en serie salian 1,9 paginas/s y 11 HORAS
-# para 90 dias (medido, no estimado). Con 6 en paralelo se ronda las 11
-# peticiones/s -holgado frente al limite de los endpoints publicos- y baja a
-# unas 2 horas.
-CONCURRENCIA = 6
+# Cuantos simbolos se descargan A LA VEZ. En serie salian 1,9 paginas/s y 11
+# HORAS para 90 dias (medido). Con 6 en paralelo baja a ~2h, pero Bitget
+# empieza a devolver 429: medido, 12 peticiones simultaneas dan entre 1 y 10
+# rechazos. Con 4 y una pausa mayor el ritmo es algo menor y los reintentos
+# dejan de dominar.
+CONCURRENCIA = 4
 
 
 async def _tickers(http: httpx.AsyncClient) -> list[dict]:
@@ -43,14 +43,30 @@ async def _tickers(http: httpx.AsyncClient) -> list[dict]:
 
 
 async def _pagina(http: httpx.AsyncClient, symbol: str, fin_ms: int) -> list[list]:
-    """Una pagina de 200 velas que TERMINA en `fin_ms`; [] si no hay mas."""
-    r = await http.get(f"{BASE}/api/v2/mix/market/history-candles",
-                       params={"symbol": symbol, "productType": "USDT-FUTURES",
-                               "granularity": "1m", "limit": str(POR_PAGINA),
-                               "endTime": str(fin_ms)})
-    if r.status_code != 200:
-        return []
-    return r.json().get("data") or []
+    """Una pagina de 200 velas que TERMINA en `fin_ms`.
+
+    Distingue "no hay mas datos" de "la peticion fallo", que es justo lo que
+    la primera version confundia: devolvia [] ante CUALQUIER error y el
+    llamador lo leia como fin del historico. Con 6 descargas en paralelo
+    Bitget devuelve 429 a menudo, asi que la mayoria de los simbolos se
+    daban por completos tras UNA pagina -medido: 74 de 84 se quedaron con
+    menos de 5 dias de los 90 pedidos, y el proceso decia "listo".
+
+    Un 429 se reintenta con espera creciente. Solo una respuesta correcta y
+    vacia significa que no hay mas."""
+    espera = 1.0
+    for intento in range(6):
+        r = await http.get(f"{BASE}/api/v2/mix/market/history-candles",
+                           params={"symbol": symbol, "productType": "USDT-FUTURES",
+                                   "granularity": "1m", "limit": str(POR_PAGINA),
+                                   "endTime": str(fin_ms)})
+        if r.status_code == 200:
+            return r.json().get("data") or []
+        if r.status_code != 429:
+            raise RuntimeError(f"HTTP {r.status_code} en {symbol}")
+        await asyncio.sleep(espera)
+        espera *= 2
+    raise RuntimeError(f"{symbol}: 429 persistente tras 6 intentos")
 
 
 def _preparar(conn: sqlite3.Connection) -> None:
