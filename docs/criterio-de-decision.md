@@ -66,3 +66,24 @@ Se anotan aquí para que el resultado se lea con ellos delante:
    cada vela de un minuto, mientras que el bot en vivo solo ve los precios que
    muestrea. Medido sobre las 39 operaciones que ambos tomaron: el bot salió
    **+32,22 USDT mejor** en las salidas por stop.
+
+## Añadido (14 sep, antes de ejecutar): fidelidad de la reconstrucción
+
+Al validar el reconstructor contra las transiciones que el escáner generó en
+vivo sobre los mismos datos, aparece una cuarta limitación que no estaba
+prevista:
+
+4. **La reconstrucción produce el ~76% de las transiciones** que el escáner
+   genera en vivo. El escáner evalúa cada segundo contra la vela en curso; el
+   histórico de Bitget solo baja a la granularidad de un minuto, así que la
+   reconstrucción evalúa una vez por vela cerrada. Las transiciones que faltan
+   son picos intra-minuto.
+
+   **No se sabe en qué dirección sesga**: no hay forma de saber si esas
+   entradas perdidas habrían sido mejores o peores. Lo que sí se puede afirmar
+   es que el backtest histórico es una versión **más gruesa** de la estrategia,
+   no la misma.
+
+   (Antes de enchufar `market_cap` con el suministro actual, la reconstrucción
+   se quedaba en el 62% y el score medio salía 4 puntos bajo. Ese componente
+   vale hasta 5 puntos y no era neutral omitirlo.)
