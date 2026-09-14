@@ -255,3 +255,41 @@ def test_en_paper_no_aparece_ninguna_de_esas_dos_lineas(repo):
         repo, "paper", descartes={}, cierres_tardios=0, saldo_real=None)
     assert "saldo no fiable" not in bloque
     assert "varadas" not in bloque
+
+
+def test_el_informe_no_arrastra_el_cliente_http():
+    """El CLI del informe es SOLO LECTURA y no toca la red: no debe depender
+    de `httpx` ni del cliente de Bitget para funcionar.
+
+    Lo rompi yo sin darme cuenta: `report.py` importaba una CADENA DE TEXTO
+    desde `bot/verificacion_cuenta.py`, que importa `bitget/private.py`, que
+    importa `httpx`. El sintoma aparecio en produccion -`python3 -m
+    scanner_volumen.bot` reventaba con `ModuleNotFoundError: No module named
+    'httpx'` en un interprete sin el entorno virtual- y la causa no tenia
+    nada que ver con lo que el informe hace.
+
+    Se comprueba en un subproceso y con `httpx` BLOQUEADO a proposito: mirar
+    `sys.modules` en este proceso no sirve, porque otros tests ya lo han
+    importado."""
+    import subprocess
+    import sys
+    import textwrap
+
+    codigo = textwrap.dedent("""
+        import sys
+
+        class Bloqueo:
+            def find_module(self, nombre, ruta=None):
+                if nombre == "httpx":
+                    raise ImportError("httpx bloqueado a proposito")
+
+        sys.meta_path.insert(0, Bloqueo())
+        import scanner_volumen.bot.__main__  # noqa: F401
+        assert "httpx" not in sys.modules
+        assert "scanner_volumen.bitget.private" not in sys.modules
+        print("OK")
+    """)
+    r = subprocess.run([sys.executable, "-c", codigo], capture_output=True, text=True)
+    assert r.returncode == 0 and "OK" in r.stdout, (
+        f"el CLI del informe arrastra el cliente HTTP:\n{r.stderr[-800:]}"
+    )

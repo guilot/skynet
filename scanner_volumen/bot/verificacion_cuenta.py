@@ -64,15 +64,16 @@ import math
 from collections.abc import Awaitable, Callable
 
 from scanner_volumen.bitget.private import ConfiguracionCuentaSymbol
+from scanner_volumen.bot.model import MOTIVO_CONFIG_CUENTA
 from scanner_volumen.strategy.model import StrategyParams
 
 log = logging.getLogger(__name__)
 
 # Etiqueta PROPIA (no la "simbolo vetado" de la reconciliación de arranque,
-# ver el docstring del módulo para por qué): debe estar también en
-# `ETIQUETAS_DESCARTE` (`bot/model.py`) para que `bot/__main__.py` no la
-# filtre fuera del informe.
-MOTIVO_VETO = "config cuenta"
+# ver el docstring del módulo para por qué). Se define en `bot/model.py` y
+# se reexporta aquí: allí no hay dependencias pesadas, y el informe la
+# necesita sin arrastrar el cliente HTTP -ver la nota en ese fichero.
+MOTIVO_VETO = MOTIVO_CONFIG_CUENTA
 
 LectorConfiguracionCuenta = Callable[[str], Awaitable[ConfiguracionCuentaSymbol]]
 # `(symbol, apalancamiento) -> None`. Pone el símbolo en margen aislado al

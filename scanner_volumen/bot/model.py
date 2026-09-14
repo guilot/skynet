@@ -106,6 +106,15 @@ class PosicionExchange:
 # Fase 3 (Task 10, `bot/frenos.py`): a diferencia de las demás etiquetas, que
 # se contabilizan transición a transición, estas cuentan una vez por tick en
 # el que el freno impidió evaluar entradas.
+# La etiqueta del veto por configuracion de cuenta vive AQUI y no en
+# `bot/verificacion_cuenta.py`, que es quien la produce, porque tambien la
+# necesita el informe -y ese modulo arrastra `bitget/private.py` y con el
+# `httpx`. El CLI del informe es SOLO LECTURA y no toca la red: hacerle
+# depender del cliente HTTP para leer una cadena de texto rompia su
+# capacidad de correr en un entorno minimo (paso de verdad: `python3 -m
+# scanner_volumen.bot` reventaba con ModuleNotFoundError: httpx).
+MOTIVO_CONFIG_CUENTA = "config cuenta"
+
 ETIQUETAS_DESCARTE = (
     "NEUTRAL",
     "simbolo abierto",
@@ -114,7 +123,7 @@ ETIQUETAS_DESCARTE = (
     "par congelado",
     "desvio",
     "simbolo vetado",
-    "config cuenta",
+    MOTIVO_CONFIG_CUENTA,
     "perdida diaria",
     "parada de emergencia",
 )

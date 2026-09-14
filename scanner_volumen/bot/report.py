@@ -11,7 +11,7 @@ from scanner_volumen.bot.frenos import MOTIVO_SALDO_NO_FIABLE as FRENO_SALDO_NO_
 from scanner_volumen.bot.model import ETIQUETAS_DESCARTE
 from scanner_volumen.bot.modo import REAL, REAL_LECTURA
 from scanner_volumen.bot.repo import BotRepo
-from scanner_volumen.bot.verificacion_cuenta import MOTIVO_VETO as VETO_CONFIG_CUENTA
+from scanner_volumen.bot.model import MOTIVO_CONFIG_CUENTA as VETO_CONFIG_CUENTA
 from scanner_volumen.models import Direction
 from scanner_volumen.strategy.model import (
     ExitReason, Fill, ResumenOperativa, TradeResumen,
