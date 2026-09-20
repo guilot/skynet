@@ -5,7 +5,7 @@ statistically abnormal expansions of price and volume, plus a paper-trading
 bot that acts on those signals through the same rule engine that the
 backtester uses.
 
-**The honest headline: the strategy does not have an edge.** It was measured
+**The strategy does not have an edge.** It was measured
 against a pre-registered criterion over 1,636 trades and 90 days of
 reconstructed history, and it failed all three tests. The numbers, and how
 they were obtained, are in [Results](#results) below. The code is published
