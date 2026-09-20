@@ -20,6 +20,10 @@ logs/
 config.local.toml
 .env
 
+# Notas de trabajo privadas: planes y especificaciones de cada fase.
+# Se quedan en local, fuera del repositorio publico.
+docs/superpowers/
+
 # Editores
 .vscode/
 .idea/
